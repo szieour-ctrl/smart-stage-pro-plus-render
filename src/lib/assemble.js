@@ -6,36 +6,56 @@ const ffmpeg = require("fluent-ffmpeg");
 
 const CROSSFADE_DURATION = 0.6; // seconds between clips
 
-// ── CONCATENATE CLIPS WITH CROSSFADE ─────────────────────────────────────
-// Chains xfade filters across all clips in sequence. Each clip already has
-// its motion preset baked in from motionPresets.js.
+// ── PROBE ACTUAL CLIP DURATION ───────────────────────────────────────────
+// The previous version assumed every clip was exactly 4.5s when calculating
+// crossfade offsets. That assumption was wrong as soon as duration varied
+// even slightly, and caused xfade offsets to be miscalculated — visually
+// "swallowing" earlier clips in the sequence (only the last clip appeared
+// in testing with 2 frames). Probing real duration fixes this at the root.
 
-function concatenateClips(clipPaths, workDir) {
+function probeDuration(clipPath) {
   return new Promise((resolve, reject) => {
-    if (clipPaths.length === 1) {
-      return resolve(clipPaths[0]);
-    }
+    ffmpeg.ffprobe(clipPath, (err, metadata) => {
+      if (err) return reject(new Error(`ffprobe failed for ${clipPath}: ${err.message}`));
+      resolve(metadata.format.duration);
+    });
+  });
+}
 
+// ── CONCATENATE CLIPS WITH CROSSFADE ─────────────────────────────────────
+// Chains xfade filters across all clips in sequence using REAL probed
+// durations for offset calculation, not an assumed fixed length.
+
+async function concatenateClips(clipPaths, workDir) {
+  if (clipPaths.length === 1) {
+    return clipPaths[0];
+  }
+
+  const durations = await Promise.all(clipPaths.map(probeDuration));
+
+  return new Promise((resolve, reject) => {
     const outputPath = path.join(workDir, "concatenated.mp4");
     const command = ffmpeg();
 
     clipPaths.forEach((clip) => command.input(clip));
 
-    // Build chained xfade filter graph: each pair crossfades into the next
+    // Build chained xfade filter graph using real durations.
+    // offset = where in the CUMULATIVE output timeline this transition
+    // should begin — i.e. (sum of all preceding clip durations so far,
+    // minus the crossfade overlaps already consumed).
     let filterParts = [];
     let lastLabel = "0:v";
-    let cumulativeOffset = 0;
+    let cumulativeOffset = durations[0] - CROSSFADE_DURATION;
 
     for (let i = 1; i < clipPaths.length; i++) {
       const nextLabel = `${i}:v`;
       const outLabel = i === clipPaths.length - 1 ? "outv" : `v${i}`;
-      // Offset is approximate — exact timing refined once real clip
-      // durations are confirmed during testing.
+
       filterParts.push(
-        `[${lastLabel}][${nextLabel}]xfade=transition=fade:duration=${CROSSFADE_DURATION}:offset=${cumulativeOffset}[${outLabel}]`
+        `[${lastLabel}][${nextLabel}]xfade=transition=fade:duration=${CROSSFADE_DURATION}:offset=${Math.max(0, cumulativeOffset).toFixed(2)}[${outLabel}]`
       );
       lastLabel = outLabel;
-      cumulativeOffset += 4.5 - CROSSFADE_DURATION; // approximate clip duration
+      cumulativeOffset += durations[i] - CROSSFADE_DURATION;
     }
 
     command
