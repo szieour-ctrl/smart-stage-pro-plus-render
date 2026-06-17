@@ -27,11 +27,15 @@ async function downloadFrames(frames, workDir) {
     localFrames.push({
       localPath,
       beforeLocalPath,
+      remoteImageUrl: frame.imageUrl, // preserved for Kling, which fetches from a public URL itself
+      remoteBeforeUrl: frame.beforeUrl || null,
       isBeforeAfter: !!frame.isBeforeAfter,
       roomType: frame.roomType || "default",
       motionPreset: frame.motionPreset || "auto",
       durationSeconds: frame.durationSeconds || 4.5,
       sequenceOrder: frame.sequenceOrder ?? i,
+      useAiMotion: !!frame.useAiMotion,
+      customPrompt: frame.customPrompt || null,
     });
   }
 
