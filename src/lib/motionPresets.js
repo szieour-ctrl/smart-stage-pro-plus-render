@@ -18,6 +18,27 @@ const AUTO_PRESETS = {
   default:  "float",
 };
 
+// Default shot duration by room type, used when the agent/frontend doesn't
+// specify durationSeconds explicitly. Uniform timing across every shot was
+// part of what made early tests feel like a slideshow — real walkthroughs
+// vary pacing: a hero shot (living room) holds longer, a utility shot
+// (bathroom) moves faster.
+const DEFAULT_DURATIONS = {
+  exterior: 5.5,
+  living:   5.5,
+  kitchen:  4.5,
+  dining:   4.0,
+  bedroom:  4.5,
+  bathroom: 3.0,
+  flex:     4.0,
+  default:  4.5,
+};
+
+function resolveDuration(frame) {
+  if (frame.durationSeconds) return frame.durationSeconds;
+  return DEFAULT_DURATIONS[frame.roomType] || DEFAULT_DURATIONS.default;
+}
+
 // FFmpeg zoompan filter strings. d = number of frames at given fps
 // (we render at 25fps, so duration*25 = d).
 //
@@ -32,16 +53,28 @@ const ZOOMPAN_H = 540;
 const OUTPUT_W = 1920;
 const OUTPUT_H = 1080;
 
-function buildZoompanFilter(preset, durationSeconds) {
-  const fps = 20; // reduced from 25 — fewer frames to hold in memory, still smooth for Ken Burns motion
+function buildZoompanFilter(preset, durationSeconds, startZoom = 1.0) {
+  const fps = 20;
   const frames = Math.round(durationSeconds * fps);
 
+  // Zoom rate increased from 0.0015 to 0.004 — the previous rate was too
+  // subtle to read as deliberate movement, contributing to the "slideshow"
+  // feel. Faster, more confident motion reads as walking through a space
+  // rather than slowly looking at a photo.
+  //
+  // startZoom allows directional continuity between clips — see
+  // renderPipeline.js, which now passes the previous clip's ending zoom
+  // level so push_in/pull_back chains feel continuous rather than each
+  // clip resetting to a default zoom state.
+  const maxZoom = Math.min(startZoom + 0.5, 1.8);
+  const minZoom = Math.max(startZoom - 0.5, 1.0);
+
   const filters = {
-    push_in:   `zoompan=z='min(zoom+0.0015,1.5)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${frames}:s=${ZOOMPAN_W}x${ZOOMPAN_H}:fps=${fps},scale=${OUTPUT_W}:${OUTPUT_H}`,
-    pull_back: `zoompan=z='if(lte(zoom,1.0),1.5,max(1.0,zoom-0.0015))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${frames}:s=${ZOOMPAN_W}x${ZOOMPAN_H}:fps=${fps},scale=${OUTPUT_W}:${OUTPUT_H}`,
-    pan_left:  `zoompan=z=1.2:x='if(lte(x,0),iw/2,x-2)':y='ih/2-(ih/zoom/2)':d=${frames}:s=${ZOOMPAN_W}x${ZOOMPAN_H}:fps=${fps},scale=${OUTPUT_W}:${OUTPUT_H}`,
-    pan_right: `zoompan=z=1.2:x='if(gte(x,iw),iw/2,x+2)':y='ih/2-(ih/zoom/2)':d=${frames}:s=${ZOOMPAN_W}x${ZOOMPAN_H}:fps=${fps},scale=${OUTPUT_W}:${OUTPUT_H}`,
-    float:     `zoompan=z='1.05+0.02*sin(2*PI*on/${frames})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${frames}:s=${ZOOMPAN_W}x${ZOOMPAN_H}:fps=${fps},scale=${OUTPUT_W}:${OUTPUT_H}`,
+    push_in:   `zoompan=z='min(zoom+0.004,${maxZoom})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${frames}:s=${ZOOMPAN_W}x${ZOOMPAN_H}:fps=${fps},scale=${OUTPUT_W}:${OUTPUT_H}`,
+    pull_back: `zoompan=z='if(lte(zoom,${minZoom}),${maxZoom},max(${minZoom},zoom-0.004))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${frames}:s=${ZOOMPAN_W}x${ZOOMPAN_H}:fps=${fps},scale=${OUTPUT_W}:${OUTPUT_H}`,
+    pan_left:  `zoompan=z=1.25:x='if(lte(x,0),iw*0.15,x-3)':y='ih/2-(ih/zoom/2)':d=${frames}:s=${ZOOMPAN_W}x${ZOOMPAN_H}:fps=${fps},scale=${OUTPUT_W}:${OUTPUT_H}`,
+    pan_right: `zoompan=z=1.25:x='if(gte(x,iw*0.85),iw*0.15,x+3)':y='ih/2-(ih/zoom/2)':d=${frames}:s=${ZOOMPAN_W}x${ZOOMPAN_H}:fps=${fps},scale=${OUTPUT_W}:${OUTPUT_H}`,
+    float:     `zoompan=z='1.1+0.03*sin(2*PI*on/${frames})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${frames}:s=${ZOOMPAN_W}x${ZOOMPAN_H}:fps=${fps},scale=${OUTPUT_W}:${OUTPUT_H}`,
     static:    `scale=${OUTPUT_W}:${OUTPUT_H}:force_original_aspect_ratio=decrease,pad=${OUTPUT_W}:${OUTPUT_H}:(ow-iw)/2:(oh-ih)/2,fps=${fps}`,
   };
 
@@ -55,14 +88,25 @@ function resolvePreset(frame) {
   return AUTO_PRESETS[frame.roomType] || AUTO_PRESETS.default;
 }
 
-function applyMotionPreset(frame, workDir) {
+function getEndingZoom(preset, startZoom) {
+  // Mirrors the maxZoom/minZoom logic in buildZoompanFilter so the next
+  // clip can pick up where this one left off, creating the illusion of
+  // continuous forward movement between rooms rather than each shot
+  // resetting to a default state.
+  if (preset === "push_in") return Math.min(startZoom + 0.5, 1.8);
+  if (preset === "pull_back") return Math.max(startZoom - 0.5, 1.0);
+  return 1.1; // pan/float/static presets don't carry a meaningful zoom handoff
+}
+
+function applyMotionPreset(frame, workDir, startZoom = 1.0) {
   return new Promise((resolve, reject) => {
     const preset = resolvePreset(frame);
-    const filter = buildZoompanFilter(preset, frame.durationSeconds);
+    const duration = resolveDuration(frame);
+    const filter = buildZoompanFilter(preset, duration, startZoom);
     const outputPath = path.join(workDir, `clip_${path.basename(frame.localPath, path.extname(frame.localPath))}.mp4`);
 
     ffmpeg(frame.localPath)
-      .loop(frame.durationSeconds)
+      .loop(duration)
       // Pre-scale large source images down before zoompan ever touches them —
       // Cloudinary staged images can be quite high-res, and feeding a huge
       // source into zoompan multiplies its memory footprint unnecessarily.
@@ -72,12 +116,12 @@ function applyMotionPreset(frame, workDir) {
         "-movflags", "+faststart",
         "-threads", "1", // cap FFmpeg's thread/memory usage per job — safer on constrained containers
       ])
-      .duration(frame.durationSeconds)
+      .duration(duration)
       .output(outputPath)
-      .on("end", () => resolve(outputPath))
+      .on("end", () => resolve({ path: outputPath, endingZoom: getEndingZoom(preset, startZoom), duration }))
       .on("error", (err) => reject(new Error(`FFmpeg motion failed (${preset}): ${err.message}`)))
       .run();
   });
 }
 
-module.exports = { applyMotionPreset, resolvePreset, AUTO_PRESETS };
+module.exports = { applyMotionPreset, resolvePreset, resolveDuration, AUTO_PRESETS, DEFAULT_DURATIONS };
