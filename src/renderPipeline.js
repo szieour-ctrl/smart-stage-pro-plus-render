@@ -15,6 +15,7 @@ const axios = require("axios");
 
 const { downloadFrames } = require("./lib/downloadFrames");
 const { applyMotionPreset, resolveDuration } = require("./lib/motionPresets");
+const { applyKlingMotion } = require("./lib/klingMotion");
 const { generateMusic } = require("./lib/musicGen");
 const { assembleVideo, buildBeforeAfterClip } = require("./lib/assemble");
 const { uploadToCloudinary } = require("./lib/cloudinaryUpload");
@@ -45,7 +46,30 @@ async function processRenderJob(job) {
 
     for (const frame of localFrames) {
       let clipPath;
-      if (frame.isBeforeAfter && frame.beforeLocalPath) {
+
+      if (frame.useAiMotion) {
+        // Premium AI motion via Kling — interior requires both vacant+staged
+        // URLs (enforced inside klingMotion.js), exterior allows single or
+        // paired images. Falls back to standard Ken Burns on any failure.
+        //
+        // IMPORTANT: Kling fetches images itself from a public URL — it
+        // needs the original Cloudinary URLs (frame.remoteImageUrl /
+        // frame.remoteBeforeUrl), not the local disk paths downloadFrames.js
+        // already pulled down for the Ken Burns/FFmpeg path.
+        const result = await applyKlingMotion(
+          {
+            imageUrl: frame.isBeforeAfter ? frame.remoteBeforeUrl : frame.remoteImageUrl,
+            endImageUrl: frame.isBeforeAfter ? frame.remoteImageUrl : undefined,
+            roomType: frame.roomType,
+            durationSeconds: resolveDuration(frame),
+            customPrompt: frame.customPrompt,
+          },
+          workDir,
+          () => applyMotionPreset(frame, workDir, carryZoom)
+        );
+        clipPath = result.path;
+        carryZoom = result.endingZoom;
+      } else if (frame.isBeforeAfter && frame.beforeLocalPath) {
         // Flagship feature: vacant room holds, then wipes into staged version.
         // Build each side's motion clip first, then composite the wipe.
         // Before/After clips don't participate in cross-room zoom continuity —
