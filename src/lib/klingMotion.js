@@ -78,9 +78,16 @@ async function generateKlingClip(frame, workDir) {
   enforceScopeRules(frame);
 
   const prompt = buildPrompt(frame);
-  const duration = String(frame.durationSeconds || 5);
 
-  console.log(`  [Kling] Submitting job — room: ${frame.roomType}, duration: ${duration}s`);
+  // Kling's API only accepts whole-second duration values (3-15), not
+  // decimals. Our room-type defaults (e.g. 5.5s for "living") are tuned
+  // for FFmpeg/Ken Burns and need to be rounded for Kling specifically —
+  // this caused a 422 "Unprocessable Entity" the first time we tested.
+  const rawDuration = frame.durationSeconds || 5;
+  const roundedDuration = Math.min(15, Math.max(3, Math.round(rawDuration)));
+  const duration = String(roundedDuration);
+
+  console.log(`  [Kling] Submitting job — room: ${frame.roomType}, duration: ${duration}s (requested ${rawDuration}s)`);
 
   const result = await fal.subscribe("fal-ai/kling-video/o3/standard/image-to-video", {
     input: {
