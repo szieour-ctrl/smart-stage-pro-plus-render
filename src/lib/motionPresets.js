@@ -69,13 +69,24 @@ function buildZoompanFilter(preset, durationSeconds, startZoom = 1.0) {
   const maxZoom = Math.min(startZoom + 0.5, 1.8);
   const minZoom = Math.max(startZoom - 0.5, 1.0);
 
+  // IMPORTANT: the final scale=OUTPUT_W:OUTPUT_H with no aspect-ratio
+  // flag was force-stretching every motion preset's output to exactly
+  // 16:9 regardless of the source image's real aspect ratio — confirmed
+  // visually as a "stretched" result on real test footage. Every preset
+  // now pads to preserve aspect ratio, matching what `static` already did
+  // correctly. zoompan itself still operates at ZOOMPAN_W x ZOOMPAN_H
+  // (stretched internally, which is fine — that's just its working
+  // canvas), but the FINAL output step now always preserves real aspect
+  // ratio via force_original_aspect_ratio + pad, same pattern as static.
+  const finalScale = `scale=${OUTPUT_W}:${OUTPUT_H}:force_original_aspect_ratio=decrease,pad=${OUTPUT_W}:${OUTPUT_H}:(ow-iw)/2:(oh-ih)/2`;
+
   const filters = {
-    push_in:   `zoompan=z='min(zoom+0.004,${maxZoom})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${frames}:s=${ZOOMPAN_W}x${ZOOMPAN_H}:fps=${fps},scale=${OUTPUT_W}:${OUTPUT_H}`,
-    pull_back: `zoompan=z='if(lte(zoom,${minZoom}),${maxZoom},max(${minZoom},zoom-0.004))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${frames}:s=${ZOOMPAN_W}x${ZOOMPAN_H}:fps=${fps},scale=${OUTPUT_W}:${OUTPUT_H}`,
-    pan_left:  `zoompan=z=1.25:x='if(lte(x,0),iw*0.15,x-3)':y='ih/2-(ih/zoom/2)':d=${frames}:s=${ZOOMPAN_W}x${ZOOMPAN_H}:fps=${fps},scale=${OUTPUT_W}:${OUTPUT_H}`,
-    pan_right: `zoompan=z=1.25:x='if(gte(x,iw*0.85),iw*0.15,x+3)':y='ih/2-(ih/zoom/2)':d=${frames}:s=${ZOOMPAN_W}x${ZOOMPAN_H}:fps=${fps},scale=${OUTPUT_W}:${OUTPUT_H}`,
-    float:     `zoompan=z='1.1+0.03*sin(2*PI*on/${frames})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${frames}:s=${ZOOMPAN_W}x${ZOOMPAN_H}:fps=${fps},scale=${OUTPUT_W}:${OUTPUT_H}`,
-    static:    `scale=${OUTPUT_W}:${OUTPUT_H}:force_original_aspect_ratio=decrease,pad=${OUTPUT_W}:${OUTPUT_H}:(ow-iw)/2:(oh-ih)/2,fps=${fps}`,
+    push_in:   `zoompan=z='min(zoom+0.004,${maxZoom})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${frames}:s=${ZOOMPAN_W}x${ZOOMPAN_H}:fps=${fps},${finalScale}`,
+    pull_back: `zoompan=z='if(lte(zoom,${minZoom}),${maxZoom},max(${minZoom},zoom-0.004))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${frames}:s=${ZOOMPAN_W}x${ZOOMPAN_H}:fps=${fps},${finalScale}`,
+    pan_left:  `zoompan=z=1.25:x='if(lte(x,0),iw*0.15,x-3)':y='ih/2-(ih/zoom/2)':d=${frames}:s=${ZOOMPAN_W}x${ZOOMPAN_H}:fps=${fps},${finalScale}`,
+    pan_right: `zoompan=z=1.25:x='if(gte(x,iw*0.85),iw*0.15,x+3)':y='ih/2-(ih/zoom/2)':d=${frames}:s=${ZOOMPAN_W}x${ZOOMPAN_H}:fps=${fps},${finalScale}`,
+    float:     `zoompan=z='1.1+0.03*sin(2*PI*on/${frames})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${frames}:s=${ZOOMPAN_W}x${ZOOMPAN_H}:fps=${fps},${finalScale}`,
+    static:    `${finalScale},fps=${fps}`,
   };
 
   return filters[preset] || filters.float;
