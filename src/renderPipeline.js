@@ -14,7 +14,7 @@ const os = require("os");
 const axios = require("axios");
 
 const { downloadFrames } = require("./lib/downloadFrames");
-const { applyMotionPreset } = require("./lib/motionPresets");
+const { applyMotionPreset, resolveDuration } = require("./lib/motionPresets");
 const { generateMusic } = require("./lib/musicGen");
 const { assembleVideo, buildBeforeAfterClip } = require("./lib/assemble");
 const { uploadToCloudinary } = require("./lib/cloudinaryUpload");
@@ -32,7 +32,7 @@ async function processRenderJob(job) {
 
     // ── Step 2: Apply motion preset to each frame → individual clips ─────
     // Runs while music generates in parallel (Step 3 kicks off immediately).
-    const totalDuration = localFrames.reduce((sum, f) => sum + (f.durationSeconds || 4.5), 0);
+    const totalDuration = localFrames.reduce((sum, f) => sum + resolveDuration(f), 0);
 
     const musicPromise = generateMusic({
       durationSeconds: Math.ceil(totalDuration),
@@ -41,27 +41,36 @@ async function processRenderJob(job) {
     });
 
     const clipPaths = [];
+    let carryZoom = 1.0; // tracks ending zoom of the previous clip for continuity
+
     for (const frame of localFrames) {
       let clipPath;
       if (frame.isBeforeAfter && frame.beforeLocalPath) {
         // Flagship feature: vacant room holds, then wipes into staged version.
         // Build each side's motion clip first, then composite the wipe.
-        const vacantClip = await applyMotionPreset(
+        // Before/After clips don't participate in cross-room zoom continuity —
+        // they're a self-contained reveal, so always start at a fresh zoom.
+        const vacantResult = await applyMotionPreset(
           { ...frame, localPath: frame.beforeLocalPath, motionPreset: "pull_back", durationSeconds: 3 },
-          workDir
+          workDir,
+          1.0
         );
-        const stagedClip = await applyMotionPreset(
+        const stagedResult = await applyMotionPreset(
           { ...frame, motionPreset: "push_in", durationSeconds: 4 },
-          workDir
+          workDir,
+          1.0
         );
         clipPath = await buildBeforeAfterClip(
-          vacantClip,
-          stagedClip,
+          vacantResult.path,
+          stagedResult.path,
           workDir,
           `beforeafter_${path.basename(frame.localPath, path.extname(frame.localPath))}.mp4`
         );
+        carryZoom = 1.0; // reset after a before/after beat
       } else {
-        clipPath = await applyMotionPreset(frame, workDir);
+        const result = await applyMotionPreset(frame, workDir, carryZoom);
+        clipPath = result.path;
+        carryZoom = result.endingZoom;
       }
       clipPaths.push(clipPath);
     }
