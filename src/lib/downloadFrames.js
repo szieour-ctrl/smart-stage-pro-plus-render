@@ -36,6 +36,13 @@ async function downloadFrames(frames, workDir) {
       sequenceOrder: frame.sequenceOrder ?? i,
       useAiMotion: !!frame.useAiMotion,
       customPrompt: frame.customPrompt || null,
+      // These three were missing entirely until this fix — the
+      // addContinuationMotion flag from the original request was being
+      // silently dropped here, so it never reached renderPipeline.js or
+      // klingMotion.js no matter how correctly those files were written.
+      addContinuationMotion: !!frame.addContinuationMotion,
+      continuationPreset: frame.continuationPreset || null,
+      continuationDurationSeconds: frame.continuationDurationSeconds || null,
     });
   }
 
