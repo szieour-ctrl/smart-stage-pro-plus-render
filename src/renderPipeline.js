@@ -56,6 +56,12 @@ async function processRenderJob(job) {
         // needs the original Cloudinary URLs (frame.remoteImageUrl /
         // frame.remoteBeforeUrl), not the local disk paths downloadFrames.js
         // already pulled down for the Ken Burns/FFmpeg path.
+        //
+        // localPath is also passed through — it's the staged image already
+        // downloaded locally, used by the optional continuation-motion step
+        // (Ken Burns push-in/parallax that plays after Kling's transformation
+        // settles), so we never need to extract a frame from Kling's own
+        // video output.
         const result = await applyKlingMotion(
           {
             imageUrl: frame.isBeforeAfter ? frame.remoteBeforeUrl : frame.remoteImageUrl,
@@ -63,6 +69,10 @@ async function processRenderJob(job) {
             roomType: frame.roomType,
             durationSeconds: resolveDuration(frame),
             customPrompt: frame.customPrompt,
+            localPath: frame.localPath,
+            addContinuationMotion: !!frame.addContinuationMotion,
+            continuationPreset: frame.continuationPreset,
+            continuationDurationSeconds: frame.continuationDurationSeconds,
           },
           workDir,
           () => applyMotionPreset(frame, workDir, carryZoom)
