@@ -23,6 +23,13 @@ const ffmpeg = require("fluent-ffmpeg");
 const { fal } = require("@fal-ai/client");
 const { applyMotionPreset } = require("./motionPresets");
 
+// Must match the output dimensions used in motionPresets.js — kept as a
+// separate local constant rather than importing it, since these two
+// modules normalize to a shared OUTPUT spec but aren't otherwise coupled.
+// If motionPresets.js's OUTPUT_W/OUTPUT_H ever change, update here too.
+const OUTPUT_W = 1920;
+const OUTPUT_H = 1080;
+
 let configured = false;
 
 function ensureConfigured() {
@@ -107,12 +114,21 @@ function concatTwoClips(firstPath, secondPath, workDir, outputName) {
     // (approximately) the staged image, and the continuation clip starts
     // from that same staged image, so the cut should read as nearly
     // seamless without needing a transition effect to hide a mismatch.
+    //
+    // IMPORTANT: Kling's native output and our own FFmpeg-rendered clip
+    // are NOT guaranteed to share the same resolution, fps, or pixel
+    // format — confirmed by a real "Error reinitializing filters! Failed
+    // to inject frame into filter network: Invalid argument" failure when
+    // concatenating them directly. The fix is to explicitly normalize
+    // BOTH inputs to identical specs (scale + pad to OUTPUT_W x OUTPUT_H,
+    // fixed fps, yuv420p) as part of this same filter graph, rather than
+    // assuming they already match.
     ffmpeg()
       .input(firstPath)
       .input(secondPath)
       .complexFilter([
-        "[0:v]setpts=PTS-STARTPTS[v0]",
-        "[1:v]setpts=PTS-STARTPTS[v1]",
+        `[0:v]scale=${OUTPUT_W}:${OUTPUT_H}:force_original_aspect_ratio=decrease,pad=${OUTPUT_W}:${OUTPUT_H}:(ow-iw)/2:(oh-ih)/2,fps=20,format=yuv420p,setpts=PTS-STARTPTS[v0]`,
+        `[1:v]scale=${OUTPUT_W}:${OUTPUT_H}:force_original_aspect_ratio=decrease,pad=${OUTPUT_W}:${OUTPUT_H}:(ow-iw)/2:(oh-ih)/2,fps=20,format=yuv420p,setpts=PTS-STARTPTS[v1]`,
         "[v0][v1]concat=n=2:v=1:a=0[outv]",
       ])
       .outputOptions(["-map", "[outv]", "-pix_fmt", "yuv420p"])
