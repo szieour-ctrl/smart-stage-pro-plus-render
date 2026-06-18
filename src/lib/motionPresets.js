@@ -1,12 +1,9 @@
 // motionPresets.js — Applies Ken Burns-style motion to a still image,
-// producing a short video clip per frame. Fully functional — only
-// requires FFmpeg, which Railway installs via nixpacks.toml.
+// producing a short video clip per frame.
 
 const path = require("path");
 const ffmpeg = require("fluent-ffmpeg");
 
-// Auto preset assignment by room type — used when the agent leaves
-// motionPreset as "auto" rather than picking one manually.
 const AUTO_PRESETS = {
   exterior: "pull_back",
   living:   "push_in",
@@ -18,11 +15,6 @@ const AUTO_PRESETS = {
   default:  "float",
 };
 
-// Default shot duration by room type, used when the agent/frontend doesn't
-// specify durationSeconds explicitly. Uniform timing across every shot was
-// part of what made early tests feel like a slideshow — real walkthroughs
-// vary pacing: a hero shot (living room) holds longer, a utility shot
-// (bathroom) moves faster.
 const DEFAULT_DURATIONS = {
   exterior: 5.5,
   living:   5.5,
@@ -39,105 +31,135 @@ function resolveDuration(frame) {
   return DEFAULT_DURATIONS[frame.roomType] || DEFAULT_DURATIONS.default;
 }
 
-// FFmpeg zoompan filter strings. d = number of frames at given fps.
-//
-// IMPORTANT — zoompan memory: zoompan is memory-intensive at full resolution.
-// Fix: run zoompan at 960x540, then scale up to 1920x1080 as a separate step.
-// Cuts zoompan memory footprint to ~1/4 of running at output resolution.
+// ─── WORKING CANVAS ────────────────────────────────────────────────────────
+// zoompan runs at 960x540 to stay within Railway's memory limits, then the
+// result is scaled up to 1920x1080 as a cheap final step.
 const ZOOMPAN_W = 960;
 const ZOOMPAN_H = 540;
-const OUTPUT_W = 1920;
-const OUTPUT_H = 1080;
+const OUTPUT_W  = 1920;
+const OUTPUT_H  = 1080;
 
-// ─── WHY `on` INSTEAD OF `zoom` STATE ──────────────────────────────────────
+// ─── PRE-PROCESS: WHY WE CENTER-CROP TO 16:9 BEFORE ZOOMPAN ───────────────
+//
+// zoompan's internal viewport is iw/zoom × ih/zoom (a fraction of the SOURCE
+// frame). When zoom=1.0, that's the ENTIRE source — which gets stretched to
+// fill the 960×540 (16:9) output canvas. If the source is 3:2 (1600×1066),
+// zoompan horizontally stretches it by 1.78/1.5 = 18.5% to fill 16:9. This
+// was the "stretched/distorted" result confirmed on real footage.
+//
+// Fix: center-crop the source to 16:9 BEFORE zoompan. Then at any zoom level
+// the viewport is always a 16:9 crop from a 16:9 source → no stretch possible.
+//
+// Filter chain:
+//   1. scale='min(1600,iw)':-2        downscale if needed, keep aspect ratio
+//   2. crop to 16:9, centered         remove top/bottom (landscape) or
+//                                     left/right (portrait) excess pixels
+//
+// The crop formula min(ih, iw*9/16) safely handles both landscape and portrait:
+//   - 1600×1066 (3:2 landscape): crops to 1600×900  (removes 83px top/bottom)
+//   - 1024×768  (4:3 landscape): crops to 1024×576  (removes 96px top/bottom)
+//   - 1024×1024 (square):        crops to 1024×576  (removes 224px top/bottom)
+//   - 768×1024  (portrait):      crops to 768×432   (removes 296px top/bottom)
+//
+// Note: single quotes inside the crop expression protect commas from being
+// misread as FFmpeg filter-chain separators (FFmpeg expression quoting).
+// ───────────────────────────────────────────────────────────────────────────
+const PRE_PROCESS = [
+  `scale='min(1600,iw)':-2`,
+  `crop=iw:'min(ih,iw*9/16)':0:'(ih-min(ih,iw*9/16))/2'`,
+];
+
+// ─── FPS: 20 → 25 ──────────────────────────────────────────────────────────
+// At 20fps, the per-frame crop-window jump is large enough to read as stutter
+// rather than smooth motion — confirmed as "shakey" on real footage. 25fps
+// reduces each inter-frame jump by 20%. Still within Railway's memory budget
+// at the 960×540 zoompan working size.
+// ───────────────────────────────────────────────────────────────────────────
+const FPS = 25;
+
+// ─── FINAL SCALE ────────────────────────────────────────────────────────────
+// zoompan always outputs exactly ZOOMPAN_W×ZOOMPAN_H (960×540, 16:9), so this
+// step is always a clean 2× upscale with no distortion. The pad is a safety
+// net in case of any upstream rounding that produces a non-exactly-16:9 frame.
+const FINAL_SCALE = `scale=${OUTPUT_W}:${OUTPUT_H}:force_original_aspect_ratio=decrease,pad=${OUTPUT_W}:${OUTPUT_H}:(ow-iw)/2:(oh-ih)/2`;
+
+// ─── WHY `on` INSTEAD OF THE `zoom` STATE VARIABLE ─────────────────────────
 //
 // Previous versions used FFmpeg's internal `zoom` state variable in the z=
-// expression (e.g. z='min(zoom+0.004, maxZoom)'). This causes TWO bugs:
+// expression (e.g. z='min(zoom+0.004, maxZoom)'). This caused the jumpiness
+// at every clip transition:
 //
-// Bug 1 — JUMPINESS AT EVERY CLIP TRANSITION:
-//   zoompan always initializes its internal `zoom` to 1.0 at the start of each
-//   clip, regardless of startZoom. So even though renderPipeline.js correctly
-//   tracks carryZoom (e.g. 1.5) and passes it as startZoom, every clip snaps
-//   back to 1.0 on frame 0. The viewer sees: last frame of clip A at 1.5x →
-//   first frame of clip B snapping back to 1.0x. That visible jump was the
-//   "jumpy movement" reported in real footage.
+//   zoompan resets its internal `zoom` to 1.0 at the start of EVERY clip,
+//   regardless of what startZoom was passed in. So even though renderPipeline
+//   correctly tracked carryZoom (e.g. 1.5) and passed it as startZoom, every
+//   push_in clip snapped back to 1.0 on frame 0. The viewer saw: last frame
+//   of clip A at 1.5× zoom → first frame of clip B snapping to 1.0×. That
+//   visible snap was the "jumpy movement" on real footage.
 //
-// Bug 2 — pull_back's if() reset fired immediately:
-//   if(lte(zoom, minZoom), maxZoom, ...) evaluates on frame 0 when zoom=1.0,
-//   which equals minZoom when startZoom=1.0 — so it immediately snapped to
-//   maxZoom=1.5, introducing an additional first-frame jump on top of Bug 1.
+//   pull_back had a second jump: if(lte(zoom, minZoom), maxZoom, ...) fired
+//   on frame 0 when zoom=1.0 equalled minZoom, adding a second snap on top.
 //
-// FIX: Replace zoom-state expressions with `on` (output frame counter, 0-indexed).
-//   `on` is deterministic — it counts up from 0 each clip — which means
-//   startZoom can be baked in as a JS constant in the filter string, rather
-//   than relying on zoompan to remember it frame-to-frame. No more reset.
+// Fix: express zoom as a function of `on` (output frame counter, 0-indexed).
+//   `on` counts up from 0 each clip. startZoom is baked in as a JS constant
+//   inside the filter string, so the clip always begins at the right value
+//   regardless of zoompan's internal initialization.
 // ───────────────────────────────────────────────────────────────────────────
 
 function buildZoompanFilter(preset, durationSeconds, startZoom = 1.0) {
-  const fps = 20;
-  const frames = Math.round(durationSeconds * fps);
-
+  const frames  = Math.round(durationSeconds * FPS);
   const maxZoom = Math.min(startZoom + 0.5, 1.8);
   const minZoom = Math.max(startZoom - 0.5, 1.0);
 
-  // finalScale: zoompan outputs exactly ZOOMPAN_W x ZOOMPAN_H (always 16:9),
-  // so the scale step is a clean 2x upscale with no distortion. The
-  // force_original_aspect_ratio + pad is a safety net for any edge case where
-  // the zoompan output isn't exactly 16:9 (shouldn't happen, but protects
-  // against a silent stretch if something upstream changes).
-  const finalScale = `scale=${OUTPUT_W}:${OUTPUT_H}:force_original_aspect_ratio=decrease,pad=${OUTPUT_W}:${OUTPUT_H}:(ow-iw)/2:(oh-ih)/2`;
+  // Per-frame zoom delta for push_in and pull_back.
+  const pushRate = ((maxZoom - startZoom) / frames).toFixed(6);
+  const pullRate = ((maxZoom - minZoom)   / frames).toFixed(6);
 
-  // Centering anchor — positions the crop window at the center of the input
-  // for any zoom level. All presets use this as their x/y baseline.
-  // x = iw/2 - (viewport_width/2)  where viewport_width = iw/zoom
-  //   = iw/2 - iw/(zoom*2)
-  // This is safe (always in bounds) as long as zoom >= 1.0.
+  // Centering anchor — positions the crop window at the source center at any
+  // zoom level. Safe at all values zoom >= 1.0.
+  //   x = iw/2 - (iw/zoom)/2   →  same as  iw/2 - iw/(zoom*2)
+  //   y = ih/2 - (ih/zoom)/2
   const cx = `iw/2-(iw/zoom/2)`;
   const cy = `ih/2-(ih/zoom/2)`;
 
+  // Available pan margin = total source size minus the viewport size.
+  // With a 16:9 source (guaranteed by PRE_PROCESS) and 16:9 zoompan canvas,
+  // the viewport is iw/zoom × ih/zoom. Available horizontal margin = iw*(1-1/zoom).
+  const xMargin = `iw*(1-1/zoom)`;
+  const yMargin = `ih*(1-1/zoom)`;
+
   const filters = {
-    // push_in: zoom from startZoom up to maxZoom linearly.
-    // Uses `on` so frame 0 starts AT startZoom, not at zoompan's default 1.0.
-    push_in: `zoompan=z='min(${startZoom}+${(maxZoom - startZoom) / frames}*on,${maxZoom})':x='${cx}':y='${cy}':d=${frames}:s=${ZOOMPAN_W}x${ZOOMPAN_H}:fps=${fps},${finalScale}`,
+    // push_in: zoom from startZoom → maxZoom, centered. `on` starts at 0.
+    push_in: `zoompan=z='min(${startZoom}+${pushRate}*on,${maxZoom})':x='${cx}':y='${cy}':d=${frames}:s=${ZOOMPAN_W}x${ZOOMPAN_H}:fps=${FPS},${FINAL_SCALE}`,
 
-    // pull_back: zoom from maxZoom down to minZoom linearly.
-    // Replaces the if() reset expression — that expression jumped to maxZoom
-    // on frame 0 (because initial zoom=1.0 triggered the lte condition),
-    // creating a double-jump bug on top of the zoom-state reset issue.
-    pull_back: `zoompan=z='max(${minZoom},${maxZoom}-${(maxZoom - minZoom) / frames}*on)':x='${cx}':y='${cy}':d=${frames}:s=${ZOOMPAN_W}x${ZOOMPAN_H}:fps=${fps},${finalScale}`,
+    // pull_back: zoom from maxZoom → minZoom, centered. No if() reset — pure linear.
+    pull_back: `zoompan=z='max(${minZoom},${maxZoom}-${pullRate}*on)':x='${cx}':y='${cy}':d=${frames}:s=${ZOOMPAN_W}x${ZOOMPAN_H}:fps=${FPS},${FINAL_SCALE}`,
 
-    // pan_left: fixed zoom, pan from right to left across the frame.
-    // x starts at iw*0.25 (right-biased start) and decreases by 2px/frame.
-    // Safe range: x stays between 0 and iw*0.25 well within the 1.25x viewport.
-    pan_left:  `zoompan=z=1.25:x='max(0,iw*0.25-2*on)':y='${cy}':d=${frames}:s=${ZOOMPAN_W}x${ZOOMPAN_H}:fps=${fps},${finalScale}`,
+    // pan_left: fixed 1.25× zoom, pan right→left across the available margin.
+    // Start at right margin, move 2px/frame leftward, floor at 0.
+    pan_left:  `zoompan=z=1.25:x='max(0,${xMargin}-2*on)':y='${cy}':d=${frames}:s=${ZOOMPAN_W}x${ZOOMPAN_H}:fps=${FPS},${FINAL_SCALE}`,
 
-    // pan_right: fixed zoom, pan from left to right across the frame.
-    // x starts at 0 and increases by 2px/frame, capped at iw*0.25 (safe max).
-    pan_right: `zoompan=z=1.25:x='min(iw*0.25,2*on)':y='${cy}':d=${frames}:s=${ZOOMPAN_W}x${ZOOMPAN_H}:fps=${fps},${finalScale}`,
+    // pan_right: fixed 1.25× zoom, pan left→right across the available margin.
+    // Start at 0, move 2px/frame rightward, ceiling at available margin.
+    pan_right: `zoompan=z=1.25:x='min(${xMargin},2*on)':y='${cy}':d=${frames}:s=${ZOOMPAN_W}x${ZOOMPAN_H}:fps=${FPS},${FINAL_SCALE}`,
 
-    // float: gentle sine-wave breathing — zoom oscillates between 1.07–1.13.
-    // Already used `on` correctly in the old version, kept as-is.
-    float: `zoompan=z='1.1+0.03*sin(2*PI*on/${frames})':x='${cx}':y='${cy}':d=${frames}:s=${ZOOMPAN_W}x${ZOOMPAN_H}:fps=${fps},${finalScale}`,
+    // float: gentle sine-wave breathing between 1.07×–1.13×. Already `on`-based.
+    float: `zoompan=z='1.1+0.03*sin(2*PI*on/${frames})':x='${cx}':y='${cy}':d=${frames}:s=${ZOOMPAN_W}x${ZOOMPAN_H}:fps=${FPS},${FINAL_SCALE}`,
 
     // luxury_parallax: slow diagonal slider drift at a fixed modest zoom.
-    // Used as the Ken Burns continuation beat after a Kling clip.
+    // Used as the Ken Burns continuation beat that follows a Kling clip.
     //
-    // PREVIOUS BUG — out-of-bounds drift:
-    //   With iw=1600, zoom=1.15: viewport width = 1600/1.15 = 1391px.
-    //   Center x = 1600/2 - 1391/2 = 104px. Drift = 1391 * 0.08 = 111px.
-    //   Final x = 104 + 111 = 215px. Right edge = 215 + 1391 = 1606 > 1600.
-    //   FFmpeg silently clamped, producing zero movement for the last ~20% of
-    //   the clip. Fixed by reducing drift multipliers so the viewport stays
-    //   safely inside the image at any reasonable input size.
+    // PREVIOUS BUG — x drift exceeded image bounds:
+    //   With iw=1600, zoom=1.15: center_x=104px, drift=(1600/1.15)*0.08=111px.
+    //   Final right edge = 104+111+1391 = 1606 > 1600 → FFmpeg clamped silently
+    //   → zero movement for the last ~20% of the clip.
     //
-    // NEW VERSION: drift is expressed as a fraction of the AVAILABLE MARGIN
-    //   (the space between center and the safe edge), so it's self-bounding
-    //   regardless of input resolution. Max drift = 35% of available margin.
-    //   Available horizontal margin = iw/2 - (iw/zoom/2) = center x value.
-    //   So max drift = center_x * 0.35. Always safe.
-    luxury_parallax: `zoompan=z=1.15:x='(iw/2-(iw/zoom/2))*(1+0.35*(on/${frames}))':y='(ih/2-(ih/zoom/2))*(1-0.25*(on/${frames}))':d=${frames}:s=${ZOOMPAN_W}x${ZOOMPAN_H}:fps=${fps},${finalScale}`,
+    // FIX — express drift as a fraction of the AVAILABLE MARGIN:
+    //   Available x margin = iw*(1-1/zoom). Drift = margin * 0.35 (35% of
+    //   the safe travel range). This is mathematically bounded at any iw.
+    //   Same principle for y (25% of available y margin, drifting upward).
+    luxury_parallax: `zoompan=z=1.15:x='${cx}+${xMargin}*0.35*(on/${frames})':y='${cy}-${yMargin}*0.25*(on/${frames})':d=${frames}:s=${ZOOMPAN_W}x${ZOOMPAN_H}:fps=${FPS},${FINAL_SCALE}`,
 
-    static: `${finalScale},fps=${fps}`,
+    static: `${FINAL_SCALE},fps=${FPS}`,
   };
 
   return filters[preset] || filters.float;
@@ -151,34 +173,34 @@ function resolvePreset(frame) {
 }
 
 function getEndingZoom(preset, startZoom) {
-  // Mirrors the zoom math in buildZoompanFilter so renderPipeline.js can
-  // track carryZoom accurately and pass it to the next clip as startZoom.
   if (preset === "push_in")   return Math.min(startZoom + 0.5, 1.8);
   if (preset === "pull_back") return Math.max(startZoom - 0.5, 1.0);
-  return 1.1; // pan/float/static presets don't carry a meaningful zoom handoff
+  return 1.1;
 }
 
 function applyMotionPreset(frame, workDir, startZoom = 1.0) {
   return new Promise((resolve, reject) => {
-    const preset = resolvePreset(frame);
-    const duration = resolveDuration(frame);
-    const filter = buildZoompanFilter(preset, duration, startZoom);
+    const preset     = resolvePreset(frame);
+    const duration   = resolveDuration(frame);
+    const filter     = buildZoompanFilter(preset, duration, startZoom);
     const outputPath = path.join(workDir, `clip_${path.basename(frame.localPath, path.extname(frame.localPath))}.mp4`);
 
     ffmpeg(frame.localPath)
-      .loop(duration)
-      // Pre-scale large source images before zoompan — high-res Cloudinary
-      // images multiply zoompan's memory footprint. Scale to max 1600px wide
-      // first, then zoompan operates on the smaller canvas.
-      .videoFilters([`scale=min(1600\\,iw):-2`, filter])
+      // -loop 1 + -framerate FPS: loop the still image indefinitely at exactly
+      // FPS frames/second so zoompan always receives the right input frame rate.
+      // Replaces .loop(duration) which set -loop N (a count, not a rate) and
+      // left the input framerate unspecified — a mismatch that contributed to
+      // stuttering when zoompan's internal fps differed from the looped input.
+      .inputOptions(["-loop", "1", "-framerate", `${FPS}`])
+      .videoFilters([...PRE_PROCESS, filter])
       .outputOptions([
-        "-pix_fmt", "yuv420p",
-        "-movflags", "+faststart",
-        "-threads", "1",
+        "-pix_fmt",    "yuv420p",
+        "-movflags",   "+faststart",
+        "-threads",    "1",
       ])
       .duration(duration)
       .output(outputPath)
-      .on("end", () => resolve({ path: outputPath, endingZoom: getEndingZoom(preset, startZoom), duration }))
+      .on("end",   ()    => resolve({ path: outputPath, endingZoom: getEndingZoom(preset, startZoom), duration }))
       .on("error", (err) => reject(new Error(`FFmpeg motion failed (${preset}): ${err.message}`)))
       .run();
   });
