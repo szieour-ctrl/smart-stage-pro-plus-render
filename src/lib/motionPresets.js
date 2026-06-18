@@ -93,11 +93,16 @@ function buildZoompanFilter(preset, durationSeconds, startZoom = 1.0) {
     // real cinematographer's slider/dolly shot than a simple left-right pan.
     // This is the preset used as the SECOND beat after a Kling vacant→staged
     // transformation — see applyContinuationMotion() in klingMotion.js.
-    // Tested directly against single-prompt Kling pacing language, which
-    // failed (uniform speed, furniture continued shifting, image drifted
-    // from the real staged photo) — this two-stage approach is the
-    // validated, working alternative.
-    luxury_parallax: `zoompan=z=1.15:x='iw*0.08+iw*0.04*(on/${frames})':y='ih*0.06-ih*0.03*(on/${frames})':d=${frames}:s=${ZOOMPAN_W}x${ZOOMPAN_H}:fps=${fps},${finalScale}`,
+    //
+    // FIXED: the original version used an absolute pixel offset (iw*0.08)
+    // for x/y, which sat outside zoompan's valid crop-window range and got
+    // silently clamped to a single fixed position — confirmed visually as
+    // "zero movement" on real test footage. This version starts from the
+    // CENTERED position (iw/2-(iw/zoom/2), same anchor as every other
+    // preset) and drifts a small, bounded percentage of the available
+    // margin — the same safe pattern push_in/pan_left/pan_right already
+    // use, just applied diagonally instead of along one axis.
+    luxury_parallax: `zoompan=z=1.15:x='(iw/2-(iw/zoom/2))+(iw/zoom)*0.08*(on/${frames})':y='(ih/2-(ih/zoom/2))-(ih/zoom)*0.06*(on/${frames})':d=${frames}:s=${ZOOMPAN_W}x${ZOOMPAN_H}:fps=${fps},${finalScale}`,
     static:    `${finalScale},fps=${fps}`,
   };
 
