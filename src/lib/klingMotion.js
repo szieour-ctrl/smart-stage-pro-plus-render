@@ -19,7 +19,9 @@
 const fs = require("fs");
 const path = require("path");
 const axios = require("axios");
+const ffmpeg = require("fluent-ffmpeg");
 const { fal } = require("@fal-ai/client");
+const { applyMotionPreset } = require("./motionPresets");
 
 let configured = false;
 
@@ -69,6 +71,69 @@ function buildPrompt(frame) {
     frame.customPrompt ||
     "Smooth cinematic camera movement across the exterior as lighting and landscaping gradually transform and improve, photorealistic, no distortion, house structure and architecture remain completely fixed and unchanged"
   );
+}
+
+// ── CONTINUATION MOTION ──────────────────────────────────────────────
+// After Kling's transformation finishes (vacant becomes staged), the
+// clip ends on a static-feeling final frame. This stitches on a few
+// extra seconds of Ken Burns motion (push-in, pull-back, float, pan)
+// starting from the REAL staged image — not an extracted video frame,
+// which would risk compounding any minor artifacts from the Kling
+// generation itself. Uses the proven, already-tested Ken Burns engine
+// rather than trusting Kling's own multi-shot prompting to get a second
+// camera move right.
+
+function concatTwoClips(firstPath, secondPath, workDir, outputName) {
+  return new Promise((resolve, reject) => {
+    const outputPath = path.join(workDir, outputName);
+
+    // Simple hard cut, not a crossfade — Kling's clip already ends on
+    // (approximately) the staged image, and the continuation clip starts
+    // from that same staged image, so the cut should read as nearly
+    // seamless without needing a transition effect to hide a mismatch.
+    ffmpeg()
+      .input(firstPath)
+      .input(secondPath)
+      .complexFilter([
+        "[0:v]setpts=PTS-STARTPTS[v0]",
+        "[1:v]setpts=PTS-STARTPTS[v1]",
+        "[v0][v1]concat=n=2:v=1:a=0[outv]",
+      ])
+      .outputOptions(["-map", "[outv]", "-pix_fmt", "yuv420p"])
+      .output(outputPath)
+      .on("end", () => resolve(outputPath))
+      .on("error", (err) => reject(new Error(`Continuation concat failed: ${err.message}`)))
+      .run();
+  });
+}
+
+async function applyContinuationMotion(klingClipPath, frame, workDir) {
+  // Continuation always uses the real staged image as its source — frame
+  // here refers to the original frame object, which already has the
+  // local downloaded staged image path available from downloadFrames.js.
+  const continuationPreset = frame.continuationPreset || "push_in";
+  const continuationDuration = frame.continuationDurationSeconds || 3;
+
+  console.log(`  [Kling] Adding ${continuationDuration}s continuation motion (${continuationPreset})`);
+
+  const continuationResult = await applyMotionPreset(
+    {
+      localPath: frame.localPath, // the real staged image, downloaded locally
+      motionPreset: continuationPreset,
+      durationSeconds: continuationDuration,
+    },
+    workDir,
+    1.0
+  );
+
+  const combinedPath = await concatTwoClips(
+    klingClipPath,
+    continuationResult.path,
+    workDir,
+    `kling_continued_${Date.now()}.mp4`
+  );
+
+  return { path: combinedPath, endingZoom: continuationResult.endingZoom };
 }
 
 // ── KLING GENERATION ──────────────────────────────────────────────────
@@ -128,8 +193,18 @@ async function generateKlingClip(frame, workDir) {
 
 async function applyKlingMotion(frame, workDir, fallbackFn) {
   try {
-    const clipPath = await generateKlingClip(frame, workDir);
-    return { path: clipPath, source: "kling", endingZoom: 1.0 };
+    let clipPath = await generateKlingClip(frame, workDir);
+    let endingZoom = 1.0;
+
+    // Optional: continue with Ken Burns motion after Kling's transformation
+    // settles, so the video doesn't go static the instant staging finishes.
+    if (frame.addContinuationMotion) {
+      const continued = await applyContinuationMotion(clipPath, frame, workDir);
+      clipPath = continued.path;
+      endingZoom = continued.endingZoom;
+    }
+
+    return { path: clipPath, source: "kling", endingZoom };
   } catch (err) {
     console.error(`  [Kling] Failed, falling back to Ken Burns: ${err.message}`);
     const fallbackResult = await fallbackFn();
