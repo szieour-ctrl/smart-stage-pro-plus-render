@@ -1,0 +1,5 @@
+# Python dependencies for motionRenderer.py
+# opencv-python-headless: no GUI/display deps — correct for Railway server environment
+# numpy: required by OpenCV
+opencv-python-headless
+numpy
