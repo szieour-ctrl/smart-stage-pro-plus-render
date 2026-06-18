@@ -212,24 +212,36 @@ async function generateKlingClip(frame, workDir) {
 // proven Ken Burns path rather than failing the entire video job.
 
 async function applyKlingMotion(frame, workDir, fallbackFn) {
+  let clipPath;
+
+  // Kling generation has its own try/catch — if THIS fails, we have no
+  // usable clip at all, so falling back to Ken Burns from scratch is
+  // correct here.
   try {
-    let clipPath = await generateKlingClip(frame, workDir);
-    let endingZoom = 1.0;
-
-    // Optional: continue with Ken Burns motion after Kling's transformation
-    // settles, so the video doesn't go static the instant staging finishes.
-    if (frame.addContinuationMotion) {
-      const continued = await applyContinuationMotion(clipPath, frame, workDir);
-      clipPath = continued.path;
-      endingZoom = continued.endingZoom;
-    }
-
-    return { path: clipPath, source: "kling", endingZoom };
+    clipPath = await generateKlingClip(frame, workDir);
   } catch (err) {
-    console.error(`  [Kling] Failed, falling back to Ken Burns: ${err.message}`);
+    console.error(`  [Kling] Generation failed, falling back to Ken Burns: ${err.message}`);
     const fallbackResult = await fallbackFn();
     return { ...fallbackResult, source: "ken_burns_fallback" };
   }
+
+  // Continuation motion is a SEPARATE try/catch. If Kling already
+  // succeeded (real money already spent, real working clip in hand),
+  // a failure in the continuation step should never discard that —
+  // it should just skip the continuation and return the Kling clip as-is.
+  let endingZoom = 1.0;
+  if (frame.addContinuationMotion) {
+    try {
+      const continued = await applyContinuationMotion(clipPath, frame, workDir);
+      clipPath = continued.path;
+      endingZoom = continued.endingZoom;
+    } catch (err) {
+      console.error(`  [Kling] Continuation motion failed, using Kling clip without it: ${err.message}`);
+      // clipPath stays as the successful Kling-only result — not discarded.
+    }
+  }
+
+  return { path: clipPath, source: "kling", endingZoom };
 }
 
 module.exports = { applyKlingMotion, generateKlingClip, enforceScopeRules, buildPrompt };
