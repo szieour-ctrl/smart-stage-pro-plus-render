@@ -1,280 +1,111 @@
-// klingMotion.js — AI-generated camera motion via Kling (through fal.ai),
-// using the official @fal-ai/client SDK rather than raw HTTP requests.
+// ─── PATCH FOR klingMotion.js ──────────────────────────────────────────────
 //
-// IMPORTANT — SCOPE RESTRICTION (read before modifying):
-// This module is intentionally restricted to two use cases validated
-// against real Smart Stage PRO listings:
-//   1. Interior vacant→staged interpolation (start/end frame, same room)
-//   2. Exterior day→twilight / landscape enhancement (start/end frame)
+// Add extractLastFrame() anywhere before applyKlingMotion().
+// Then update the three places marked CHANGE inside applyContinuationMotion().
 //
-// AI motion is NEVER applied to a single still image with no end frame
-// for interior rooms — that would mean the model is inventing unseen
-// architecture rather than interpolating between two real, disclosed
-// images, which is an AB 723 compliance risk. See enforceScopeRules()
-// below, which is a hard runtime check, not just a comment.
+// WHY: Previously, continuation motion ran Ken Burns on the original staged
+// image (localPath). That image is the STARTING state of Kling's clip, not
+// the ending state — so the Ken Burns continuation begins at a different zoom,
+// crop, and composition than where Kling left off. The viewer sees an obvious
+// size/position jump at the stitch point.
 //
-// Falls back to Ken Burns (motionPresets.js) on any failure — AI motion
-// is a premium enhancement, not a dependency the pipeline requires.
+// FIX: Extract the actual last frame of Kling's output video as a PNG,
+// then feed THAT image into Ken Burns. The first frame of the Ken Burns clip
+// is now pixel-identical to the last frame of the Kling clip — seamless cut.
+// ───────────────────────────────────────────────────────────────────────────
 
-const fs = require("fs");
 const path = require("path");
-const axios = require("axios");
 const ffmpeg = require("fluent-ffmpeg");
-const { fal } = require("@fal-ai/client");
-const { applyMotionPreset } = require("./motionPresets");
 
-// Must match the output dimensions used in motionPresets.js — kept as a
-// separate local constant rather than importing it, since these two
-// modules normalize to a shared OUTPUT spec but aren't otherwise coupled.
-// If motionPresets.js's OUTPUT_W/OUTPUT_H ever change, update here too.
-const OUTPUT_W = 1920;
-const OUTPUT_H = 1080;
+// ── ADD THIS FUNCTION ────────────────────────────────────────────────────────
 
-let configured = false;
-
-function ensureConfigured() {
-  if (configured) return;
-  if (!process.env.FAL_KEY) {
-    throw new Error("FAL_KEY not set — cannot use Kling AI motion");
-  }
-  fal.config({ credentials: process.env.FAL_KEY });
-  configured = true;
-}
-
-// ── SCOPE ENFORCEMENT ─────────────────────────────────────────────────
-// The real safety boundary isn't "interior vs exterior" — it's whether
-// Kling has two REAL, KNOWN endpoints to interpolate between, or has to
-// INVENT content because only one image exists.
-//
-//   - Vacant + Staged pair (from Smart Stage PRO staging) → both endpoints
-//     are real, disclosed images. Kling fills in the transition between
-//     two known states. Low risk, AI Motion freely available here.
-//
-//   - A single photo with no pair (e.g. professional photography uploaded
-//     without a staged counterpart) → Kling has nothing to interpolate
-//     toward. It must invent what a camera move reveals — what's beyond
-//     the frame, what an unseen angle looks like. This is the exact
-//     unconstrained-inference risk VideoTour.ai's own docs describe
-//     causing hallucinated objects/architecture.
-//
-// Rule: ANY interior frame without both a start and end image is rejected
-// outright, regardless of room type. Exterior is the only case where a
-// single image is permitted, since there's no fixed interior architecture
-// at risk — landscaping/sky have more tolerance for invented detail than
-// a room's walls and layout do. Even then, this is a judgment call worth
-// revisiting, not an assumption that exteriors are risk-free.
-
-function enforceScopeRules(frame) {
-  const hasKnownPair = !!frame.endImageUrl;
-  const isExterior = frame.roomType === "exterior";
-
-  if (!hasKnownPair && !isExterior) {
-    throw new Error(
-      `Kling AI motion rejected: no end image provided for room type "${frame.roomType}". AI motion on a single interior photo requires Kling to invent unseen content (architecture, layout) rather than interpolate between two known images — this is disabled by design. Use a vacant+staged pair, or use Ken Burns for single-image interior shots. See AB 723 scope restriction in klingMotion.js.`
-    );
-  }
-}
-
-// ── PROMPT TEMPLATES ──────────────────────────────────────────────────
-// Kept separate per use case since the framing differs meaningfully —
-// interior is about furniture appearing, exterior is about lighting/
-// landscape transformation with the structure held fixed.
-
-function buildPrompt(frame) {
-  const isInterior = !["exterior"].includes(frame.roomType);
-
-  if (isInterior) {
-    return (
-      frame.customPrompt ||
-      "Smooth cinematic push-in camera movement through an empty room as furniture and decor gradually appear, room becomes fully furnished and staged, photorealistic, no distortion, stable architecture, walls and windows remain fixed"
-    );
-  }
-
-  return (
-    frame.customPrompt ||
-    "Smooth cinematic camera movement across the exterior as lighting and landscaping gradually transform and improve, photorealistic, no distortion, house structure and architecture remain completely fixed and unchanged"
-  );
-}
-
-// ── CONTINUATION MOTION ──────────────────────────────────────────────
-// After Kling's transformation finishes (vacant becomes staged), the
-// clip ends on a static-feeling final frame. This stitches on a few
-// extra seconds of Ken Burns motion (push-in, pull-back, float, pan)
-// starting from the REAL staged image — not an extracted video frame,
-// which would risk compounding any minor artifacts from the Kling
-// generation itself. Uses the proven, already-tested Ken Burns engine
-// rather than trusting Kling's own multi-shot prompting to get a second
-// camera move right.
-
-function concatTwoClips(firstPath, secondPath, workDir, outputName) {
+/**
+ * Extracts the last frame of a video clip as a PNG.
+ * Used to seed the Ken Burns continuation clip from Kling's exact end state,
+ * so the first frame of Ken Burns is pixel-identical to Kling's last frame.
+ *
+ * @param {string} videoPath  - Path to the Kling output video on disk.
+ * @param {string} workDir    - Temp directory for this job.
+ * @returns {Promise<string>} - Path to the extracted PNG.
+ */
+async function extractLastFrame(videoPath, workDir) {
+  const outputPath = path.join(workDir, `lastframe_${path.basename(videoPath, ".mp4")}.png`);
   return new Promise((resolve, reject) => {
-    const outputPath = path.join(workDir, outputName);
-
-    // Simple hard cut, not a crossfade — Kling's clip already ends on
-    // (approximately) the staged image, and the continuation clip starts
-    // from that same staged image, so the cut should read as nearly
-    // seamless without needing a transition effect to hide a mismatch.
-    //
-    // IMPORTANT: Kling's native output and our own FFmpeg-rendered clip
-    // are NOT guaranteed to share the same resolution, fps, or pixel
-    // format — confirmed by a real "Error reinitializing filters! Failed
-    // to inject frame into filter network: Invalid argument" failure when
-    // concatenating them directly. The fix is to explicitly normalize
-    // BOTH inputs to identical specs (scale + pad to OUTPUT_W x OUTPUT_H,
-    // fixed fps, yuv420p) as part of this same filter graph, rather than
-    // assuming they already match.
-    ffmpeg()
-      .input(firstPath)
-      .input(secondPath)
-      .complexFilter([
-        `[0:v]scale=${OUTPUT_W}:${OUTPUT_H}:force_original_aspect_ratio=decrease,pad=${OUTPUT_W}:${OUTPUT_H}:(ow-iw)/2:(oh-ih)/2,fps=20,format=yuv420p,setpts=PTS-STARTPTS[v0]`,
-        `[1:v]scale=${OUTPUT_W}:${OUTPUT_H}:force_original_aspect_ratio=decrease,pad=${OUTPUT_W}:${OUTPUT_H}:(ow-iw)/2:(oh-ih)/2,fps=20,format=yuv420p,setpts=PTS-STARTPTS[v1]`,
-        "[v0][v1]concat=n=2:v=1:a=0[outv]",
+    ffmpeg(videoPath)
+      .outputOptions([
+        "-sseof", "-0.1",  // seek to 0.1s before end of file
+        "-vframes", "1",   // grab exactly one frame
+        "-q:v", "2",       // near-lossless quality (PNG ignores this, but safe)
       ])
-      .outputOptions(["-map", "[outv]", "-pix_fmt", "yuv420p"])
       .output(outputPath)
       .on("end", () => resolve(outputPath))
-      .on("error", (err) => reject(new Error(`Continuation concat failed: ${err.message}`)))
-      .run();
+      .on("error", (err) => reject(new Error(`extractLastFrame failed: ${err.message}`)));
   });
 }
 
-async function applyContinuationMotion(klingClipPath, frame, workDir) {
-  // Continuation always uses the real staged image as its source — frame
-  // here refers to the original frame object, which already has the
-  // local downloaded staged image path available from downloadFrames.js.
-  // Default to luxury_parallax — push_in immediately after Kling's own
-  // push-in transformation would feel repetitive (same motion twice in a
-  // row). A slow parallax drift gives the second beat real contrast and
-  // matches the validated "Push → Transform → Parallax" sequence design.
-  const continuationPreset = frame.continuationPreset || "luxury_parallax";
-  const continuationDuration = frame.continuationDurationSeconds || 3;
+// ── CHANGE INSIDE applyContinuationMotion() ──────────────────────────────────
+//
+// Current signature:
+//   async function applyContinuationMotion(klingSrc, localPath, preset, durationSeconds, workDir)
+//
+// Change to:
+//   async function applyContinuationMotion(klingSrc, preset, durationSeconds, workDir)
+//   (localPath removed — we derive the source from klingSrc directly)
+//
+// Current body (find this block):
+//   const continuationResult = await applyMotionPreset(
+//     { localPath, motionPreset: preset, roomType: null },
+//     workDir,
+//     1.0
+//   );
+//
+// Replace with:
+async function applyContinuationMotion(klingSrc, preset, durationSeconds, workDir) {
+  // Extract the last frame of Kling's clip — this is the pixel-exact state
+  // Kling ended on. Ken Burns will start from this image, making the cut
+  // between Kling and Ken Burns invisible to the viewer.
+  const lastFramePath = await extractLastFrame(klingSrc, workDir);
 
-  console.log(`  [Kling] Adding ${continuationDuration}s continuation motion (${continuationPreset})`);
-
+  // Run Ken Burns on the extracted last frame.
+  // startZoom = 1.0 is correct here: the last frame already represents Kling's
+  // full zoomed/panned composition — Ken Burns doesn't need to compensate for
+  // any prior zoom state, it just continues naturally from that still image.
+  const { applyMotionPreset } = require("./motionPresets");
   const continuationResult = await applyMotionPreset(
-    {
-      localPath: frame.localPath, // the real staged image, downloaded locally
-      motionPreset: continuationPreset,
-      durationSeconds: continuationDuration,
-    },
+    { localPath: lastFramePath, motionPreset: preset, durationSeconds, roomType: null },
     workDir,
     1.0
   );
 
-  // ── TEMPORARY DEBUG: upload both individual clips BEFORE concatenation,
-  // so each can be inspected in isolation. This is the fastest way to tell
-  // whether the bug lives in the parallax filter itself (motionPresets.js)
-  // or only appears after the concat/normalize step. Remove once the
-  // continuation feature is confirmed working end to end.
-  try {
-    const { uploadToCloudinary } = require("./cloudinaryUpload");
-    const debugUrls = await uploadToCloudinary(
-      { debug_kling_only: klingClipPath, debug_parallax_only: continuationResult.path },
-      "debug-continuation"
-    );
-    console.log(`  [DEBUG] Kling clip alone: ${debugUrls.debug_kling_only}`);
-    console.log(`  [DEBUG] Parallax clip alone: ${debugUrls.debug_parallax_only}`);
-  } catch (debugErr) {
-    console.error(`  [DEBUG] Debug upload failed (non-fatal): ${debugErr.message}`);
-  }
-
-  const combinedPath = await concatTwoClips(
-    klingClipPath,
-    continuationResult.path,
-    workDir,
-    `kling_continued_${Date.now()}.mp4`
-  );
-
-  return { path: combinedPath, endingZoom: continuationResult.endingZoom };
+  return continuationResult;
 }
 
-// ── KLING GENERATION ──────────────────────────────────────────────────
+// ── CHANGE THE CALL SITE INSIDE applyKlingMotion() ──────────────────────────
+//
+// Find the existing call to applyContinuationMotion and remove the localPath arg:
+//
+// BEFORE:
+//   const continuation = await applyContinuationMotion(
+//     klingSrc, params.localPath, params.continuationPreset,
+//     params.continuationDurationSeconds, workDir
+//   );
+//
+// AFTER:
+//   const continuation = await applyContinuationMotion(
+//     klingSrc, params.continuationPreset,
+//     params.continuationDurationSeconds, workDir
+//   );
+//
+// Also update renderPipeline.js — the comment on line 61-64 says:
+//   "localPath is also passed through — it's the staged image already
+//    downloaded locally, used by the optional continuation-motion step,
+//    so we never need to extract a frame from Kling's own video output."
+//
+// That comment is now wrong. localPath is still passed (Kling needs it for
+// the fallback Ken Burns path), but the continuation step NO LONGER uses it.
+// Update the comment to:
+//   "localPath is passed as the Ken Burns fallback source if Kling fails.
+//    The continuation-motion step no longer uses localPath — it extracts
+//    the actual last frame from Kling's output video instead."
 
-async function generateKlingClip(frame, workDir) {
-  ensureConfigured();
-  enforceScopeRules(frame);
-
-  const prompt = buildPrompt(frame);
-
-  // Kling's API only accepts whole-second duration values (3-15), not
-  // decimals. Our room-type defaults (e.g. 5.5s for "living") are tuned
-  // for FFmpeg/Ken Burns and need to be rounded for Kling specifically —
-  // this caused a 422 "Unprocessable Entity" the first time we tested.
-  const rawDuration = frame.durationSeconds || 5;
-  const roundedDuration = Math.min(15, Math.max(3, Math.round(rawDuration)));
-  const duration = String(roundedDuration);
-
-  console.log(`  [Kling] Submitting job — room: ${frame.roomType}, duration: ${duration}s (requested ${rawDuration}s)`);
-
-  const result = await fal.subscribe("fal-ai/kling-video/o3/standard/image-to-video", {
-    input: {
-      image_url: frame.imageUrl,
-      end_image_url: frame.endImageUrl || undefined,
-      prompt,
-      duration,
-      generate_audio: false, // Mubert handles music separately — avoid conflicting audio tracks
-    },
-    logs: true,
-    onQueueUpdate: (update) => {
-      if (update.status === "IN_PROGRESS") {
-        update.logs?.forEach((log) => console.log(`  [Kling] ${log.message}`));
-      }
-    },
-  });
-
-  const videoUrl = result.data?.video?.url;
-  if (!videoUrl) {
-    throw new Error("Kling returned no video URL");
-  }
-
-  // Download the generated clip to local disk so it can flow into the
-  // same assembleVideo() pipeline as Ken Burns clips — from this point
-  // forward, the rest of the pipeline doesn't know or care whether a
-  // clip came from FFmpeg or Kling.
-  const outputPath = path.join(workDir, `kling_${Date.now()}.mp4`);
-  const response = await axios.get(videoUrl, { responseType: "arraybuffer" });
-  fs.writeFileSync(outputPath, response.data);
-
-  return outputPath;
-}
-
-// ── ENTRY POINT WITH FALLBACK ────────────────────────────────────────
-// AI motion is a premium enhancement, not a hard dependency. Any failure
-// (API down, scope rejection, fal.ai account issue) falls back to the
-// proven Ken Burns path rather than failing the entire video job.
-
-async function applyKlingMotion(frame, workDir, fallbackFn) {
-  let clipPath;
-
-  // Kling generation has its own try/catch — if THIS fails, we have no
-  // usable clip at all, so falling back to Ken Burns from scratch is
-  // correct here.
-  try {
-    clipPath = await generateKlingClip(frame, workDir);
-  } catch (err) {
-    console.error(`  [Kling] Generation failed, falling back to Ken Burns: ${err.message}`);
-    const fallbackResult = await fallbackFn();
-    return { ...fallbackResult, source: "ken_burns_fallback" };
-  }
-
-  // Continuation motion is a SEPARATE try/catch. If Kling already
-  // succeeded (real money already spent, real working clip in hand),
-  // a failure in the continuation step should never discard that —
-  // it should just skip the continuation and return the Kling clip as-is.
-  let endingZoom = 1.0;
-  if (frame.addContinuationMotion) {
-    try {
-      const continued = await applyContinuationMotion(clipPath, frame, workDir);
-      clipPath = continued.path;
-      endingZoom = continued.endingZoom;
-    } catch (err) {
-      console.error(`  [Kling] Continuation motion failed, using Kling clip without it: ${err.message}`);
-      // clipPath stays as the successful Kling-only result — not discarded.
-    }
-  }
-
-  return { path: clipPath, source: "kling", endingZoom };
-}
-
-module.exports = { applyKlingMotion, generateKlingClip, enforceScopeRules, buildPrompt };
+module.exports = { extractLastFrame };
