@@ -35,19 +35,35 @@ function ensureConfigured() {
 }
 
 // ── SCOPE ENFORCEMENT ─────────────────────────────────────────────────
-// Hard rule, not a default: interior AI motion REQUIRES both a start
-// and end image (real vacant + real staged). A single-image interior
-// request is rejected outright rather than silently falling back —
-// callers should be using Ken Burns for that case in the first place.
-// Exterior is more permissive since there's no fixed interior
-// architecture at risk of being misrepresented.
+// The real safety boundary isn't "interior vs exterior" — it's whether
+// Kling has two REAL, KNOWN endpoints to interpolate between, or has to
+// INVENT content because only one image exists.
+//
+//   - Vacant + Staged pair (from Smart Stage PRO staging) → both endpoints
+//     are real, disclosed images. Kling fills in the transition between
+//     two known states. Low risk, AI Motion freely available here.
+//
+//   - A single photo with no pair (e.g. professional photography uploaded
+//     without a staged counterpart) → Kling has nothing to interpolate
+//     toward. It must invent what a camera move reveals — what's beyond
+//     the frame, what an unseen angle looks like. This is the exact
+//     unconstrained-inference risk VideoTour.ai's own docs describe
+//     causing hallucinated objects/architecture.
+//
+// Rule: ANY interior frame without both a start and end image is rejected
+// outright, regardless of room type. Exterior is the only case where a
+// single image is permitted, since there's no fixed interior architecture
+// at risk — landscaping/sky have more tolerance for invented detail than
+// a room's walls and layout do. Even then, this is a judgment call worth
+// revisiting, not an assumption that exteriors are risk-free.
 
 function enforceScopeRules(frame) {
-  const isInterior = !["exterior"].includes(frame.roomType);
+  const hasKnownPair = !!frame.endImageUrl;
+  const isExterior = frame.roomType === "exterior";
 
-  if (isInterior && !frame.endImageUrl) {
+  if (!hasKnownPair && !isExterior) {
     throw new Error(
-      `Kling AI motion rejected: interior room type "${frame.roomType}" requires both a start and end image (vacant + staged). Single-image AI motion on interiors is disabled by design — see AB 723 scope restriction in klingMotion.js.`
+      `Kling AI motion rejected: no end image provided for room type "${frame.roomType}". AI motion on a single interior photo requires Kling to invent unseen content (architecture, layout) rather than interpolate between two known images — this is disabled by design. Use a vacant+staged pair, or use Ken Burns for single-image interior shots. See AB 723 scope restriction in klingMotion.js.`
     );
   }
 }
@@ -111,7 +127,11 @@ async function applyContinuationMotion(klingClipPath, frame, workDir) {
   // Continuation always uses the real staged image as its source — frame
   // here refers to the original frame object, which already has the
   // local downloaded staged image path available from downloadFrames.js.
-  const continuationPreset = frame.continuationPreset || "push_in";
+  // Default to luxury_parallax — push_in immediately after Kling's own
+  // push-in transformation would feel repetitive (same motion twice in a
+  // row). A slow parallax drift gives the second beat real contrast and
+  // matches the validated "Push → Transform → Parallax" sequence design.
+  const continuationPreset = frame.continuationPreset || "luxury_parallax";
   const continuationDuration = frame.continuationDurationSeconds || 3;
 
   console.log(`  [Kling] Adding ${continuationDuration}s continuation motion (${continuationPreset})`);
