@@ -86,6 +86,18 @@ function buildZoompanFilter(preset, durationSeconds, startZoom = 1.0) {
     pan_left:  `zoompan=z=1.25:x='if(lte(x,0),iw*0.15,x-3)':y='ih/2-(ih/zoom/2)':d=${frames}:s=${ZOOMPAN_W}x${ZOOMPAN_H}:fps=${fps},${finalScale}`,
     pan_right: `zoompan=z=1.25:x='if(gte(x,iw*0.85),iw*0.15,x+3)':y='ih/2-(ih/zoom/2)':d=${frames}:s=${ZOOMPAN_W}x${ZOOMPAN_H}:fps=${fps},${finalScale}`,
     float:     `zoompan=z='1.1+0.03*sin(2*PI*on/${frames})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${frames}:s=${ZOOMPAN_W}x${ZOOMPAN_H}:fps=${fps},${finalScale}`,
+    // luxury_parallax — slow, deliberate diagonal slider drift at a fixed,
+    // modest zoom (1.15x, well below push_in's range) so the room reads as
+    // settled/finished rather than still moving inward. The diagonal path
+    // (combining slight horizontal AND vertical drift) reads more like a
+    // real cinematographer's slider/dolly shot than a simple left-right pan.
+    // This is the preset used as the SECOND beat after a Kling vacant→staged
+    // transformation — see applyContinuationMotion() in klingMotion.js.
+    // Tested directly against single-prompt Kling pacing language, which
+    // failed (uniform speed, furniture continued shifting, image drifted
+    // from the real staged photo) — this two-stage approach is the
+    // validated, working alternative.
+    luxury_parallax: `zoompan=z=1.15:x='iw*0.08+iw*0.04*(on/${frames})':y='ih*0.06-ih*0.03*(on/${frames})':d=${frames}:s=${ZOOMPAN_W}x${ZOOMPAN_H}:fps=${fps},${finalScale}`,
     static:    `${finalScale},fps=${fps}`,
   };
 
