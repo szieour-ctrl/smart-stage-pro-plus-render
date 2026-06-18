@@ -162,6 +162,23 @@ async function applyContinuationMotion(klingClipPath, frame, workDir) {
     1.0
   );
 
+  // ── TEMPORARY DEBUG: upload both individual clips BEFORE concatenation,
+  // so each can be inspected in isolation. This is the fastest way to tell
+  // whether the bug lives in the parallax filter itself (motionPresets.js)
+  // or only appears after the concat/normalize step. Remove once the
+  // continuation feature is confirmed working end to end.
+  try {
+    const { uploadToCloudinary } = require("./cloudinaryUpload");
+    const debugUrls = await uploadToCloudinary(
+      { debug_kling_only: klingClipPath, debug_parallax_only: continuationResult.path },
+      "debug-continuation"
+    );
+    console.log(`  [DEBUG] Kling clip alone: ${debugUrls.debug_kling_only}`);
+    console.log(`  [DEBUG] Parallax clip alone: ${debugUrls.debug_parallax_only}`);
+  } catch (debugErr) {
+    console.error(`  [DEBUG] Debug upload failed (non-fatal): ${debugErr.message}`);
+  }
+
   const combinedPath = await concatTwoClips(
     klingClipPath,
     continuationResult.path,
