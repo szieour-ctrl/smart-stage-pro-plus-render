@@ -165,8 +165,17 @@ function concatTwoClips(firstPath, secondPath, workDir, outputName) {
       .input(firstPath)
       .input(secondPath)
       .complexFilter([
-        `[0:v]scale=${OUTPUT_W}:${OUTPUT_H}:force_original_aspect_ratio=decrease,pad=${OUTPUT_W}:${OUTPUT_H}:(ow-iw)/2:(oh-ih)/2,fps=20,format=yuv420p,setpts=PTS-STARTPTS[v0]`,
-        `[1:v]scale=${OUTPUT_W}:${OUTPUT_H}:force_original_aspect_ratio=decrease,pad=${OUTPUT_W}:${OUTPUT_H}:(ow-iw)/2:(oh-ih)/2,fps=20,format=yuv420p,setpts=PTS-STARTPTS[v1]`,
+        // Scale-to-fill + center-crop, not scale-to-fit + pad. Kling's native
+        // resolution (e.g. 1176x784) doesn't match our 1920x1080 canvas, and
+        // padding to fit left it letterboxed — visually smaller than the
+        // continuation clip, which already fills the frame. That mismatch is
+        // what read as a jarring zoom jump at the cut: same canvas size, very
+        // different effective content size. Crop-to-fill matches the same
+        // convention already used elsewhere (the 16:9 pre-crop fix for the
+        // Ken Burns stretching bug) — content fills the frame on both sides
+        // of the cut, no black bars, no apparent size jump.
+        `[0:v]scale=${OUTPUT_W}:${OUTPUT_H}:force_original_aspect_ratio=increase,crop=${OUTPUT_W}:${OUTPUT_H},fps=20,format=yuv420p,setpts=PTS-STARTPTS[v0]`,
+        `[1:v]scale=${OUTPUT_W}:${OUTPUT_H}:force_original_aspect_ratio=increase,crop=${OUTPUT_W}:${OUTPUT_H},fps=20,format=yuv420p,setpts=PTS-STARTPTS[v1]`,
         "[v0][v1]concat=n=2:v=1:a=0[outv]",
       ])
       .outputOptions(["-map", "[outv]", "-pix_fmt", "yuv420p"])
