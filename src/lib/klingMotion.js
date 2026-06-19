@@ -75,6 +75,28 @@ function enforceScopeRules(frame) {
   }
 }
 
+// ── INPUT ASPECT RATIO NORMALIZATION ──────────────────────────────────
+// Kling infers its output aspect ratio from the input image (confirmed on
+// fal.ai's v3/pro docs: "Aspect ratio is inferred from the start image. The
+// aspect_ratio field in the UI is ignored by the model" — O3 Standard
+// exposes no aspect_ratio parameter either, consistent with the same
+// inference behavior). Real estate photos are commonly shot at 3:2
+// (e.g. 1176x784), not 16:9 — so without this, Kling faithfully returns a
+// 3:2 clip, which then needs scaling/cropping to fit our 1920x1080 canvas
+// and visually mismatches the full-frame Ken Burns continuation.
+//
+// Fixing it here, at the source, means Kling never produces a mismatched
+// clip in the first place — same principle as the existing "center-crop
+// source to 16:9 before any motion is applied" fix already used for the
+// Ken Burns engine, just applied one step earlier in the Kling pipeline.
+// Cloudinary applies this transformation on the fly when Kling fetches the
+// URL — no extra processing or re-upload needed on our end.
+
+function forceCloudinary16x9(url) {
+  if (!url || !url.includes("/upload/")) return url; // not a Cloudinary delivery URL — leave untouched
+  return url.replace("/upload/", "/upload/c_fill,ar_16:9,g_auto/");
+}
+
 // ── PROMPT TEMPLATES ──────────────────────────────────────────────────
 // Kept separate per use case since the framing differs meaningfully —
 // interior is about furniture appearing, exterior is about lighting/
@@ -180,6 +202,7 @@ function concatTwoClips(firstPath, secondPath, workDir, outputName) {
       ])
       .outputOptions(["-map", "[outv]", "-pix_fmt", "yuv420p"])
       .output(outputPath)
+      .on("start", (cmd) => console.log(`  [Kling] concatTwoClips ffmpeg command: ${cmd}`))
       .on("end", () => resolve(outputPath))
       .on("error", (err) => reject(new Error(`Continuation concat failed: ${err.message}`)))
       .run();
@@ -303,8 +326,8 @@ async function generateKlingClip(frame, workDir) {
   // instead of vanishing without a trace.
   const { request_id } = await fal.queue.submit(KLING_ENDPOINT, {
     input: {
-      image_url: frame.imageUrl,
-      end_image_url: frame.endImageUrl || undefined,
+      image_url: forceCloudinary16x9(frame.imageUrl),
+      end_image_url: frame.endImageUrl ? forceCloudinary16x9(frame.endImageUrl) : undefined,
       prompt,
       duration,
       generate_audio: false, // Mubert handles music separately — avoid conflicting audio tracks
