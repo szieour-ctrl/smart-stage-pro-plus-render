@@ -244,7 +244,22 @@ async function generateKlingClip(frame, workDir) {
 
   console.log(`  [Kling] Submitting job — room: ${frame.roomType}, duration: ${duration}s (requested ${rawDuration}s)`);
 
-  const result = await fal.subscribe("fal-ai/kling-video/o3/standard/image-to-video", {
+  const KLING_ENDPOINT = "fal-ai/kling-video/o3/standard/image-to-video";
+
+  // Submitting explicitly via queue.submit() + our own polling loop, rather
+  // than fal.subscribe()'s blocking internal poll. fal.subscribe() submits
+  // and waits in one opaque call — if anything in that internal loop dies
+  // silently (dropped connection, missed status transition), there's no
+  // visibility and no error ever surfaces; the awaited promise just never
+  // resolves or rejects. Confirmed twice in testing: Kling completed
+  // successfully on fal.ai's own dashboard both times, but the Railway
+  // process never logged anything past job submission — no completion, no
+  // [Kling] failure fallback, no top-level "Job failed" catch. Total
+  // silence with no JS-catchable error means the process likely wasn't
+  // failing in JS at all; explicit polling gives us a log line every
+  // attempt, so a future stall shows up as a clear gap at a known interval
+  // instead of vanishing without a trace.
+  const { request_id } = await fal.queue.submit(KLING_ENDPOINT, {
     input: {
       image_url: frame.imageUrl,
       end_image_url: frame.endImageUrl || undefined,
@@ -252,13 +267,40 @@ async function generateKlingClip(frame, workDir) {
       duration,
       generate_audio: false, // Mubert handles music separately — avoid conflicting audio tracks
     },
-    logs: true,
-    onQueueUpdate: (update) => {
-      if (update.status === "IN_PROGRESS") {
-        update.logs?.forEach((log) => console.log(`  [Kling] ${log.message}`));
-      }
-    },
   });
+
+  console.log(`  [Kling] Queued — request_id: ${request_id} (save this — recoverable via fal.ai dashboard even if this process dies)`);
+
+  const POLL_INTERVAL_MS = 10000;
+  const MAX_POLL_ATTEMPTS = 90; // 90 * 10s = 15 minute ceiling — well above observed real Kling generation time
+
+  let finalStatus = null;
+  for (let attempt = 1; attempt <= MAX_POLL_ATTEMPTS; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+
+    const status = await fal.queue.status(KLING_ENDPOINT, {
+      requestId: request_id,
+      logs: true,
+    });
+
+    console.log(`  [Kling] Poll ${attempt}/${MAX_POLL_ATTEMPTS} — status: ${status.status}`);
+    if (status.status === "IN_PROGRESS" && status.logs) {
+      status.logs.forEach((log) => console.log(`  [Kling] ${log.message}`));
+    }
+
+    if (status.status === "COMPLETED") {
+      finalStatus = status;
+      break;
+    }
+  }
+
+  if (!finalStatus) {
+    throw new Error(
+      `Kling request ${request_id} did not complete within ${(MAX_POLL_ATTEMPTS * POLL_INTERVAL_MS) / 60000} minutes of polling. Check this request_id directly on the fal.ai dashboard — the generation may have finished even if polling here gave up.`
+    );
+  }
+
+  const result = await fal.queue.result(KLING_ENDPOINT, { requestId: request_id });
 
   const videoUrl = result.data?.video?.url;
   if (!videoUrl) {
