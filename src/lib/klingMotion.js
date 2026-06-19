@@ -114,9 +114,14 @@ async function extractLastFrame(videoPath, workDir) {
   const outputPath = path.join(workDir, `lastframe_${path.basename(videoPath, ".mp4")}.png`);
   return new Promise((resolve, reject) => {
     ffmpeg(videoPath)
+      .inputOptions([
+        "-sseof", "-0.1", // seek to 0.1s before end of file — this is an INPUT-side seek
+        // option (it affects how ffmpeg reads the source), not an output option. Confirmed via
+        // a real "Option sseof cannot be applied to output url" ffmpeg error when this was
+        // bundled into outputOptions() instead — ffmpeg parses options positionally, and an
+        // input option placed after -i gets misread as belonging to the output file.
+      ])
       .outputOptions([
-        "-y",              // never wait on an interactive overwrite prompt — classic ffmpeg hang if an output path ever collides
-        "-sseof", "-0.1", // seek to 0.1s before end of file
         "-vframes", "1",  // grab exactly one frame
         "-q:v", "2",      // near-lossless quality (PNG ignores this, but safe)
       ])
