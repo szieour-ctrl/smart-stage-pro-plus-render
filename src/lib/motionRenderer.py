@@ -202,11 +202,27 @@ def build_motion_curve(preset, n_frames, start_zoom):
             pan_y = 0.0
 
         elif preset == "luxury_parallax":
-            # Kling continuation beat — ease_in so the camera appears to
-            # settle after the vacant→staged transformation, then drifts.
-            drift = (1.0 - 1.0 / 1.15) * 0.30
+            # Kling continuation beat — ease_in zoom + diagonal settle.
+            #
+            # zoom now RAMPS from start_zoom up to start_zoom + SETTLE_AMOUNT,
+            # rather than the previous flat zoom = 1.15 (hardcoded, ignoring
+            # start_zoom entirely). That hardcoded value was the actual cause
+            # of a visible jump cut at the Kling→Ken Burns stitch point: the
+            # caller passes start_zoom=1.0 specifically because the source
+            # image already IS Kling's exact last frame at full composition —
+            # but the old code rendered its very first frame at 1.15 zoom
+            # regardless, a real ~13% tighter crop than what Kling ended on,
+            # at the same center point (pan_x/pan_y are 0 at t=0 either way,
+            # which is why the discontinuity reads as "same focal point, just
+            # closer" rather than a framing shift). Ramping from start_zoom
+            # guarantees frame 0 is pixel-identical in composition to
+            # whatever the caller passed in, then eases into the same total
+            # "settle in" push as before — just anchored to the real starting
+            # composition instead of an arbitrary constant.
+            SETTLE_AMOUNT = 0.15
             t_in  = ease_in(t)
-            zoom  = 1.15
+            zoom  = start_zoom + SETTLE_AMOUNT * t_in
+            drift = (1.0 - 1.0 / zoom) * 0.30 if zoom > 1.0 else 0.0
             pan_x = drift * t_in
             pan_y = -drift * 0.6 * t_in
 
