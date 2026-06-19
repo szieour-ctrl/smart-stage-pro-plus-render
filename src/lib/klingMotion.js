@@ -123,7 +123,8 @@ async function extractLastFrame(videoPath, workDir) {
       .output(outputPath)
       .on("start", (cmd) => console.log(`  [Kling] extractLastFrame ffmpeg command: ${cmd}`))
       .on("end", () => resolve(outputPath))
-      .on("error", (err) => reject(new Error(`extractLastFrame failed: ${err.message}`)));
+      .on("error", (err) => reject(new Error(`extractLastFrame failed: ${err.message}`)))
+      .run();
   });
 }
 
