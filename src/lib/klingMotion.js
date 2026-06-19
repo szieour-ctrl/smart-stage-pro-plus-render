@@ -115,11 +115,13 @@ async function extractLastFrame(videoPath, workDir) {
   return new Promise((resolve, reject) => {
     ffmpeg(videoPath)
       .outputOptions([
+        "-y",              // never wait on an interactive overwrite prompt — classic ffmpeg hang if an output path ever collides
         "-sseof", "-0.1", // seek to 0.1s before end of file
         "-vframes", "1",  // grab exactly one frame
         "-q:v", "2",      // near-lossless quality (PNG ignores this, but safe)
       ])
       .output(outputPath)
+      .on("start", (cmd) => console.log(`  [Kling] extractLastFrame ffmpeg command: ${cmd}`))
       .on("end", () => resolve(outputPath))
       .on("error", (err) => reject(new Error(`extractLastFrame failed: ${err.message}`)));
   });
@@ -174,7 +176,14 @@ async function applyContinuationMotion(klingClipPath, frame, workDir) {
   // pixel-exact state Kling ended on. Ken Burns starts from this image,
   // making the cut between Kling and Ken Burns invisible to the viewer,
   // instead of jumping back to the composition the room started at.
+  //
+  // Logging on both sides of this call deliberately — this is new,
+  // never-before-exercised code, and the Kling polling fix just taught us
+  // that any unlogged await is a place a future hang can vanish without a
+  // trace. Same principle applied here preemptively.
+  console.log(`  [Kling] Extracting last frame from ${klingClipPath}`);
   const lastFramePath = await extractLastFrame(klingClipPath, workDir);
+  console.log(`  [Kling] Last frame extracted: ${lastFramePath}`);
 
   // Default to luxury_parallax — push_in immediately after Kling's own
   // push-in transformation would feel repetitive (same motion twice in a
@@ -307,6 +316,8 @@ async function generateKlingClip(frame, workDir) {
     throw new Error("Kling returned no video URL");
   }
 
+  console.log(`  [Kling] Generation complete — downloading clip from fal.ai`);
+
   // Download the generated clip to local disk so it can flow into the
   // same assembleVideo() pipeline as Ken Burns clips — from this point
   // forward, the rest of the pipeline doesn't know or care whether a
@@ -314,6 +325,8 @@ async function generateKlingClip(frame, workDir) {
   const outputPath = path.join(workDir, `kling_${Date.now()}.mp4`);
   const response = await axios.get(videoUrl, { responseType: "arraybuffer" });
   fs.writeFileSync(outputPath, response.data);
+
+  console.log(`  [Kling] Clip downloaded to ${outputPath} (${response.data.length} bytes)`);
 
   return outputPath;
 }
@@ -331,6 +344,7 @@ async function applyKlingMotion(frame, workDir, fallbackFn) {
   // correct here.
   try {
     clipPath = await generateKlingClip(frame, workDir);
+    console.log(`  [Kling] Clip ready: ${clipPath}`);
   } catch (err) {
     console.error(`  [Kling] Generation failed, falling back to Ken Burns: ${err.message}`);
     const fallbackResult = await fallbackFn();
