@@ -2,16 +2,37 @@
 // using the official @fal-ai/client SDK rather than raw HTTP requests.
 //
 // IMPORTANT — SCOPE RESTRICTION (read before modifying):
-// This module is intentionally restricted to two use cases validated
-// against real Smart Stage PRO listings:
+// The real safety boundary is whether Kling has two REAL, KNOWN endpoints
+// to interpolate between, or has to INVENT unseen content because only one
+// image exists. See enforceScopeRules() below, which is a hard runtime
+// check, not just a comment. Validated known-pair use cases:
 //   1. Interior vacant→staged interpolation (start/end frame, same room)
-//   2. Exterior day→twilight / landscape enhancement (start/end frame)
+//   2. Exterior day/twilight transitions (start/end frame) — see
+//      KLING_MOTION_TEMPLATES for the day_to_twilight / twilight_to_day /
+//      timelapse variants
+// Exterior also permits single-image motion (no end frame) — landscaping/
+// sky tolerate invented detail in a way a room's walls and layout don't.
+// See KLING_MOTION_TEMPLATES below for drone_boom_up, water_motion, and
+// the full growing prompt library, tested in the fal.ai Playground before
+// being added here.
 //
 // AI motion is NEVER applied to a single still image with no end frame
 // for interior rooms — that would mean the model is inventing unseen
 // architecture rather than interpolating between two real, disclosed
-// images, which is an AB 723 compliance risk. See enforceScopeRules()
-// below, which is a hard runtime check, not just a comment.
+// images, which is an AB 723 compliance risk.
+//
+// OPEN QUESTION (flagged, not yet resolved — see handoff): orbit_arc,
+// rack_focus, fireplace_flicker, and curtain_sway are written as
+// single-image moves, intended for interior subjects (kitchen island,
+// fireplace, etc.) that are already fully staged and disclosed in one
+// photo. enforceScopeRules() as currently written blocks ANY single-image
+// interior frame regardless of preset, so these four are NOT yet usable
+// for interior rooms in production. Whether they actually carry the same
+// "inventing unseen architecture" risk as a vacant→staged single image is
+// a real open question — they animate camera/dynamic elements within an
+// already-fully-visible scene, not unseen layout or furniture. Worth a
+// deliberate decision before loosening enforceScopeRules(), not a silent
+// bypass.
 //
 // Falls back to Ken Burns (motionPresets.js) on any failure — AI motion
 // is a premium enhancement, not a dependency the pipeline requires.
@@ -97,25 +118,86 @@ function forceCloudinary16x9(url) {
   return url.replace("/upload/", "/upload/c_fill,ar_16:9,g_auto/");
 }
 
+// ── KLING MOTION PRESET TEMPLATES ─────────────────────────────────────
+// Named, tested prompt templates beyond the two generic defaults below.
+// Selected via frame.klingMotionPreset; falls back to the generic
+// interior/exterior prompt when unset or unrecognized — same fallback
+// pattern as resolvePreset() in motionPresets.js. Each of these was
+// iterated on and verified in the fal.ai Playground before being added
+// here (see handoff for testing notes, image-pair requirements, and the
+// open enforceScopeRules() question noted in the file header above).
+
+const KLING_MOTION_TEMPLATES = {
+  // ── Kling-exclusive moves — impossible to fake with Ken Burns ────────
+  orbit_arc:
+    "Slow cinematic orbit camera movement arcing around the central feature — a kitchen island, dining table, or pool — sweeping laterally while keeping it centered in frame, photorealistic, no distortion, stable architecture, surrounding cabinetry and furniture remain fixed and undistorted throughout the movement",
+
+  drone_boom_up:
+    "Smooth cinematic drone boom-up camera movement, rising upward and slightly forward to reveal the full exterior and surrounding landscaping from an elevated angle, photorealistic, no distortion, house structure and architecture remain completely fixed and unchanged",
+
+  rack_focus:
+    "Cinematic rack focus shot, starting with sharp focus on a foreground detail (faucet hardware, fixture, or vignette), then smoothly shifting focus to reveal the room behind it coming into sharp clarity, soft natural depth of field transition, photorealistic, no distortion, structure and cabinetry remain fixed and unchanged",
+
+  fireplace_flicker:
+    "Static cinematic shot, camera locked off, with the fireplace flame flickering naturally and realistically, gentle ambient light flicker on surrounding walls, photorealistic, no distortion, room and architecture remain completely fixed and unchanged",
+
+  water_motion:
+    "Static cinematic shot, camera locked off, with gentle natural water movement and subtle ripples across the pool surface, photorealistic, no distortion, landscaping and structure remain completely fixed and unchanged",
+
+  curtain_sway:
+    "Static cinematic shot, camera locked off, with curtains gently swaying as if stirred by a soft breeze through an open window, photorealistic, no distortion, room and architecture remain completely fixed and unchanged",
+
+  // ── Exterior day/twilight transitions — known-pair, like vacant→staged ─
+  day_to_twilight:
+    "Smooth cinematic camera movement across the exterior as the bright daytime sky gradually deepens into a dusk blue-hour sky with soft pink and purple sunset color near the horizon, interior window lights gradually turning on and glowing warm amber, exterior porch and garage lights turning on, landscape lighting along the walkway and garden beds gradually illuminating, photorealistic, no distortion, house structure, architecture, and landscaping remain completely fixed and unchanged — only sky color, light quality, and lighting fixtures transform",
+
+  twilight_to_day:
+    "Smooth cinematic camera movement across the exterior as the dusk blue-hour sky with soft pink and purple sunset color gradually brightens into a clear daytime blue sky, interior window lights gradually turning off, exterior porch and garage lights turning off, landscape lighting along the walkway and garden beds gradually dimming and turning off, photorealistic, no distortion, house structure, architecture, and landscaping remain completely fixed and unchanged — only light quality and color temperature transform",
+
+  day_to_twilight_timelapse:
+    "Time-lapse style video, static locked-off camera, exterior daytime sky rapidly transitioning into a dusk blue-hour sky, clouds streaking past, sky color rapidly deepening from bright blue to deep blue with a pink and purple sunset glow near the horizon, interior window lights and exterior porch, garage, and landscape lighting rapidly turning on in sequence as if hours are passing in seconds, photorealistic, no distortion, house structure, architecture, and landscaping remain completely fixed and unchanged — only the sky, light, and time of day transform",
+
+  twilight_to_day_timelapse:
+    "Time-lapse style video, static locked-off camera, exterior dusk blue-hour sky with a pink and purple sunset glow rapidly brightening into a clear daytime blue sky, clouds streaking past, interior window lights and exterior porch, garage, and landscape lighting rapidly turning off in sequence as if hours are passing in seconds, photorealistic, no distortion, house structure, architecture, and landscaping remain completely fixed and unchanged — only the sky, light, and time of day transform",
+
+  // Three-phase, 6s, known-pair (twilight start / day end). Lighting timing
+  // confirmed against real test footage: interior lights go dark well
+  // before full night (people go to bed), while exterior/landscape
+  // lighting stays on through the night on timers, then cuts at dawn —
+  // two independent lighting timelines in the same clip.
+  twilight_night_day_timelapse:
+    "Time-lapse style video, static locked-off camera, exterior sky transitioning through three phases: starting at dusk blue-hour with a pink and purple sunset glow near the horizon, deepening into full night with a dark navy-to-black sky, then rapidly brightening into clear daytime blue sky, clouds streaking past throughout. Interior window lights are on at the start during dusk, then turn off at around the 2.5 second mark, leaving only exterior porch, garage, and landscape lighting on for the remainder of the night phase, which then turns off as daylight returns at dawn. Photorealistic, no distortion, house structure, architecture, and landscaping remain completely fixed and unchanged — only the sky, light, and time of day transform",
+};
+
+const VALID_KLING_PRESETS = new Set(Object.keys(KLING_MOTION_TEMPLATES));
+
 // ── PROMPT TEMPLATES ──────────────────────────────────────────────────
 // Kept separate per use case since the framing differs meaningfully —
 // interior is about furniture appearing, exterior is about lighting/
 // landscape transformation with the structure held fixed.
+//
+// Precedence: customPrompt always wins (full caller override) → named
+// klingMotionPreset from the table above → generic room-type default.
 
 function buildPrompt(frame) {
-  const isInterior = !["exterior"].includes(frame.roomType);
+  if (frame.customPrompt) return frame.customPrompt;
 
-  if (isInterior) {
-    return (
-      frame.customPrompt ||
-      "Smooth cinematic push-in camera movement through an empty room as furniture and decor gradually appear, room becomes fully furnished and staged, photorealistic, no distortion, stable architecture, walls and windows remain fixed"
+  if (frame.klingMotionPreset) {
+    if (KLING_MOTION_TEMPLATES[frame.klingMotionPreset]) {
+      return KLING_MOTION_TEMPLATES[frame.klingMotionPreset];
+    }
+    console.warn(
+      `[klingMotion] Unknown klingMotionPreset "${frame.klingMotionPreset}", falling back to room-type default`
     );
   }
 
-  return (
-    frame.customPrompt ||
-    "Smooth cinematic camera movement across the exterior as lighting and landscaping gradually transform and improve, photorealistic, no distortion, house structure and architecture remain completely fixed and unchanged"
-  );
+  const isInterior = !["exterior"].includes(frame.roomType);
+
+  if (isInterior) {
+    return "Smooth cinematic push-in camera movement through an empty room as furniture and decor gradually appear, room becomes fully furnished and staged, photorealistic, no distortion, stable architecture, walls and windows remain fixed";
+  }
+
+  return "Smooth cinematic camera movement across the exterior as lighting and landscaping gradually transform and improve, photorealistic, no distortion, house structure and architecture remain completely fixed and unchanged";
 }
 
 // ── LAST-FRAME EXTRACTION ─────────────────────────────────────────────
@@ -426,4 +508,12 @@ async function applyKlingMotion(frame, workDir, fallbackFn) {
   return { path: clipPath, source: "kling", endingZoom };
 }
 
-module.exports = { applyKlingMotion, generateKlingClip, enforceScopeRules, buildPrompt, extractLastFrame };
+module.exports = {
+  applyKlingMotion,
+  generateKlingClip,
+  enforceScopeRules,
+  buildPrompt,
+  extractLastFrame,
+  KLING_MOTION_TEMPLATES,
+  VALID_KLING_PRESETS,
+};
