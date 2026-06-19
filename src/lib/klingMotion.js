@@ -238,6 +238,24 @@ async function applyContinuationMotion(klingClipPath, frame, workDir) {
     `kling_continued_${Date.now()}.mp4`
   );
 
+  // ── TEMPORARY DEBUG: upload the combined clip too, right after concat,
+  // before it heads into the rest of the pipeline. The two uploads above
+  // confirmed each half individually — this one confirms whether the
+  // CONCAT step itself produces a correct ~8s combined file, or whether
+  // the bug is further downstream (assemble.js) truncating something
+  // that was already fine at this point. Remove alongside the other two
+  // debug uploads once the full chain is confirmed working.
+  try {
+    const { uploadToCloudinary } = require("./cloudinaryUpload");
+    const combinedDebugUrls = await uploadToCloudinary(
+      { debug_combined: combinedPath },
+      "debug-continuation"
+    );
+    console.log(`  [DEBUG] Combined clip (post-concat, pre-pipeline): ${combinedDebugUrls.debug_combined}`);
+  } catch (debugErr) {
+    console.error(`  [DEBUG] Combined debug upload failed (non-fatal): ${debugErr.message}`);
+  }
+
   return { path: combinedPath, endingZoom: continuationResult.endingZoom };
 }
 
