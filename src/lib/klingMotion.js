@@ -2,37 +2,48 @@
 // using the official @fal-ai/client SDK rather than raw HTTP requests.
 //
 // IMPORTANT — SCOPE RESTRICTION (read before modifying):
-// The real safety boundary is whether Kling has two REAL, KNOWN endpoints
-// to interpolate between, or has to INVENT unseen content because only one
-// image exists. See enforceScopeRules() below, which is a hard runtime
-// check, not just a comment. Validated known-pair use cases:
+// The real safety boundary is NOT "interior vs exterior" and NOT "known
+// pair vs single image" on its own — it's whether the alteration is a
+// disclosed, enumerated-category change (anything AB 723 §10140.8(b)(1)
+// already covers: furniture, fixtures, walls, flooring, hardscape,
+// landscape, facade, floor plans) vs. content with no photographic ground
+// truth at all and no disclosed framing. See enforceScopeRules() below,
+// which is a hard runtime check, not just a comment.
+//
+// Validated known-pair use cases (both endpoints are real, disclosed
+// images — Kling interpolates, doesn't invent):
 //   1. Interior vacant→staged interpolation (start/end frame, same room)
 //   2. Exterior day/twilight transitions (start/end frame) — see
 //      KLING_MOTION_TEMPLATES for the day_to_twilight / twilight_to_day /
 //      timelapse variants
-// Exterior also permits single-image motion (no end frame) — landscaping/
-// sky tolerate invented detail in a way a room's walls and layout don't.
-// See KLING_MOTION_TEMPLATES below for drone_boom_up, water_motion, and
-// the full growing prompt library, tested in the fal.ai Playground before
-// being added here.
 //
-// AI motion is NEVER applied to a single still image with no end frame
-// for interior rooms — that would mean the model is inventing unseen
-// architecture rather than interpolating between two real, disclosed
-// images, which is an AB 723 compliance risk.
+// Exterior also permits single-image motion (no end frame) — drone_boom_up,
+// water_motion, and the generic exterior default.
 //
-// OPEN QUESTION (flagged, not yet resolved — see handoff): orbit_arc,
-// rack_focus, fireplace_flicker, and curtain_sway are written as
-// single-image moves, intended for interior subjects (kitchen island,
-// fireplace, etc.) that are already fully staged and disclosed in one
-// photo. enforceScopeRules() as currently written blocks ANY single-image
-// interior frame regardless of preset, so these four are NOT yet usable
-// for interior rooms in production. Whether they actually carry the same
-// "inventing unseen architecture" risk as a vacant→staged single image is
-// a real open question — they animate camera/dynamic elements within an
-// already-fully-visible scene, not unseen layout or furniture. Worth a
-// deliberate decision before loosening enforceScopeRules(), not a silent
-// bypass.
+// RESOLVED — single-image INTERIOR presets (orbit_arc, rack_focus,
+// fireplace_flicker, curtain_sway) are also permitted, via
+// SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS below. Worked through with Sam
+// against the actual AB 723 text and MetroList's MLS Rules (11.6.1,
+// 12.10(f)): these are the same kind of disclosed, enumerated-category
+// alteration as a virtual pool, a wall removal, or added landscaping —
+// not a different risk just because the invented content shows up via a
+// camera move instead of a static add-on. A virtual pool isn't internally
+// marked "this part is fake" inside the photo either — the only mechanism
+// either case has is the same one: a watermark/label, the AB 723
+// compliance page, and (per MLS Rule 12.10(f)) identification in Public
+// Remarks. If that mechanism is sufficient for a pool, it's sufficient for
+// a camera move that reveals an unphotographed cabinet run or animates an
+// existing fireplace's flame. Same compliance path, same conclusion.
+//
+// What STAYS blocked for single-image interior: the GENERIC default case
+// (no klingMotionPreset set, or any preset not in the allowlist) — i.e.
+// converting an empty room into a furnished one directly via Kling, with
+// no staged counterpart image at all. That's a categorically different
+// case: it bypasses the platform's actual staging pipeline (and its
+// review/Generate-Final step) entirely, inventing a full furnished room
+// from nothing rather than animating or revealing more of a scene that's
+// already been staged, photographed, and disclosed through the normal
+// flow. Use a real vacant+staged pair for that, or Ken Burns.
 //
 // Falls back to Ken Burns (motionPresets.js) on any failure — AI motion
 // is a premium enhancement, not a dependency the pipeline requires.
@@ -64,36 +75,52 @@ function ensureConfigured() {
 
 // ── SCOPE ENFORCEMENT ─────────────────────────────────────────────────
 // The real safety boundary isn't "interior vs exterior" — it's whether
-// Kling has two REAL, KNOWN endpoints to interpolate between, or has to
-// INVENT content because only one image exists.
+// Kling has two REAL, KNOWN endpoints to interpolate between, an exterior
+// scene (more tolerant of invented sky/landscape detail), or a single
+// interior preset from the allowlist below (disclosed via the same
+// mechanism as any other altered image — see file header for the full
+// reasoning).
 //
 //   - Vacant + Staged pair (from Smart Stage PRO staging) → both endpoints
 //     are real, disclosed images. Kling fills in the transition between
 //     two known states. Low risk, AI Motion freely available here.
 //
-//   - A single photo with no pair (e.g. professional photography uploaded
-//     without a staged counterpart) → Kling has nothing to interpolate
-//     toward. It must invent what a camera move reveals — what's beyond
-//     the frame, what an unseen angle looks like. This is the exact
-//     unconstrained-inference risk VideoTour.ai's own docs describe
-//     causing hallucinated objects/architecture.
+//   - A single photo with no pair, exterior → permitted. Landscaping/sky
+//     have more tolerance for invented detail than interior architecture.
 //
-// Rule: ANY interior frame without both a start and end image is rejected
-// outright, regardless of room type. Exterior is the only case where a
-// single image is permitted, since there's no fixed interior architecture
-// at risk — landscaping/sky have more tolerance for invented detail than
-// a room's walls and layout do. Even then, this is a judgment call worth
-// revisiting, not an assumption that exteriors are risk-free.
+//   - A single photo with no pair, interior, named preset in
+//     SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS → permitted. These animate
+//     camera movement or a dynamic element (flame, curtains) within a
+//     scene that's already fully visible and disclosed — same compliance
+//     category as a virtual pool or a wall removal, not a different risk.
+//
+//   - A single photo with no pair, interior, NO named preset (or one not
+//     in the allowlist) → rejected. This is the generic vacant→furnished
+//     case: no staged counterpart exists at all, so Kling would have to
+//     invent furniture/layout wholesale rather than animate or extend an
+//     already-disclosed scene. Use a real vacant+staged pair, or Ken Burns.
+
+const SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS = new Set([
+  "orbit_arc",
+  "rack_focus",
+  "fireplace_flicker",
+  "curtain_sway",
+]);
 
 function enforceScopeRules(frame) {
   const hasKnownPair = !!frame.endImageUrl;
   const isExterior = frame.roomType === "exterior";
+  const isAllowedSingleImageInteriorPreset =
+    !!frame.klingMotionPreset &&
+    SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS.has(frame.klingMotionPreset);
 
-  if (!hasKnownPair && !isExterior) {
-    throw new Error(
-      `Kling AI motion rejected: no end image provided for room type "${frame.roomType}". AI motion on a single interior photo requires Kling to invent unseen content (architecture, layout) rather than interpolate between two known images — this is disabled by design. Use a vacant+staged pair, or use Ken Burns for single-image interior shots. See AB 723 scope restriction in klingMotion.js.`
-    );
+  if (hasKnownPair || isExterior || isAllowedSingleImageInteriorPreset) {
+    return;
   }
+
+  throw new Error(
+    `Kling AI motion rejected: no end image provided for room type "${frame.roomType}", and preset "${frame.klingMotionPreset || "(none — generic default)"}" is not in the single-image interior allowlist (orbit_arc, rack_focus, fireplace_flicker, curtain_sway). The generic interior default requires Kling to invent furniture/layout wholesale rather than interpolate between two known images or animate an already-disclosed scene — this is disabled by design. Use a vacant+staged pair, select one of the allowed single-image presets, or use Ken Burns for single-image interior shots outside that list. See AB 723 scope restriction in klingMotion.js.`
+  );
 }
 
 // ── INPUT ASPECT RATIO NORMALIZATION ──────────────────────────────────
@@ -124,8 +151,10 @@ function forceCloudinary16x9(url) {
 // interior/exterior prompt when unset or unrecognized — same fallback
 // pattern as resolvePreset() in motionPresets.js. Each of these was
 // iterated on and verified in the fal.ai Playground before being added
-// here (see handoff for testing notes, image-pair requirements, and the
-// open enforceScopeRules() question noted in the file header above).
+// here (see handoff for testing notes and image-pair requirements).
+// Scope/compliance reasoning for which presets are usable on a single
+// interior image is in the file header and SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS
+// above — resolved, not an open question.
 
 const KLING_MOTION_TEMPLATES = {
   // ── Kling-exclusive moves — impossible to fake with Ken Burns ────────
@@ -516,4 +545,5 @@ module.exports = {
   extractLastFrame,
   KLING_MOTION_TEMPLATES,
   VALID_KLING_PRESETS,
+  SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS,
 };
