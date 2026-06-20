@@ -21,7 +21,7 @@
 // water_motion, and the generic exterior default.
 //
 // RESOLVED — single-image INTERIOR presets (orbit_arc, rack_focus,
-// fireplace_flicker, curtain_sway) are also permitted, via
+// fireplace_flicker) are also permitted, via
 // SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS below. Worked through with Sam
 // against the actual AB 723 text and MetroList's MLS Rules (11.6.1,
 // 12.10(f)): these are the same kind of disclosed, enumerated-category
@@ -34,6 +34,9 @@
 // Remarks. If that mechanism is sufficient for a pool, it's sufficient for
 // a camera move that reveals an unphotographed cabinet run or animates an
 // existing fireplace's flame. Same compliance path, same conclusion.
+// (curtain_sway was tested and dropped — not a compliance issue, just no
+// real use case in real estate photography, and the motion read as
+// exaggerated/windy rather than subtle. Removed entirely below.)
 //
 // What STAYS blocked for single-image interior: the GENERIC default case
 // (no klingMotionPreset set, or any preset not in the allowlist) — i.e.
@@ -90,9 +93,9 @@ function ensureConfigured() {
 //
 //   - A single photo with no pair, interior, named preset in
 //     SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS → permitted. These animate
-//     camera movement or a dynamic element (flame, curtains) within a
-//     scene that's already fully visible and disclosed — same compliance
-//     category as a virtual pool or a wall removal, not a different risk.
+//     camera movement or a dynamic element (flame) within a scene that's
+//     already fully visible and disclosed — same compliance category as
+//     a virtual pool or a wall removal, not a different risk.
 //
 //   - A single photo with no pair, interior, NO named preset (or one not
 //     in the allowlist) → rejected. This is the generic vacant→furnished
@@ -104,7 +107,6 @@ const SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS = new Set([
   "orbit_arc",
   "rack_focus",
   "fireplace_flicker",
-  "curtain_sway",
 ]);
 
 function enforceScopeRules(frame) {
@@ -119,7 +121,7 @@ function enforceScopeRules(frame) {
   }
 
   throw new Error(
-    `Kling AI motion rejected: no end image provided for room type "${frame.roomType}", and preset "${frame.klingMotionPreset || "(none — generic default)"}" is not in the single-image interior allowlist (orbit_arc, rack_focus, fireplace_flicker, curtain_sway). The generic interior default requires Kling to invent furniture/layout wholesale rather than interpolate between two known images or animate an already-disclosed scene — this is disabled by design. Use a vacant+staged pair, select one of the allowed single-image presets, or use Ken Burns for single-image interior shots outside that list. See AB 723 scope restriction in klingMotion.js.`
+    `Kling AI motion rejected: no end image provided for room type "${frame.roomType}", and preset "${frame.klingMotionPreset || "(none — generic default)"}" is not in the single-image interior allowlist (orbit_arc, rack_focus, fireplace_flicker). The generic interior default requires Kling to invent furniture/layout wholesale rather than interpolate between two known images or animate an already-disclosed scene — this is disabled by design. Use a vacant+staged pair, select one of the allowed single-image presets, or use Ken Burns for single-image interior shots outside that list. See AB 723 scope restriction in klingMotion.js.`
   );
 }
 
@@ -172,9 +174,6 @@ const KLING_MOTION_TEMPLATES = {
 
   water_motion:
     "Static cinematic shot, camera locked off, with gentle natural water movement and subtle ripples across the pool surface, photorealistic, no distortion, landscaping and structure remain completely fixed and unchanged",
-
-  curtain_sway:
-    "Static cinematic shot, camera locked off, with curtains gently swaying as if stirred by a soft breeze through an open window, photorealistic, no distortion, room and architecture remain completely fixed and unchanged",
 
   // ── Exterior day/twilight transitions — known-pair, like vacant→staged ─
   day_to_twilight:
