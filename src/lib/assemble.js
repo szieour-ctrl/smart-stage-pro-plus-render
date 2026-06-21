@@ -6,6 +6,71 @@ const ffmpeg = require("fluent-ffmpeg");
 
 const CROSSFADE_DURATION = 0.6; // seconds between clips
 
+// ── NORMALIZE CLIP (fixes the real root cause of the xfade crash) ────────
+// CONFIRMED ROOT CAUSE of "Error reinitializing filters! / Failed to
+// inject frame into filter network: Invalid argument" — a real crash from
+// a real test job with 4 clips, 2 sourced from Kling (fal.ai's own output
+// resolution/fps/codec) and 2 from the local Ken Burns fallback (OpenCV/
+// FFmpeg, whatever this codebase already renders at). xfade requires every
+// pair of inputs it chains together to share resolution, frame rate, and
+// pixel format — concatenateClips() never enforced this, so any mix of
+// Kling + Ken Burns clips (or even two Kling clips at different durations/
+// fal.ai output settings) was one mismatch away from crashing the whole
+// render.
+//
+// FIX: normalize every clip to identical parameters BEFORE it ever reaches
+// the xfade chain, regardless of source. This is deliberately a fixed
+// target (1920x1080/30fps/yuv420p) rather than "whatever Kling outputs" —
+// Ken Burns clips would still need separate normalization to MATCH
+// whatever Kling's native spec is, so pinning both to one target this
+// codebase controls is no more work and is robust to fal.ai ever changing
+// Kling's default output spec in the future. 1920x1080 matches the final
+// 16:9 output exactly, so this adds no redundant scaling at renderFormat()
+// time for the common case.
+// CHANGE: fps corrected from an initial 30 to 20, to match the EXISTING
+// normalization convention already established in klingMotion.js's own
+// concatTwoClips() (used for the Before/After continuation feature) —
+// confirmed by direct inspection: OUTPUT_W=1920, OUTPUT_H=1080, fps=20,
+// format=yuv420p. Using a different fps here would have meant a
+// continuation-combined clip (already normalized once, at 20fps, inside
+// klingMotion.js) gets silently re-normalized to a SECOND, different fps
+// the moment it reaches assemble.js — wasted re-encoding at best, and a
+// new source of inconsistency at worst if other clips in the same job
+// were normalized to yet a third value. One target, matched across both
+// files, is the actual fix — not just "pick a fixed number and move on."
+const NORMALIZE_WIDTH  = 1920;
+const NORMALIZE_HEIGHT = 1080;
+const NORMALIZE_FPS    = 20;
+
+function normalizeClip(clipPath, workDir, index) {
+  return new Promise((resolve, reject) => {
+    const outputPath = path.join(workDir, `normalized_${index}.mp4`);
+    ffmpeg(clipPath)
+      .videoFilters([
+        // Scale to fit within target dimensions preserving aspect ratio,
+        // then pad to exactly the target size — same safe-default pattern
+        // already used in renderFormat() below, applied here instead at
+        // the per-clip stage so xfade never sees a size mismatch.
+        `scale=${NORMALIZE_WIDTH}:${NORMALIZE_HEIGHT}:force_original_aspect_ratio=decrease`,
+        `pad=${NORMALIZE_WIDTH}:${NORMALIZE_HEIGHT}:(ow-iw)/2:(oh-ih)/2`,
+        `fps=${NORMALIZE_FPS}`,
+      ])
+      .outputOptions(["-pix_fmt", "yuv420p", "-c:v", "libx264", "-preset", "fast"])
+      // Audio is dropped here deliberately — concatenateClips' xfade only
+      // ever operates on [x:v] video streams (see lastLabel/nextLabel
+      // below), and mixAudio() adds the real soundtrack afterward across
+      // the whole concatenated video. Carrying per-clip audio through this
+      // step would be discarded work and a second source of format
+      // mismatches (Kling clips may have audio tracks with different
+      // sample rates than Ken Burns clips, which have none at all).
+      .noAudio()
+      .output(outputPath)
+      .on("end", () => resolve(outputPath))
+      .on("error", (err) => reject(new Error(`Clip normalization failed for ${clipPath}: ${err.message}`)))
+      .run();
+  });
+}
+
 // ── PROBE ACTUAL CLIP DURATION ───────────────────────────────────────────
 // The previous version assumed every clip was exactly 4.5s when calculating
 // crossfade offsets. That assumption was wrong as soon as duration varied
@@ -27,17 +92,25 @@ function probeDuration(clipPath) {
 // durations for offset calculation, not an assumed fixed length.
 
 async function concatenateClips(clipPaths, workDir) {
-  if (clipPaths.length === 1) {
-    return clipPaths[0];
+  // NEW — normalize every clip BEFORE the single-clip early-return check
+  // too. A single Kling clip still needs to end up at a known, consistent
+  // resolution/fps/pixel format for mixAudio()/renderFormat() downstream,
+  // even though there's no xfade chain to crash with only one clip.
+  const normalizedPaths = await Promise.all(
+    clipPaths.map((clip, i) => normalizeClip(clip, workDir, i))
+  );
+
+  if (normalizedPaths.length === 1) {
+    return normalizedPaths[0];
   }
 
-  const durations = await Promise.all(clipPaths.map(probeDuration));
+  const durations = await Promise.all(normalizedPaths.map(probeDuration));
 
   return new Promise((resolve, reject) => {
     const outputPath = path.join(workDir, "concatenated.mp4");
     const command = ffmpeg();
 
-    clipPaths.forEach((clip) => command.input(clip));
+    normalizedPaths.forEach((clip) => command.input(clip));
 
     // Build chained xfade filter graph using real durations.
     // offset = where in the CUMULATIVE output timeline this transition
