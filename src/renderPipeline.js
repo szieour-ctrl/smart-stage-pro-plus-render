@@ -83,6 +83,20 @@ async function processRenderJob(job) {
             imageUrl: frame.isBeforeAfter ? frame.remoteBeforeUrl : frame.remoteImageUrl,
             endImageUrl: frame.isBeforeAfter ? frame.remoteImageUrl : undefined,
             roomType: frame.roomType,
+            // BUG FIX (July 2026): this object never included the preset
+            // field at all, in any prior version of this file — confirmed
+            // via a real test job where every frame was rejected with
+            // "(none — generic default)" despite video-job.js correctly
+            // sending klingMotionPreset in the dispatch payload (bug 2e's
+            // fix). That fix was necessary but not sufficient: this object
+            // construction, independently, dropped the field before it ever
+            // reached klingMotion.js's enforceScopeRules()/buildPrompt(),
+            // both of which read frame.klingMotionPreset specifically. This
+            // means NO custom Kling preset has ever actually been honored in
+            // production until this fix — every Kling-bound frame without a
+            // known pair silently hit the generic-default rejection and fell
+            // back to Ken Burns, regardless of what preset the user selected.
+            klingMotionPreset: frame.klingMotionPreset,
             durationSeconds: resolveDuration(frame),
             customPrompt: frame.customPrompt,
             localPath: frame.localPath,
