@@ -32,6 +32,17 @@ async function downloadFrames(frames, workDir) {
       isBeforeAfter: !!frame.isBeforeAfter,
       roomType: frame.roomType || "default",
       motionPreset: frame.motionPreset || "auto",
+      // FIX (July 2026): klingMotionPreset was never in this file's returned
+      // object at all — same bug class as the continuation-motion fields
+      // below (an explicit property picklist silently drops anything not
+      // named), just never caught for this field until a real test job
+      // showed every Kling frame rejected with "(none — generic default)"
+      // despite video-job.js correctly sending klingMotionPreset in the
+      // dispatch payload, and despite renderPipeline.js correctly forwarding
+      // frame.klingMotionPreset onward. Both of those fixes were necessary
+      // but not sufficient — this file, one layer earlier, was dropping the
+      // field before either of them ever saw it.
+      klingMotionPreset: frame.klingMotionPreset || null,
       durationSeconds: frame.durationSeconds || 4.5,
       sequenceOrder: frame.sequenceOrder ?? i,
       useAiMotion: !!frame.useAiMotion,
