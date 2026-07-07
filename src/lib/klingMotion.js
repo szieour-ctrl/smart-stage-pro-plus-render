@@ -107,6 +107,18 @@ const SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS = new Set([
   "orbit_arc",
   "rack_focus",
   "fireplace_flicker",
+  // New Motion Library (July 2026) — camera-move-only, same category as the
+  // 3 above: motion through/around a scene that's already fully visible, no
+  // invented room content. See KLING_MOTION_TEMPLATES for the reasoning on
+  // why room_reveal, living_room_ambient, and corner_to_corner_drift are
+  // deliberately NOT included here yet.
+  "cinematic_push",
+  "luxury_drift",
+  "floating_camera_drift",
+  "parallax_push",
+  "architectural_glide",
+  "crane_up",
+  "crane_down",
 ]);
 
 function enforceScopeRules(frame) {
@@ -121,7 +133,7 @@ function enforceScopeRules(frame) {
   }
 
   throw new Error(
-    `Kling AI motion rejected: no end image provided for room type "${frame.roomType}", and preset "${frame.klingMotionPreset || "(none — generic default)"}" is not in the single-image interior allowlist (orbit_arc, rack_focus, fireplace_flicker). The generic interior default requires Kling to invent furniture/layout wholesale rather than interpolate between two known images or animate an already-disclosed scene — this is disabled by design. Use a vacant+staged pair, select one of the allowed single-image presets, or use Ken Burns for single-image interior shots outside that list. See AB 723 scope restriction in klingMotion.js.`
+    `Kling AI motion rejected: no end image provided for room type "${frame.roomType}", and preset "${frame.klingMotionPreset || "(none — generic default)"}" is not in the single-image interior allowlist (orbit_arc, rack_focus, fireplace_flicker, cinematic_push, luxury_drift, floating_camera_drift, parallax_push, architectural_glide, crane_up, crane_down). The generic interior default requires Kling to invent furniture/layout wholesale rather than interpolate between two known images or animate an already-disclosed scene — this is disabled by design. Use a vacant+staged pair, select one of the allowed single-image presets, or use Ken Burns for single-image interior shots outside that list. See AB 723 scope restriction in klingMotion.js.`
   );
 }
 
@@ -195,6 +207,71 @@ const KLING_MOTION_TEMPLATES = {
   // two independent lighting timelines in the same clip.
   twilight_night_day_timelapse:
     "Time-lapse style video, static locked-off camera, exterior sky transitioning through three phases: starting at dusk blue-hour with a pink and purple sunset glow near the horizon, deepening into full night with a dark navy-to-black sky, then rapidly brightening into clear daytime blue sky, clouds streaking past throughout. Interior window lights are on at the start during dusk, then turn off at around the 2.5 second mark, leaving only exterior porch, garage, and landscape lighting on for the remainder of the night phase, which then turns off as daylight returns at dawn. Photorealistic, no distortion, house structure, architecture, and landscaping remain completely fixed and unchanged — only the sky, light, and time of day transform",
+
+  // ── New Motion Library (July 2026) — 5 additional camera-move-only presets,
+  // same compliance category as orbit_arc/rack_focus/fireplace_flicker above:
+  // pure camera movement through/around a scene that's already fully visible
+  // and disclosed, no invented furniture, fixtures, or room content. Added to
+  // SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS below on that basis.
+
+  cinematic_push:
+    "Slow, smooth cinematic push-in camera movement toward the center of the room, gently tightening the framing on the space already shown, photorealistic, no distortion, stable architecture, all visible furniture, fixtures, walls, and windows remain fixed and unchanged throughout the movement",
+
+  luxury_drift:
+    "Slow, elegant lateral drift camera movement gliding gently across the room from one side toward the other, refined luxury cinematic feel, photorealistic, no distortion, stable architecture, all visible furniture, fixtures, and architecture remain fixed and undistorted throughout the movement",
+
+  floating_camera_drift:
+    "Gentle floating camera movement with subtle drift and micro-sway, as if suspended weightlessly within the room, soft breathing motion, photorealistic, no distortion, stable architecture, all visible furniture, fixtures, and architecture remain fixed and undistorted throughout",
+
+  parallax_push:
+    "Cinematic push-in camera movement with layered parallax depth, foreground elements shifting slightly faster than background elements as the camera moves forward to create a sense of dimensional depth, photorealistic, no distortion, stable architecture, all visible furniture, fixtures, and architecture remain fixed and undistorted throughout",
+
+  architectural_glide:
+    "Smooth lateral glide camera movement tracking along the sightline, hallway, or open-plan sequence already visible in the photo, emphasizing architectural flow, photorealistic, no distortion, stable architecture, all visible walls, ceilings, fixtures, and furniture remain fixed and undistorted throughout",
+
+  // ── crane_up / crane_down — Kling-quality vertical crane pair, filling a
+  // real gap: Ken Burns already has tilt_up/tilt_down (pure FFmpeg vertical
+  // pan, no AI generation), and drone_boom_up is Kling's vertical move but
+  // exterior-only. There was no AI-generated vertical camera move for
+  // single-image interior until now. Same category as cinematic_push/
+  // architectural_glide above — camera moves through content already
+  // visible in the photo, no invented room content.
+  crane_up:
+    "Smooth cinematic crane camera movement, rising vertically while tilting slightly upward to bring the upper portion of the room already visible in the photo into clearer view — ceiling details, chandelier, ceiling fan, or high windows — photorealistic, no distortion, stable architecture, all visible fixtures, furniture, and architecture remain fixed and unchanged throughout the movement, do not reveal room area beyond what is visible in the source photo",
+
+  crane_down:
+    "Smooth cinematic crane camera movement, descending vertically while tilting slightly downward to bring the lower portion of the room already visible in the photo into clearer view — flooring, tilework, or a rug — photorealistic, no distortion, stable architecture, all visible fixtures, furniture, and architecture remain fixed and unchanged throughout the movement, do not reveal room area beyond what is visible in the source photo",
+
+  // ── room_reveal — TEMPLATE ADDED, DELIBERATELY NOT in
+  // SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS below. Unlike the 5 above, this
+  // preset's own name implies widening what's visible beyond the original
+  // photo's framing, not just moving the camera through/around content
+  // already shown — a materially different claim than orbit_arc's "stays
+  // centered on one feature." Flagged for Sam's explicit review before
+  // enabling for single-image interior use; safe to use today only with a
+  // real vacant+staged pair (hasKnownPair bypasses this restriction) or on
+  // exterior (isExterior bypasses it too).
+  room_reveal:
+    "Slow cinematic reveal movement, camera gently pulling back and widening to bring more of the already-visible room into frame, photorealistic, no distortion, stable architecture, all furniture and fixtures remain fixed and unchanged — do not invent new rooms, walls, fixtures, or furniture beyond what is visible in the source photo",
+
+  // ── The following 3 are the exact presets already flagged in Sam's own
+  // New Motion Library planning doc as needing fal.ai Playground
+  // verification before real use — honoring that flag as-is, not
+  // second-guessing it. Templates included so they can be Playground-tested;
+  // living_room_ambient and corner_to_corner_drift are deliberately NOT in
+  // SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS below until verified.
+  // outdoor_breeze needs no allowlist entry — exterior single-image is
+  // already permitted for any preset under enforceScopeRules' isExterior
+  // check — but the same invented-water-feature risk applies regardless of
+  // the scope gate, so verify it in Playground before real use too.
+  living_room_ambient:
+    "Subtle ambient cinematic motion within the living room — if a lit fireplace is visible, gentle flame flicker; if curtains are visible, a light natural sway; if plants are visible, subtle organic movement — only animating elements already present in the photo, photorealistic, no distortion, stable architecture, all furniture, fixtures, and architecture remain fixed and unchanged, do not add a fireplace, curtains, or plants that are not already visible",
+
+  outdoor_breeze:
+    "Gentle outdoor ambient motion — if trees, plants, or landscaping are visible, a subtle natural breeze moving through them; if water features are visible, gentle ripples — only animating elements already present in the photo, photorealistic, no distortion, structure and landscaping remain fixed and unchanged, do not add trees, plants, water features, or landscaping that are not already visible",
+
+  corner_to_corner_drift:
+    "Slow diagonal cinematic drift from one corner of the room toward the opposite corner, staying within the room as already framed in the photo, photorealistic, no distortion, stable architecture, all visible furniture, fixtures, and architecture remain fixed and undistorted throughout, do not reveal room area beyond what is visible in the source photo",
 };
 
 const VALID_KLING_PRESETS = new Set(Object.keys(KLING_MOTION_TEMPLATES));
