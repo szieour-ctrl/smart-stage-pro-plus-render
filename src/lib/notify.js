@@ -18,6 +18,15 @@ async function notifyWebhook(payload, webhookUrlOverride) {
     return;
   }
 
+  // Diagnostic logging (July 7, 2026): a Smart Correct batch webhook call
+  // was returning 400 even though the exact same payload shape succeeded
+  // when POSTed directly via Postman — meaning something about the actual
+  // resolved URL or payload differs from what's expected. Logging both
+  // explicitly, with the URL wrapped in brackets to make any invisible
+  // trailing space/newline from an env var copy-paste immediately visible.
+  console.log(`[notifyWebhook] Target URL: [${targetUrl}] (length ${targetUrl.length})`);
+  console.log(`[notifyWebhook] Payload keys: ${Object.keys(payload).join(", ")}, batchId/jobId: ${payload.batchId || payload.jobId}, status: ${payload.status}`);
+
   try {
     await axios.post(targetUrl, payload, {
       headers: {
@@ -31,6 +40,9 @@ async function notifyWebhook(payload, webhookUrlOverride) {
     // render process. The job status in Supabase may need manual review
     // if this keeps happening; check Railway logs.
     console.error("Webhook notification failed:", err.message);
+    if (err.response) {
+      console.error(`Webhook response status: ${err.response.status}, body: ${JSON.stringify(err.response.data).slice(0, 500)}`);
+    }
   }
 }
 
