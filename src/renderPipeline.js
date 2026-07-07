@@ -24,6 +24,15 @@ const { notifyWebhook } = require("./lib/notify");
 async function processRenderJob(job) {
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), `job-${job.jobId}-`));
 
+  // NEW (bug 2g — refund logic): declared here, not inside the try block,
+  // so it's still readable in the catch block below if a failure happens
+  // partway through the frame loop — informational on the failure path
+  // (the failure refund is a full-charge refund regardless, per the locked
+  // design: no usable video means no charge is defensible either way), but
+  // useful for diagnosing exactly which frames had already rendered via
+  // Kling (real cost already incurred) before the failure occurred.
+  let klingFrameOutcomes = [];
+
   try {
     console.log(`[${job.jobId}] Starting render. ${job.frames.length} frames.`);
 
@@ -44,7 +53,14 @@ async function processRenderJob(job) {
     const clipPaths = [];
     let carryZoom = 1.0; // tracks ending zoom of the previous clip for continuity
 
-    for (const frame of localFrames) {
+    // Tracks, per Kling-requested frame, whether it actually rendered via
+    // Kling or silently fell back to Ken Burns. sequenceOrder is passed
+    // through from video-job.js's dispatch payload — falls back to array
+    // index if a frame is somehow missing it, so this never throws, it just
+    // degrades to position-based matching.
+
+    for (let i = 0; i < localFrames.length; i++) {
+      const frame = localFrames[i];
       let clipPath;
 
       if (frame.useAiMotion) {
@@ -79,6 +95,16 @@ async function processRenderJob(job) {
         );
         clipPath = result.path;
         carryZoom = result.endingZoom;
+
+        // result.source is "kling" (real Kling output) or
+        // "ken_burns_fallback" (applyKlingMotion() caught a failure and
+        // fell back) — set in klingMotion.js's applyKlingMotion(). This is
+        // exactly the distinction video-notify.js needs to know which
+        // billed frames to refund.
+        klingFrameOutcomes.push({
+          sequenceOrder: frame.sequenceOrder !== undefined ? frame.sequenceOrder : i,
+          outcome: result.source,
+        });
       } else if (frame.isBeforeAfter && frame.beforeLocalPath) {
         // Flagship feature: vacant room holds, then wipes into staged version.
         // Build each side's motion clip first, then composite the wipe.
@@ -132,6 +158,7 @@ async function processRenderJob(job) {
       jobId: job.jobId,
       status: "complete",
       urls,
+      klingFrameOutcomes,
     });
 
     console.log(`[${job.jobId}] Done.`);
@@ -141,6 +168,7 @@ async function processRenderJob(job) {
       jobId: job.jobId,
       status: "failed",
       error: err.message,
+      klingFrameOutcomes,
     });
     throw err;
   } finally {
