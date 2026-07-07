@@ -10,6 +10,7 @@
 require("dotenv").config();
 const express = require("express");
 const { processRenderJob } = require("./renderPipeline");
+const { processCorrectBatch } = require("./correctPipeline");
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
@@ -70,6 +71,36 @@ app.post("/render", requireSecret, async (req, res) => {
     })
     .finally(() => {
       activeJobs.delete(job.jobId);
+    });
+});
+
+// ── SMART CORRECT BATCH ENDPOINT ──────────────────────────────────────────
+// Smart Connect™ — Module 1/2 deterministic image correction.
+// Same shape as /render: acknowledge fast (202), process in the background,
+// report the result via a webhook (SMART_CORRECT_WEBHOOK_URL, separate
+// from the video webhook so results never collide with jobId-shaped
+// video payloads on the Netlify side).
+
+app.post("/correct-batch", requireSecret, async (req, res) => {
+  const job = req.body;
+
+  if (!job.batchId || !job.images || !Array.isArray(job.images) || job.images.length === 0) {
+    return res.status(400).json({ error: "Missing batchId or images array" });
+  }
+
+  // Acknowledge immediately — Module 1/2 correction across a batch can take
+  // real time even with parallelism; the Netlify side must not hold this
+  // HTTP connection open waiting for it.
+  res.status(202).json({ accepted: true, batchId: job.batchId });
+
+  activeJobs.set(job.batchId, { startedAt: Date.now(), type: "smart-correct" });
+
+  processCorrectBatch(job)
+    .catch((err) => {
+      console.error(`Smart Correct batch ${job.batchId} failed:`, err.message);
+    })
+    .finally(() => {
+      activeJobs.delete(job.batchId);
     });
 });
 
