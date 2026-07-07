@@ -10,7 +10,7 @@
 require("dotenv").config();
 const express = require("express");
 const { processRenderJob } = require("./renderPipeline");
-const { processCorrectBatch } = require("./correctPipeline");
+const { processCorrectBatch } = require("./lib/correctPipeline");
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
