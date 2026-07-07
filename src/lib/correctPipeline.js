@@ -94,6 +94,25 @@ function correctOneImage(image, workDir) {
   });
 }
 
+// WORKAROUND (July 7, 2026): SMART_CORRECT_WEBHOOK_URL would not persist in
+// Railway's environment despite being set three separate ways (normal Add
+// Variable, delete-and-recreate, Raw Editor) and confirmed via a startup
+// diagnostic dump of process.env — it simply never appeared alongside
+// WEBHOOK_SECRET and VIDEO_WEBHOOK_URL, which both work reliably. Rather
+// than keep fighting Railway's UI for this one variable, this derives the
+// Smart Correct webhook URL from VIDEO_WEBHOOK_URL, which IS confirmed
+// present — same domain, same /.netlify/functions/ path, just swapping the
+// function name at the end. Still tries the dedicated env var first, in
+// case it ever does start persisting, so this can be removed cleanly later
+// without a behavior change if Railway's variable issue resolves itself.
+function resolveSmartCorrectWebhookUrl() {
+  if (process.env.SMART_CORRECT_WEBHOOK_URL) return process.env.SMART_CORRECT_WEBHOOK_URL;
+  if (process.env.VIDEO_WEBHOOK_URL) {
+    return process.env.VIDEO_WEBHOOK_URL.replace("video-notify", "smart-correct-notify");
+  }
+  return undefined;
+}
+
 async function processCorrectBatch(job) {
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), `smart-correct-${job.batchId}-`));
 
@@ -116,7 +135,7 @@ async function processCorrectBatch(job) {
       batchId: job.batchId,
       status: "done",
       results,
-    }, process.env.SMART_CORRECT_WEBHOOK_URL);
+    }, resolveSmartCorrectWebhookUrl());
 
     console.log(`[${job.batchId}] Notified Netlify webhook.`);
 
@@ -126,7 +145,7 @@ async function processCorrectBatch(job) {
       batchId: job.batchId,
       status: "error",
       error: err.message,
-    }, process.env.SMART_CORRECT_WEBHOOK_URL);
+    }, resolveSmartCorrectWebhookUrl());
     throw err;
   } finally {
     fs.rm(workDir, { recursive: true, force: true }, (err) => {
