@@ -17,6 +17,18 @@ app.use(express.json({ limit: "10mb" }));
 
 const PORT = process.env.PORT || 3000;
 
+// TEMPORARY DIAGNOSTIC (July 7, 2026): SMART_CORRECT_WEBHOOK_URL appears
+// correctly set in Railway's dashboard, but process.env.SMART_CORRECT_WEBHOOK_URL
+// is resolving as undefined at runtime inside notifyWebhook(), causing every
+// Smart Correct batch to fall back to VIDEO_WEBHOOK_URL instead. This dumps
+// every env var name containing "WEBHOOK" at startup, so we can see exactly
+// what Node actually has access to — removing all guesswork from dashboard
+// screenshots, which can't show trailing whitespace or environment-scoping
+// issues. Remove this block once the root cause is confirmed and fixed.
+console.log("[STARTUP DIAGNOSTIC] Env vars containing 'WEBHOOK':",
+  Object.keys(process.env).filter(k => k.includes("WEBHOOK")).map(k => `${k}=[${process.env[k]}]`)
+);
+
 // In-memory job tracking for active renders (process-local; Supabase is
 // the source of truth for status, this is just for quick local debugging)
 const activeJobs = new Map();
