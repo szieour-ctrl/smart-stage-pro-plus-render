@@ -92,7 +92,7 @@ def deskew_perspective(img):
 
     angles = []
     for line in lines:
-        x1, y1, x2, y2 = line[0]
+        x1, y1, x2, y2 = line.flatten()
         dx, dy = x2 - x1, y2 - y1
         if abs(dy) < 1e-3:
             continue
