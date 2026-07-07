@@ -49,6 +49,7 @@ function correctOneImage(image, workDir) {
     try {
       fs.writeFileSync(sourcePath, Buffer.from(image.imageBase64, "base64"));
     } catch (err) {
+      console.error(`[correctOneImage] ${image.id}: failed to write source image: ${err.message}`);
       return resolve({ id: image.id, status: "error", error: `Failed to write source image: ${err.message}` });
     }
 
@@ -62,6 +63,7 @@ function correctOneImage(image, workDir) {
 
     proc.on("close", (code) => {
       if (code !== 0) {
+        console.error(`[correctOneImage] ${image.id}: smartCorrect.py exited ${code}. stderr: ${stderr.slice(0, 800)}`);
         return resolve({
           id: image.id,
           status: "error",
@@ -80,11 +82,13 @@ function correctOneImage(image, workDir) {
           perspectiveCorrectionDegrees: parsed.perspectiveCorrectionDegrees,
         });
       } catch (err) {
+        console.error(`[correctOneImage] ${image.id}: failed to read/parse output. stdout: ${stdout.slice(0, 300)} | err: ${err.message}`);
         resolve({ id: image.id, status: "error", error: `Failed to read corrected output: ${err.message}` });
       }
     });
 
     proc.on("error", (err) => {
+      console.error(`[correctOneImage] ${image.id}: failed to spawn python3: ${err.message}`);
       resolve({ id: image.id, status: "error", error: `Failed to spawn smartCorrect.py: ${err.message}` });
     });
   });
