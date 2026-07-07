@@ -4,14 +4,22 @@
 
 const axios = require("axios");
 
-async function notifyWebhook(payload) {
-  if (!process.env.VIDEO_WEBHOOK_URL) {
-    console.warn("VIDEO_WEBHOOK_URL not set — skipping notification. Job result:", payload);
+async function notifyWebhook(payload, webhookUrlOverride) {
+  // Backward compatible: every existing call site (renderPipeline.js) calls
+  // this with just one argument, so webhookUrlOverride is undefined and
+  // behavior is byte-for-byte identical to before this change.
+  // New callers (correctPipeline.js) pass SMART_CORRECT_WEBHOOK_URL
+  // explicitly, so a Smart Correct batch result never gets POSTed to the
+  // video webhook receiver, which expects a jobId-shaped payload, not a
+  // batchId-shaped one.
+  const targetUrl = webhookUrlOverride || process.env.VIDEO_WEBHOOK_URL;
+  if (!targetUrl) {
+    console.warn("No webhook URL configured — skipping notification. Job result:", payload);
     return;
   }
 
   try {
-    await axios.post(process.env.VIDEO_WEBHOOK_URL, payload, {
+    await axios.post(targetUrl, payload, {
       headers: {
         "Content-Type": "application/json",
         "x-webhook-secret": process.env.WEBHOOK_SECRET || "",
