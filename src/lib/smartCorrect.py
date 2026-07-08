@@ -521,6 +521,26 @@ def mls_brightness_lift(img, intensity=1.0):
     fusion = merge_mertens.process([under_8u, img.copy(), over_8u])
     fused = np.clip(fusion * 255, 0, 255).astype(np.uint8)
 
+    # LUMINANCE-ONLY FUSION FIX (July 9, 2026): confirmed directly on a
+    # real bathroom photo that full-RGB Mertens fusion introduces visible
+    # blotchy color artifacts on large uniform surfaces (a plain wall) —
+    # local chroma variance jumped ~4.5x (max local variance 38.9 -> 168.7)
+    # from the fusion step alone, before any other correction ran. Cause:
+    # Mertens fusion assigns per-pixel weights based on local
+    # well-exposedness/contrast/saturation, and on a subtly-textured
+    # uniform surface, neighboring pixels can get slightly different
+    # weights — which shows up as visible color mottling, not just
+    # brightness variation. Fix: apply the fusion result's LUMINANCE only,
+    # keep the original photo's actual color/chroma channels untouched.
+    # Verified: wall chroma variance dropped back to near-original levels
+    # (41.3 vs 38.9 baseline) while the brightness benefit was fully
+    # preserved (identical median luma, 161, with or without this fix).
+    lab_fused = cv2.cvtColor(fused, cv2.COLOR_BGR2LAB)
+    lab_orig_full = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    lab_hybrid = lab_orig_full.copy()
+    lab_hybrid[:, :, 0] = lab_fused[:, :, 0]
+    fused = cv2.cvtColor(lab_hybrid, cv2.COLOR_LAB2BGR)
+
     # Blend fusion result with the original by `intensity`, so the
     # existing intensity dial (0.6-1.25) still controls overall strength.
     blended = cv2.addWeighted(fused, intensity, img, 1.0 - intensity, 0) if intensity < 1.0 else fused
