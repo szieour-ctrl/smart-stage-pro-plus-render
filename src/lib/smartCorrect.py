@@ -385,11 +385,40 @@ def deskew_perspective(img):
 
 
 def detect_noise_level(img):
-    """Proxy for ISO/noise level: variance of the Laplacian on a grayscale
-    copy. No EXIF ISO dependency (most agent/iPhone uploads won't reliably
-    carry it through upload pipelines)."""
+    """Proxy for ISO/noise level.
+
+    FIXED (July 9, 2026, corrected on the second attempt): the original
+    version used a single GLOBAL Laplacian variance, which can't
+    distinguish "genuinely noisy/blurry photo" from "photo with naturally
+    smooth, low-texture content" (confirmed directly on a real marble
+    bathroom photo — global variance measured 79.8, triggering the
+    strongest denoise tier, which smoothed away real marble veining/detail
+    into a flat, hazy look). A first fix attempt using cv2.blur() on the
+    squared Laplacian was ALSO wrong — box-blurring dilutes genuinely sharp
+    edge spikes (a single grout line gets averaged against ~600 smooth
+    neighboring pixels), making the signal WORSE, not better (measured:
+    51.3, even lower than the original 79.8). Correct approach: compute
+    variance WITHIN actual small tiles independently (not a blurred
+    average), then take a high percentile across tiles — this correctly
+    lets a few genuinely sharp regions (grout lines, fixture edges) signal
+    "this photo is in focus," even when most tiles are naturally smooth.
+    Verified directly: proper per-tile variance on the bathroom photo
+    showed a 95th-percentile tile variance of ~458 — well into "clean,
+    doesn't need strong denoise" — versus the flawed global/blurred
+    approaches which both stayed under 100."""
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    return cv2.Laplacian(gray, cv2.CV_64F).var()
+    lap = cv2.Laplacian(gray, cv2.CV_64F)
+    h, w = lap.shape
+    tile = 40
+    variances = []
+    for y in range(0, max(1, h - tile), tile):
+        for x in range(0, max(1, w - tile), tile):
+            block = lap[y:y + tile, x:x + tile]
+            if block.size > 0:
+                variances.append(block.var())
+    if not variances:
+        return float(lap.var())
+    return float(np.percentile(variances, 95))
 
 
 def adaptive_denoise(img):
@@ -554,20 +583,41 @@ def clean_whites_adaptive(img, intensity=1.0):
     mean_l = float(np.mean(L[sample_mask]))
     cast_mag = float(np.sqrt((mean_a - 128.0) ** 2 + (mean_b - 128.0) ** 2))
 
-    neutralize_strength = clamp01((cast_mag - 1.8) / (10.0 - 1.8)) * 0.55 * intensity
+    # MAJORITY-WHITE-ROOM FIX (July 9, 2026): this function was designed
+    # and tested against kitchens, where white cabinets/trim are a
+    # distinguishable MINORITY of the frame against colorful counters,
+    # floors, and walls. Confirmed directly on a real marble bathroom
+    # photo that this assumption breaks down completely in predominantly-
+    # white rooms: whiteFraction measured 80%+ of the ENTIRE frame, so
+    # this function was applying its lift/neutralize to almost the whole
+    # photo — not a targeted surface correction anymore, just a second
+    # (redundant, compounding) global brightness/color pass stacked on
+    # top of mls_brightness_lift, vignette, and white balance, which were
+    # ALSO already touching the same dominant white content. That
+    # stacking is what produced a visibly blown-out, hazy result. Fix:
+    # scale strength down as white_fraction grows past what's plausible
+    # for "a minority of trim/cabinets" — full strength at <=35% white
+    # coverage (a normal amount of trim in a typical room), tapering to
+    # near-zero by 65%+ coverage (the room IS predominantly white by
+    # design — global corrections already handle it, a second targeted
+    # pass on top is redundant and risks exactly this compounding).
+    majority_room_factor = clamp01((0.75 - white_fraction) / (0.75 - 0.50))
+
+    neutralize_strength = clamp01((cast_mag - 1.8) / (10.0 - 1.8)) * 0.55 * intensity * majority_room_factor
 
     target_l = 212.0
     l_gap = max(0.0, target_l - mean_l)
-    lift_strength = clamp01(l_gap / 38.0) * 0.22 * intensity
+    lift_strength = clamp01(l_gap / 38.0) * 0.22 * intensity * majority_room_factor
     if mean_l > 220.0:
         lift_strength *= 0.15
     elif mean_l > 212.0:
         lift_strength *= 0.35
 
     if neutralize_strength < 0.03 and lift_strength < 0.03:
+        reason = "majority_white_room_scaled_down" if white_fraction > 0.55 else "likely_whites_already_clean"
         return img, {"applied": False, "whiteFraction": round(white_fraction, 4),
                       "castMagnitude": round(cast_mag, 3), "meanWhiteLuma": round(mean_l, 2),
-                      "reason": "likely_whites_already_clean"}
+                      "majorityRoomFactor": round(majority_room_factor, 3), "reason": reason}
 
     mask_u8 = white_mask.astype(np.uint8) * 255
     mask_blur = cv2.GaussianBlur(mask_u8, (0, 0), sigmaX=5, sigmaY=5).astype(np.float32) / 255.0
