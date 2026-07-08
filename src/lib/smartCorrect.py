@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-smartCorrect.py — Smart Connect(TM) Module 1/2 deterministic image correction.
+smartCorrect.py — Smart Connect(TM) deterministic image correction, MLS Bright calibrated.
 
 Mirrors motionRenderer.py's invocation convention exactly: CLI args in,
 single JSON object on stdout, non-zero exit code + stderr on failure.
@@ -11,53 +11,59 @@ CRITICAL DESIGN RULE (do not violate): every operation in this file must be
 classical, deterministic computer vision — no generative model, ever. This
 is the load-bearing assumption behind the SSC path's "no AB 723 required"
 claim: the statute excludes edits like white balance, exposure, color cast,
-sharpening, angle/perspective, and cropping when they don't change the
-representation of the property. A generative model doesn't just adjust
-values, it regenerates pixels — that's a different legal category entirely,
-and this script must never drift into it.
+sharpening, angle/perspective, lens geometry, and cropping when they don't
+change the representation of the property. A generative model doesn't just
+adjust values, it regenerates pixels — that's a different legal category
+entirely, and this script must never drift into it. Confirmed by Sam (July
+8, 2026): lens correction is standard real-estate-photography practice and
+does not raise AB 723 concerns, same as any other geometric correction here.
 
-MODULE 1 — always RUNS, but each correction measures its own defect
-severity first and scales its strength proportionally (redesigned July 8,
-2026 after real output looked overprocessed — see inline comments on each
-function for the specific before/after reasoning):
-  - White balance calibration (white-patch/gray-world hybrid, strength
-    scaled to measured color-cast magnitude)
-  - Lens/perspective alignment (Hough-line-based vertical deskew — already
-    binary/measured: only rotates when a real tilt is detected)
-  - Exposure normalization (contrast stretch + CLAHE, strength scaled to
-    measured range-utilization and local-contrast flatness)
-  - Color cast removal (part of the white balance pass)
-  - Adaptive noise reduction (fastNlMeansDenoisingColored, strength scaled
-    to a detected-noise proxy rather than a fixed constant)
-  - Vignette neutralization (radial gain, strength scaled to measured
-    center-vs-edge brightness falloff)
-  - Saturation lift (new — strength scaled to measured current saturation)
+HISTORY (July 8, 2026): this pipeline went through three real iterations
+in one session, each driven by direct feedback on actual output rather
+than assumption:
+  1. First pass — every correction applied at fixed full strength to every
+     photo. Real bug found via direct measurement: the perspective deskew
+     had a sign error that DOUBLED tilt instead of removing it, and
+     rotation left replicated-border artifacts at the corners. Both fixed
+     and verified (marker-color test proved zero fabricated pixels survive
+     the crop; a known 5-degree test tilt measured 0.0 degrees residual
+     after the fix).
+  2. Second pass — made each correction measure its own defect severity
+     and scale proportionally, so a photo with only one real issue doesn't
+     get every correction applied at once. Sam's own words on the first
+     pass: "the life was edited out of the photos — overprocessed."
+  3. Third pass (this version) — Sam provided a reference implementation
+     built with another tool and calibrated against real professional MLS
+     Bright photos (his own words: "23 years in real estate and I've paid
+     for photos that have MLS Bright corrections done as SOP"). That
+     reference is used here as intended — as a reference, not verbatim —
+     merging its validated MLS Bright calibration (measured brightness
+     targets, targeted white-surface masking, do-no-harm gate) into this
+     file's existing structure, so the working Railway/Node integration
+     (correctPipeline.js's JSON parsing contract) doesn't need to change.
 
-A photo with only one real defect (e.g. a mild color cast, nothing else
-wrong) should come out with only that one correction meaningfully applied
-— reflected honestly in modulesApplied, which only lists a correction once
-its measured strength crosses a real threshold, not just because the
-function ran.
+PIPELINE:
+  Do-No-Harm Gate (Professional MLS Guard)
+     -> if the photo already matches the calibrated MLS Bright profile,
+        copy through untouched rather than reprocess it
+  Technical correction
+     -> white balance (neutral-surface-aware) / mild lens correction /
+        perspective deskew / adaptive denoise / vignette lift
+  MLS Bright finish
+     -> calibrated interior brightness lift (highlight-protected) /
+        adaptive clean-whites / window highlight balance / color+clarity
+        finish
 
-MODULE 2 — conditional, histogram-triggered:
-  - Shadow recovery
-  - Highlight recovery
-  - Texture / micro-contrast boost
-
-NOT IMPLEMENTED in this first pass (explicitly stubbed, not silently
-faked — each returns the image unchanged and is flagged in the JSON output
-as "skipped"):
+NOT IMPLEMENTED (explicitly stubbed, not silently faked — flagged in the
+JSON output as "skipped"):
   - Color uniformity harmonization — needs whole-batch context (comparing
-    wall/floor tones ACROSS frames), not just this one image. This script
-    only ever sees one image at a time. Would need to move up into
-    correctPipeline.js as a batch-level pass if built later.
+    wall/floor tones ACROSS frames), not just this one image. Would need
+    to move up into correctPipeline.js as a batch-level pass if built later.
   - Reflection/glare reduction — specular highlight detection + inpainting
-    is a materially harder CV problem than the rest of this list; cut from
-    MVP per the same reasoning that cut HDR/bracket merge (see the July 7,
-    2026 Notion decision page — no clear near-term need, real engineering
-    cost, better to build only if a concrete case shows up in testing).
+    is a materially harder CV problem than the rest of this list; cut per
+    the July 7, 2026 Notion decision page reasoning.
   - HDR / bracket merge — no multi-exposure upload path exists for
-    single-shot iPhone/agent uploads. Cut from MVP per that same doc.
+    single-shot iPhone/agent uploads.
 
 Usage:
   python3 smartCorrect.py --source IN.jpg --output OUT.jpg
@@ -65,77 +71,192 @@ Usage:
 
 import argparse
 import json
+import os
+import shutil
 import sys
 
 import cv2
 import numpy as np
 
 
-def white_balance_gray_world(img):
-    """Module 1: white balance + color cast removal.
+def clamp01(x):
+    return float(np.clip(x, 0.0, 1.0))
 
-    REDESIGNED (July 8, 2026) after Sam's direct feedback on real output:
-    stacking full-strength WB + full contrast stretch + full CLAHE + full
-    vignette lift + full saturation boost on every photo, regardless of
-    what that specific photo actually needed, produced an overprocessed,
-    "life edited out" look — Sam's own words. His example: "sometimes all
-    a photo may need is white balance." The fix isn't reverting to weaker
-    fixed strength (that was the original complaint) — it's making each
-    correction MEASURE its own defect severity and scale its strength to
-    match, so a photo with a mild cast gets a mild nudge and a photo with
-    a real problem gets real correction, instead of every photo getting
-    the same blanket treatment either way.
 
-    Uses the same white-patch/gray-world hybrid as before to compute the
-    needed scale per channel, but now measures how far that scale actually
-    deviates from "no change" (1.0) and interpolates between no-correction
-    and full-correction proportionally — full strength only kicks in once
-    the detected cast is genuinely significant.
-    """
-    result = img.astype(np.float32)
+# ── Measurement helpers (read-only, no pixel changes) ──────────────────────
 
-    mean_b, mean_g, mean_r = [result[:, :, i].mean() for i in range(3)]
-    mean_gray = (mean_b + mean_g + mean_r) / 3.0
+def image_stats(img):
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    l = lab[:, :, 0].astype(np.float32)
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    return {
+        "mean_luma": round(float(l.mean()), 2),
+        "median_luma": round(float(np.median(l)), 2),
+        "p05_luma": round(float(np.percentile(l, 5)), 2),
+        "p95_luma": round(float(np.percentile(l, 95)), 2),
+        "mean_saturation": round(float(hsv[:, :, 1].mean()), 2),
+    }
 
-    # White-patch reference: mean of the brightest 5% of pixels per channel
-    wp_scales = []
-    for i in range(3):
-        channel = result[:, :, i]
-        threshold = np.percentile(channel, 95)
-        bright_pixels = channel[channel >= threshold]
-        wp_scales.append(bright_pixels.mean() if bright_pixels.size > 0 else mean_gray)
-    wp_mean = sum(wp_scales) / 3.0
 
-    blended_scales = []
-    for i, mean_c in enumerate([mean_b, mean_g, mean_r]):
-        if mean_c > 1e-3:
-            gray_world_scale = mean_gray / mean_c
-            white_patch_scale = (wp_mean / wp_scales[i]) if wp_scales[i] > 1e-3 else gray_world_scale
-            blended_scales.append(0.6 * white_patch_scale + 0.4 * gray_world_scale)
-        else:
-            blended_scales.append(1.0)
+def white_surface_stats(img):
+    """Measure likely-white architectural surfaces (trim, cabinets,
+    ceilings) without modifying pixels — used by the do-no-harm gate and
+    by clean_whites_adaptive to decide whether/how much to correct."""
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
+    L, A, B = cv2.split(lab)
+    chroma = np.sqrt((A - 128.0) ** 2 + (B - 128.0) ** 2)
+    white_mask = (L > 145.0) & (chroma < 22.0)
+    strong_white_mask = (L > 165.0) & (chroma < 16.0)
 
-    # Severity-proportional application: measure how far the computed scale
-    # deviates from "no change needed" (1.0), then interpolate between
-    # identity and the full computed correction. Below ~3% deviation, barely
-    # touch it (near-neutral photo). Above ~18% deviation, apply the full
-    # computed correction (genuinely significant cast). Linear ramp between.
-    cast_magnitude = max(abs(s - 1.0) for s in blended_scales)
-    strength = float(np.clip((cast_magnitude - 0.03) / (0.18 - 0.03), 0.0, 1.0))
+    white_fraction = float(np.mean(white_mask))
+    strong_fraction = float(np.mean(strong_white_mask))
+    if white_fraction < 0.003:
+        return {
+            "whiteFraction": round(white_fraction, 4),
+            "strongWhiteFraction": round(strong_fraction, 4),
+            "meanWhiteLuma": 0.0,
+            "whiteCastMagnitude": 99.0,
+            "meanWhiteA": 0.0,
+            "meanWhiteB": 0.0,
+        }
 
-    for i in range(3):
-        applied_scale = 1.0 + strength * (blended_scales[i] - 1.0)
-        result[:, :, i] *= applied_scale
-    return np.clip(result, 0, 255).astype(np.uint8), strength
+    sample_mask = strong_white_mask if np.any(strong_white_mask) else white_mask
+    mean_l = float(np.mean(L[sample_mask]))
+    mean_a = float(np.mean(A[sample_mask]))
+    mean_b = float(np.mean(B[sample_mask]))
+    cast_mag = float(np.sqrt((mean_a - 128.0) ** 2 + (mean_b - 128.0) ** 2))
+
+    return {
+        "whiteFraction": round(white_fraction, 4),
+        "strongWhiteFraction": round(strong_fraction, 4),
+        "meanWhiteLuma": round(mean_l, 2),
+        "whiteCastMagnitude": round(cast_mag, 3),
+        "meanWhiteA": round(mean_a, 2),
+        "meanWhiteB": round(mean_b, 2),
+    }
+
+
+def shadow_highlight_stats(img):
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
+    L = lab[:, :, 0]
+    return {
+        "shadowFraction": round(float(np.mean(L < 45.0)), 4),
+        "brightFraction": round(float(np.mean(L > 232.0)), 4),
+        "veryBrightFraction": round(float(np.mean(L > 245.0)), 4),
+    }
+
+
+# ── Do-No-Harm gate ─────────────────────────────────────────────────────────
+
+def assess_professional_mls_bright(img):
+    """Detect photos that already match the calibrated MLS Bright profile
+    and should be left untouched rather than reprocessed. Thresholds per
+    Sam's reference implementation, calibrated against real professional
+    MLS Bright photos (his SOP standard, 23 years in the business)."""
+    stats = image_stats(img)
+    whites = white_surface_stats(img)
+    hist = shadow_highlight_stats(img)
+
+    _, measured_rotation = deskew_perspective(img.copy())
+    measured_rotation = float(measured_rotation)
+
+    checks = {
+        "median_luma_ok": stats["median_luma"] >= 180.0,
+        "mean_luma_ok": stats["mean_luma"] >= 158.0,
+        "p95_luma_ok": stats["p95_luma"] >= 220.0,
+        "white_area_ok": whites["whiteFraction"] >= 0.55,
+        "white_luma_ok": whites["meanWhiteLuma"] >= 198.0,
+        "white_cast_ok": whites["whiteCastMagnitude"] <= 3.25,
+        "saturation_ok": stats["mean_saturation"] <= 32.0,
+        "shadow_ok": hist["shadowFraction"] <= 0.085,
+        "geometry_ok": abs(measured_rotation) <= 0.75,
+    }
+    score = sum(1 for v in checks.values() if v) / float(len(checks))
+
+    load_bearing = (
+        checks["median_luma_ok"] and checks["mean_luma_ok"]
+        and checks["white_area_ok"] and checks["white_cast_ok"]
+        and checks["geometry_ok"]
+    )
+    already_mls_bright = bool(load_bearing and score >= 0.86)
+
+    return {
+        "alreadyMLSBright": already_mls_bright,
+        "score": round(score, 3),
+        "checks": checks,
+        "stats": stats,
+        "whiteSurfaceStats": whites,
+        "shadowHighlightStats": hist,
+        "measuredPerspectiveCorrectionDegrees": round(measured_rotation, 3),
+    }
+
+
+# ── Technical correction layer ──────────────────────────────────────────────
+
+def white_balance_neutral_aware(img):
+    """White balance using likely-neutral surfaces (trim, doors, cabinets,
+    ceilings) as the primary reference, falling back to gray-world when
+    there aren't enough neutral candidates in frame. More targeted than
+    pure gray-world, per Sam's calibrated reference — real estate photos
+    are full of genuinely colorful content (wood, furniture) that pulls a
+    whole-image average away from true neutral."""
+    bgr = img.astype(np.float32)
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
+
+    neutral_mask = (s < 55) & (v > 120) & (v < 245)
+    if neutral_mask.sum() < img.size * 0.01:
+        neutral_mask = (s < 75) & (v > 100) & (v < 248)
+
+    if neutral_mask.sum() > max(250, img.shape[0] * img.shape[1] * 0.006):
+        sample = bgr[neutral_mask]
+        means = sample.mean(axis=0)
+    else:
+        means = bgr.reshape(-1, 3).mean(axis=0)
+
+    target = float(means.mean())
+    scales = target / np.maximum(means, 1.0)
+    # Conservative cap: correct cast, do not change material color.
+    scales = np.clip(scales, 0.82, 1.20)
+
+    cast_mag = float(np.max(np.abs(scales - 1.0)))
+    strength = clamp01((cast_mag - 0.015) / 0.11)
+    applied = 1.0 + strength * (scales - 1.0)
+
+    out = bgr * applied.reshape(1, 1, 3)
+    return np.clip(out, 0, 255).astype(np.uint8), round(strength, 3)
+
+
+def mild_mobile_lens_correction(img, mode="auto"):
+    """Mild deterministic radial correction for typical mobile/wide-angle
+    barrel distortion. Confirmed by Sam (July 8, 2026) as standard real
+    estate photography practice, not an AB 723 concern — geometric lens
+    correction, same category as perspective/angle correction. Uses a
+    generic distortion estimate (not a per-device calibration), kept
+    small and capped so it never meaningfully alters composition."""
+    if mode == "off":
+        return img, 0.0
+    h, w = img.shape[:2]
+    if mode == "auto" and max(w, h) < 900:
+        return img, 0.0
+
+    strength = 0.020 if mode == "auto" else 0.032
+    camera_matrix = np.array([[w, 0, w / 2], [0, w, h / 2], [0, 0, 1]], dtype=np.float32)
+    dist_coeffs = np.array([-strength, 0.0, 0.0, 0.0], dtype=np.float32)
+    new_camera, roi = cv2.getOptimalNewCameraMatrix(camera_matrix, dist_coeffs, (w, h), 1, (w, h))
+    undistorted = cv2.undistort(img, camera_matrix, dist_coeffs, None, new_camera)
+    x, y, rw, rh = roi
+    if rw > 0 and rh > 0:
+        undistorted = undistorted[y:y + rh, x:x + rw]
+        undistorted = cv2.resize(undistorted, (w, h), interpolation=cv2.INTER_CUBIC)
+    return undistorted, round(strength, 4)
 
 
 def _largest_crop_after_rotation(w, h, angle_deg):
     """Standard formula for the largest axis-aligned rectangle, with the
     same aspect ratio as the original, that fits entirely inside a WxH
     image after it's been rotated by angle_deg — i.e. the region that
-    contains zero fabricated/replicated border pixels. Well-established
-    technique (the "rotate and crop" problem), not something invented for
-    this file."""
+    contains zero fabricated/replicated border pixels."""
     angle = np.radians(abs(angle_deg))
     if angle < 1e-6:
         return w, h
@@ -153,78 +274,55 @@ def _largest_crop_after_rotation(w, h, angle_deg):
 
 
 def deskew_perspective(img):
-    """Module 1: perspective/vertical alignment via Hough-line detection.
+    """Perspective/vertical alignment via Hough-line detection.
 
-    APPROXIMATION NOTE: this detects the dominant near-vertical line angle
-    (architectural edges — door frames, wall corners) and applies a single
-    global rotation to correct it. This is a real, working first pass, but
-    it is NOT full 4-point perspective/keystone correction (which would
-    independently correct convergence at top vs. bottom of frame). If
-    testing shows meaningfully converging verticals that a single rotation
-    can't fix, this is the function to upgrade next — flagging now rather
-    than silently under-delivering on the "perspective alignment" claim.
+    APPROXIMATION NOTE: detects the dominant near-vertical line angle
+    (architectural edges) and applies a single global rotation — not full
+    4-point perspective/keystone correction. Upgrade path if testing shows
+    meaningfully converging verticals a single rotation can't fix.
 
-    CROP FIX (July 8, 2026): rotating an image within a fixed-size canvas
-    leaves the corners of the rotated content outside the frame; the
-    original code filled that gap with BORDER_REPLICATE (smeared copies of
-    edge pixels) rather than real content — a real, if subtle, quality
-    issue at the corners. This now crops down to the largest rectangle
-    containing zero fabricated pixels, then scales back up to the original
-    WxH, so the delivered image has real content everywhere and keeps the
-    exact same pixel dimensions and aspect ratio as the input.
+    Includes both fixes verified earlier this session: (1) canonicalized
+    line direction so HoughLinesP's arbitrary endpoint ordering can't flip
+    a valid line into the rejected ~180-degree range, (2) correct sign on
+    the corrective rotation (proved via a known 5-degree test tilt: the
+    unfixed version measured ~10 degrees residual, doubling the tilt; this
+    version measures 0.0), and (3) crop-after-rotate so no replicated
+    border pixels survive into the delivered image (proved via a
+    marker-color test — zero fabricated pixels found in the final output).
     """
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(gray, 50, 150, apertureSize=3)
     lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=80,
-                             minLineLength=img.shape[0] // 4, maxLineGap=10)
+                             minLineLength=max(40, img.shape[0] // 4), maxLineGap=12)
     if lines is None:
         return img, 0.0
 
     angles = []
+    lengths = []
     for line in lines:
         x1, y1, x2, y2 = line.flatten()
         dx, dy = x2 - x1, y2 - y1
-        # CRITICAL: cv2.HoughLinesP() does not guarantee which endpoint of a
-        # detected segment comes first — it can return either (top, bottom)
-        # or (bottom, top) order for the same physical line, seemingly
-        # arbitrarily. Without canonicalizing direction, the SAME real edge
-        # could compute to ~+5 degrees in one photo and ~175 degrees in
-        # another (or even within the same photo across different detected
-        # segments of the same wall), and the `abs(angle) < 20` filter below
-        # would silently keep one and reject the other — an uncontrolled,
-        # per-detection bias rather than a real measurement of tilt. Forcing
-        # every line to point downward (dy >= 0) before computing the angle
-        # makes the result direction-independent and fixes this at the root.
         if dy < 0:
             dx, dy = -dx, -dy
         if abs(dy) < 1e-3:
             continue
         angle_from_vertical = np.degrees(np.arctan2(dx, dy))
-        # Only count lines reasonably close to vertical (architectural
-        # edges) — ignore near-horizontal lines (floor lines, countertops)
-        # which aren't relevant to vertical deskew.
-        if abs(angle_from_vertical) < 20:
-            angles.append(angle_from_vertical)
+        if abs(angle_from_vertical) < 14:
+            angles.append(float(angle_from_vertical))
+            lengths.append(float(np.hypot(dx, dy)))
 
-    if not angles:
+    if len(angles) < 3:
         return img, 0.0
 
-    # SIGN FIX: cv2.getRotationMatrix2D rotates image content counter-
-    # clockwise for positive angles. The measured `angles` above describe
-    # how the content is CURRENTLY tilted (e.g. a negative median means
-    # verticals lean with their top shifted right). Applying that same
-    # signed value as the correction rotates the content FURTHER in the
-    # direction it's already leaning, doubling the tilt instead of
-    # removing it — confirmed directly: a real 5-degree test tilt became
-    # a ~10-degree residual tilt with the unfixed sign, and ~0 with this
-    # fix. The corrective rotation must be the NEGATIVE of the detected
-    # tilt to actually straighten the image.
-    correction_angle = -float(np.median(angles))
-    # Cap correction to a sane range — a large "correction" is more likely
-    # a misdetection (e.g. a rug pattern) than real lens tilt.
-    correction_angle = max(-8.0, min(8.0, correction_angle))
-    if abs(correction_angle) < 0.3:
-        return img, 0.0  # not worth rotating for sub-degree noise
+    # Length-weighted median — longer detected lines (more likely real
+    # architectural edges vs. noise) count more toward the final angle.
+    weighted = []
+    for a, l in zip(angles, lengths):
+        weighted.extend([a] * max(1, int(l // 60)))
+    correction_angle = -float(np.median(weighted if weighted else angles))
+    correction_angle = max(-6.0, min(6.0, correction_angle))
+    if abs(correction_angle) < 0.35:
+        return img, 0.0
 
     h, w = img.shape[:2]
     center = (w / 2, h / 2)
@@ -232,9 +330,6 @@ def deskew_perspective(img):
     rotated = cv2.warpAffine(img, rot_matrix, (w, h),
                               flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
 
-    # Crop out the replicated-border corners, then scale back to original
-    # dimensions so the output always matches the input's pixel size and
-    # aspect ratio exactly.
     crop_w, crop_h = _largest_crop_after_rotation(w, h, correction_angle)
     crop_w, crop_h = int(round(crop_w)), int(round(crop_h))
     x0 = max(0, (w - crop_w) // 2)
@@ -245,245 +340,279 @@ def deskew_perspective(img):
     return result, correction_angle
 
 
-def exposure_normalize(img):
-    """Module 1: exposure normalization.
-
-    REDESIGNED (July 8, 2026) alongside white_balance_gray_world — same
-    reasoning: measure the actual defect, then scale correction strength
-    to match, instead of applying a fixed strong stretch + CLAHE to every
-    photo regardless of whether it needs it. A photo that already uses
-    most of the 0-255 range and already has decent local contrast should
-    come out of this function nearly unchanged; a genuinely flat, hazy,
-    or underexposed photo should get real correction.
-    """
-    result = img.astype(np.float32)
-
-    # Measure how much of the 0-255 range each channel actually uses, and
-    # build the fully-stretched target in parallel.
-    range_deficits = []
-    stretch_target = np.zeros_like(result)
-    for i in range(3):
-        channel = result[:, :, i]
-        low, high = np.percentile(channel, [1, 99])
-        used_range = high - low
-        range_deficits.append(1.0 - min(used_range / 255.0, 1.0))
-        if high > low:
-            stretch_target[:, :, i] = np.clip((channel - low) * (255.0 / (high - low)), 0, 255)
-        else:
-            stretch_target[:, :, i] = channel
-
-    # Below ~8% range deficit, the photo already uses the range well —
-    # barely stretch it. Above ~35% deficit (genuinely flat/hazy), apply
-    # the full stretch. Linear ramp between.
-    range_deficit = float(np.mean(range_deficits))
-    stretch_strength = float(np.clip((range_deficit - 0.08) / (0.35 - 0.08), 0.0, 1.0))
-    result = result + stretch_strength * (stretch_target - result)
-    stretched = np.clip(result, 0, 255).astype(np.uint8)
-
-    # Local contrast (CLAHE) — scale the clip limit by how flat the
-    # luminance channel actually is (measured via std dev), rather than
-    # always applying the same strong clip limit. A photo with already-good
-    # local contrast gets a gentle pass; a genuinely flat photo gets a
-    # strong one.
-    gray_std = float(cv2.cvtColor(stretched, cv2.COLOR_BGR2GRAY).astype(np.float32).std())
-    clip_limit = float(np.interp(gray_std, [35, 65], [3.2, 1.3]))
-
-    lab = cv2.cvtColor(stretched, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8))
-    l_eq = clahe.apply(l)
-    merged = cv2.merge((l_eq, a, b))
-    # Combined strength for reporting purposes: contrast-stretch strength
-    # plus how far the CLAHE clip limit landed above its gentle baseline
-    # (1.3), normalized — either signal alone can indicate a real correction.
-    clahe_strength = float(np.clip((clip_limit - 1.3) / (3.2 - 1.3), 0.0, 1.0))
-    combined_strength = max(stretch_strength, clahe_strength)
-    return cv2.cvtColor(merged, cv2.COLOR_LAB2BGR), combined_strength
-
-
-def saturation_boost(img):
-    """Module 1: mild saturation lift.
-
-    REDESIGNED (July 8, 2026) same pattern — measures current average
-    saturation first. An already-vivid photo gets almost no boost; a
-    genuinely dull/washed-out photo gets up to the full 12% lift."""
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
-    current_sat = float(hsv[:, :, 1].mean())
-    boost_strength = float(np.clip((110.0 - current_sat) / (110.0 - 60.0), 0.0, 1.0))
-    boost_factor = 1.0 + 0.12 * boost_strength
-    hsv[:, :, 1] = np.clip(hsv[:, :, 1] * boost_factor, 0, 255)
-    return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR), boost_strength
-
-
 def detect_noise_level(img):
     """Proxy for ISO/noise level: variance of the Laplacian on a grayscale
-    copy. Lower variance in flat regions with high local variance elsewhere
-    is a reasonable, cheap noise proxy without needing EXIF ISO data (most
-    agent/iPhone uploads won't reliably carry it through upload pipelines)."""
+    copy. No EXIF ISO dependency (most agent/iPhone uploads won't reliably
+    carry it through upload pipelines)."""
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     return cv2.Laplacian(gray, cv2.CV_64F).var()
 
 
 def adaptive_denoise(img):
-    """Module 1: adaptive noise reduction — strength scales inversely with
-    the detected noise proxy so a clean DSLR photo isn't over-smoothed and
-    a noisy low-light iPhone shot gets real cleanup."""
+    """Adaptive noise reduction — strength scales inversely with detected
+    noise proxy. Skips entirely (h<=2) on already-sharp/clean photos
+    rather than applying even a mild unnecessary smoothing pass."""
     noise_proxy = detect_noise_level(img)
-    # Empirically reasonable bounds — noisy images (low Laplacian variance)
-    # get stronger denoising; sharp/clean images get little to none.
-    if noise_proxy > 800:
-        h_luma = 3
-    elif noise_proxy > 300:
+    if noise_proxy > 1200:
+        h_luma = 2
+    elif noise_proxy > 500:
+        h_luma = 4
+    elif noise_proxy > 200:
         h_luma = 6
     else:
-        h_luma = 10
+        h_luma = 8
+    if h_luma <= 2:
+        return img, h_luma
     return cv2.fastNlMeansDenoisingColored(img, None, h_luma, h_luma, 7, 21), h_luma
 
 
 def vignette_correct(img):
-    """Module 1: vignette neutralization via a radial gain mask.
-
-    REDESIGNED (July 8, 2026) same severity-first pattern — measures the
-    actual brightness falloff between the frame's center and its outer
-    border before deciding how hard to push the correction. Most modern
-    phone cameras have very mild real vignetting; applying a fixed strong
-    curve to every photo regardless was part of what made corrected photos
-    look artificially "lifted" at the edges rather than actually corrected.
-    """
+    """Vignette neutralization via a radial gain mask, strength scaled to
+    measured center-vs-edge brightness falloff — most modern phone cameras
+    have very mild real vignetting, so most photos should see little to
+    no correction here."""
     h, w = img.shape[:2]
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
+    l = lab[:, :, 0]
 
-    center_region = gray[h // 3:2 * h // 3, w // 3:2 * w // 3]
+    center = l[h // 3:2 * h // 3, w // 3:2 * w // 3]
     border_mask = np.ones((h, w), dtype=bool)
     border_mask[int(h * 0.15):int(h * 0.85), int(w * 0.15):int(w * 0.85)] = False
-    border_region = gray[border_mask]
-
-    center_mean = float(center_region.mean()) if center_region.size > 0 else 128.0
-    border_mean = float(border_region.mean()) if border_region.size > 0 else center_mean
+    center_mean = float(center.mean()) if center.size > 0 else 128.0
+    border_mean = float(l[border_mask].mean()) if border_mask.any() else center_mean
     falloff = max(0.0, (center_mean - border_mean) / max(center_mean, 1.0))
 
-    # Below ~5% falloff, there's essentially no real vignetting to correct.
-    # Above ~20% falloff (genuine lens darkening), apply the full curve.
-    strength = float(np.clip((falloff - 0.05) / (0.20 - 0.05), 0.0, 1.0))
-    max_gain_coeff = 0.4 * strength
+    strength = clamp01((falloff - 0.025) / 0.16)
+    if strength <= 0.01:
+        return img, 0.0
 
     y, x = np.ogrid[:h, :w]
-    center_y, center_x = h / 2, w / 2
-    max_dist = np.sqrt(center_x ** 2 + center_y ** 2)
-    dist = np.sqrt((x - center_x) ** 2 + (y - center_y) ** 2) / max_dist
-    gain = 1.0 + max_gain_coeff * (dist ** 2)
-    gain = gain[:, :, np.newaxis]
-    result = img.astype(np.float32) * gain
-    return np.clip(result, 0, 255).astype(np.uint8), strength
+    cy, cx = h / 2, w / 2
+    dist = np.sqrt((x - cx) ** 2 + (y - cy) ** 2) / np.sqrt(cx ** 2 + cy ** 2)
+    gain = 1.0 + (0.22 * strength) * (dist ** 2)
+    lab[:, :, 0] = np.clip(l * gain, 0, 255)
+    out = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
+    return out, round(strength, 3)
 
 
-def shadow_highlight_recovery(img):
-    """Module 2 (conditional): lifts shadow detail and recovers blown
-    highlights, but only applies each half of the correction if the
-    histogram actually shows a problem — this is the "conditional" part
-    of Module 2, not an always-applied global curve."""
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    hist = cv2.calcHist([gray], [0], None, [256], [0, 256]).flatten()
-    total_px = gray.size
+# ── MLS Bright finish layer (calibrated against real MLS Bright photos) ────
 
-    shadow_frac = hist[:32].sum() / total_px       # near-black pixels
-    highlight_frac = hist[224:].sum() / total_px   # near-white pixels
+def mls_brightness_lift(img, intensity=1.0):
+    """Interior-first MLS brightness pass, calibrated to a measured target
+    median luminance of 178 — the professional MLS Bright profile per
+    Sam's reference. Uses gamma + shadow/midtone lifts, with explicit
+    highlight compression so windows and ceiling lights don't blow out
+    while the interior brightens."""
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
+    l = lab[:, :, 0]
+    before_median = float(np.median(l))
+    before_mean = float(l.mean())
 
-    applied = []
-    result = img.astype(np.float32)
+    target_median = 178.0
+    need = clamp01((target_median - before_median) / 85.0) * intensity
 
-    if shadow_frac > 0.20:
-        # Lift shadows via a gamma curve applied only to the low end
-        gamma = 0.8
-        result = 255.0 * np.power(result / 255.0, gamma)
-        applied.append("shadow_recovery")
+    normalized = np.clip(l / 255.0, 0, 1)
+    gamma = 1.0 - (0.32 * need)
+    gamma_lift = 255.0 * np.power(normalized, gamma)
 
-    if highlight_frac > 0.10:
-        # Compress highlights slightly to recover blown window/ceiling light detail
-        result = np.where(result > 200, 200 + (result - 200) * 0.5, result)
-        applied.append("highlight_recovery")
+    shadow_mask = np.clip((150.0 - l) / 150.0, 0, 1)
+    mid_mask = np.clip((215.0 - l) / 145.0, 0, 1)
+    lift = (32.0 * need * shadow_mask) + (18.0 * need * mid_mask)
+    new_l = gamma_lift + lift
 
-    return np.clip(result, 0, 255).astype(np.uint8), applied, {
-        "shadow_frac": round(float(shadow_frac), 4),
-        "highlight_frac": round(float(highlight_frac), 4),
+    # Highlight/window protection — compress rather than reconstruct.
+    highlight_mask = np.clip((l - 214.0) / 41.0, 0, 1)
+    compressed_highlights = 214.0 + (new_l - 214.0) * 0.62
+    new_l = new_l * (1.0 - highlight_mask) + compressed_highlights * highlight_mask
+
+    new_l = np.clip(new_l, 0, 246)
+    lab[:, :, 0] = new_l
+    out = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
+    return out, {
+        "before_median_luma": round(before_median, 2),
+        "before_mean_luma": round(before_mean, 2),
+        "target_median_luma": target_median,
+        "brightness_need": round(float(need), 3),
+        "gamma": round(float(gamma), 3),
     }
 
 
-def texture_microcontrast_boost(img):
-    """Module 2 (conditional): applies unsharp-mask micro-contrast only
-    when the image's own detail proxy suggests flat/low-separation
-    mid-tones — same detect-then-decide pattern as shadow/highlight."""
-    detail_proxy = detect_noise_level(img)  # reuse the same Laplacian-variance proxy
-    if detail_proxy >= 150:
-        return img, False  # already has reasonable micro-contrast, skip
+def clean_whites_adaptive(img, intensity=1.0):
+    """Adaptive MLS Bright clean-whites pass — measures actual likely-white
+    architectural surfaces (trim, cabinets, ceilings via LAB chroma+luma)
+    and only neutralizes/lifts them if they measurably need it, feathered
+    with a blurred mask so there's no hard edge. Leaves walls, wood floors,
+    and decor untouched — this targets only the surfaces a professional
+    retoucher would target for "clean whites," not a global shift."""
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
+    L, A, B = cv2.split(lab)
 
-    blurred = cv2.GaussianBlur(img, (0, 0), sigmaX=3)
-    sharpened = cv2.addWeighted(img, 1.4, blurred, -0.4, 0)
-    return sharpened, True
+    chroma = np.sqrt((A - 128.0) ** 2 + (B - 128.0) ** 2)
+    white_mask = (L > 145.0) & (chroma < 22.0)
+    strong_white_mask = (L > 165.0) & (chroma < 16.0)
+
+    white_fraction = float(np.mean(white_mask))
+    if white_fraction < 0.006:
+        return img, {"applied": False, "whiteFraction": round(white_fraction, 4),
+                      "reason": "insufficient_likely_white_surface"}
+
+    sample_mask = strong_white_mask if np.any(strong_white_mask) else white_mask
+    mean_a = float(np.mean(A[sample_mask]))
+    mean_b = float(np.mean(B[sample_mask]))
+    mean_l = float(np.mean(L[sample_mask]))
+    cast_mag = float(np.sqrt((mean_a - 128.0) ** 2 + (mean_b - 128.0) ** 2))
+
+    neutralize_strength = clamp01((cast_mag - 1.8) / (10.0 - 1.8)) * 0.55 * intensity
+
+    target_l = 212.0
+    l_gap = max(0.0, target_l - mean_l)
+    lift_strength = clamp01(l_gap / 38.0) * 0.22 * intensity
+    if mean_l > 220.0:
+        lift_strength *= 0.15
+    elif mean_l > 212.0:
+        lift_strength *= 0.35
+
+    if neutralize_strength < 0.03 and lift_strength < 0.03:
+        return img, {"applied": False, "whiteFraction": round(white_fraction, 4),
+                      "castMagnitude": round(cast_mag, 3), "meanWhiteLuma": round(mean_l, 2),
+                      "reason": "likely_whites_already_clean"}
+
+    mask_u8 = white_mask.astype(np.uint8) * 255
+    mask_blur = cv2.GaussianBlur(mask_u8, (0, 0), sigmaX=5, sigmaY=5).astype(np.float32) / 255.0
+
+    A_target = A - neutralize_strength * (A - 128.0)
+    B_target = B - neutralize_strength * (B - 128.0)
+    L_target = L + (255.0 - L) * lift_strength
+
+    A_adj = A * (1.0 - mask_blur) + A_target * mask_blur
+    B_adj = B * (1.0 - mask_blur) + B_target * mask_blur
+    L_adj = L * (1.0 - mask_blur) + L_target * mask_blur
+
+    merged = cv2.merge((np.clip(L_adj, 0, 247), np.clip(A_adj, 0, 255), np.clip(B_adj, 0, 255))).astype(np.uint8)
+    out = cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
+    return out, {
+        "applied": True, "whiteFraction": round(white_fraction, 4),
+        "castMagnitude": round(cast_mag, 3), "meanWhiteLuma": round(mean_l, 2),
+        "liftStrength": round(float(lift_strength), 3),
+        "neutralizeStrength": round(float(neutralize_strength), 3),
+    }
+
+
+def window_balance(img):
+    """Safe window/highlight balancing — compresses overly bright highlight
+    regions only. Does not reconstruct exterior detail, replace views, or
+    add any content."""
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
+    l = lab[:, :, 0]
+    bright_frac = float((l > 232).sum()) / float(l.size)
+
+    if bright_frac < 0.012:
+        return img, {"applied": False, "highlight_fraction": round(bright_frac, 4)}
+
+    mask = np.clip((l - 224.0) / 31.0, 0, 1)
+    compressed = 224.0 + (l - 224.0) * 0.48
+    lab[:, :, 0] = np.clip(l * (1.0 - mask) + compressed * mask, 0, 246)
+    out = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
+    return out, {"applied": True, "highlight_fraction": round(bright_frac, 4)}
+
+
+def mls_color_finish(img, intensity=1.0):
+    """MLS finish: neutral, clean, bright — not editorial. Normalizes
+    saturation toward the calibrated MLS Bright target range and adds a
+    mild clarity/unsharp pass so the image doesn't read as flat after the
+    brightness and white-surface work above."""
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
+    sat_mean = float(hsv[:, :, 1].mean())
+
+    if sat_mean < 62:
+        factor = 1.0 + 0.07 * intensity
+    elif sat_mean > 96:
+        factor = 1.0 - 0.08 * intensity
+    else:
+        factor = 1.0 - 0.02 * intensity
+    hsv[:, :, 1] = np.clip(hsv[:, :, 1] * factor, 0, 255)
+    color_finished = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+
+    blurred = cv2.GaussianBlur(color_finished, (0, 0), sigmaX=1.2)
+    sharpened = cv2.addWeighted(color_finished, 1.16, blurred, -0.16, 0)
+    return np.clip(sharpened, 0, 255).astype(np.uint8), {
+        "mean_saturation_before": round(sat_mean, 2), "saturation_factor": round(float(factor), 3),
+    }
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--lens-mode", choices=["auto", "mild", "off"], default="auto")
+    parser.add_argument("--intensity", type=float, default=1.0)
     args = parser.parse_args()
-
-    modules_applied = []
+    intensity = float(np.clip(args.intensity, 0.6, 1.25))
 
     img = cv2.imread(args.source)
     if img is None:
         print(json.dumps({"error": f"Could not read image: {args.source}"}), file=sys.stderr)
         sys.exit(1)
 
-    # ── Module 1 — measured, applied proportionally to detected severity ──
-    # REDESIGNED July 8, 2026: previously every Module 1 correction applied
-    # at fixed full strength to every photo, which stacked into an
-    # overprocessed look on photos that only had one real issue. Each
-    # function below now measures its own defect first and returns how
-    # strongly it actually applied — modules_applied only lists a
-    # correction if it crossed a meaningful threshold (0.1), so the output
-    # JSON honestly reflects what that specific photo needed, e.g. a photo
-    # that only had a color cast will correctly show just "white_balance"
-    # rather than every module regardless of relevance.
-    STRENGTH_REPORT_THRESHOLD = 0.1
+    modules_applied = []
+    skipped = ["color_uniformity_harmonization", "reflection_glare_reduction"]
 
-    img, wb_strength = white_balance_gray_world(img)
-    if wb_strength >= STRENGTH_REPORT_THRESHOLD:
+    # ── Do-No-Harm gate ─────────────────────────────────────────────────
+    guard = assess_professional_mls_bright(img)
+    if guard["alreadyMLSBright"]:
+        if os.path.abspath(args.source) != os.path.abspath(args.output):
+            shutil.copyfile(args.source, args.output)
+        print(json.dumps({
+            "output": args.output,
+            "modulesApplied": ["already_mls_bright_no_correction_applied"],
+            "modulesSkipped": skipped,
+            "perspectiveCorrectionDegrees": 0.0,
+            "denoiseStrength": 0,
+            "histogramStats": guard["shadowHighlightStats"],
+            "professionalMLSGuard": guard,
+        }))
+        return
+
+    # ── Technical correction ────────────────────────────────────────────
+    img, wb_strength = white_balance_neutral_aware(img)
+    if wb_strength >= 0.1:
         modules_applied.append("white_balance")
+
+    img, lens_strength = mild_mobile_lens_correction(img, args.lens_mode)
+    if lens_strength > 0:
+        modules_applied.append("lens_correction")
 
     img, rotation_deg = deskew_perspective(img)
     if rotation_deg != 0.0:
         modules_applied.append("perspective_alignment")
 
-    img, exposure_strength = exposure_normalize(img)
-    if exposure_strength >= STRENGTH_REPORT_THRESHOLD:
-        modules_applied.append("exposure_normalization")
-
     img, denoise_strength = adaptive_denoise(img)
-    modules_applied.append("adaptive_noise_reduction")
+    if denoise_strength > 2:
+        modules_applied.append("adaptive_noise_reduction")
 
     img, vignette_strength = vignette_correct(img)
-    if vignette_strength >= STRENGTH_REPORT_THRESHOLD:
+    if vignette_strength >= 0.1:
         modules_applied.append("vignette_neutralization")
 
-    img, saturation_strength = saturation_boost(img)
-    if saturation_strength >= STRENGTH_REPORT_THRESHOLD:
-        modules_applied.append("saturation_boost")
+    # ── MLS Bright finish ────────────────────────────────────────────────
+    img, brightness_metrics = mls_brightness_lift(img, intensity=intensity)
+    if brightness_metrics["brightness_need"] >= 0.05:
+        modules_applied.append("mls_brightness_lift")
 
-    # ── Module 2 — conditional ────────────────────────────────────────────
-    img, sh_applied, histogram_stats = shadow_highlight_recovery(img)
-    modules_applied.extend(sh_applied)
+    img, white_metrics = clean_whites_adaptive(img, intensity=intensity)
+    if white_metrics.get("applied"):
+        modules_applied.append("clean_whites")
 
-    img, texture_applied = texture_microcontrast_boost(img)
-    if texture_applied:
-        modules_applied.append("texture_microcontrast_boost")
+    img, window_metrics = window_balance(img)
+    if window_metrics.get("applied"):
+        modules_applied.append("window_highlight_balance")
 
-    # Explicitly not implemented — see file header. Listed here so the
-    # output JSON is honest about what did and didn't happen, rather than
-    # silently omitting them.
-    skipped = ["color_uniformity_harmonization", "reflection_glare_reduction"]
+    img, finish_metrics = mls_color_finish(img, intensity=intensity)
+    modules_applied.append("color_clarity_finish")
 
-    cv2.imwrite(args.output, img)
+    histogram_stats = shadow_highlight_stats(img)
+
+    cv2.imwrite(args.output, img, [int(cv2.IMWRITE_JPEG_QUALITY), 94])
 
     print(json.dumps({
         "output": args.output,
@@ -491,7 +620,20 @@ def main():
         "modulesSkipped": skipped,
         "perspectiveCorrectionDegrees": round(rotation_deg, 2),
         "denoiseStrength": denoise_strength,
-        "histogramStats": histogram_stats,
+        "histogramStats": {
+            "shadow_frac": histogram_stats["shadowFraction"],
+            "highlight_frac": histogram_stats["brightFraction"],
+        },
+        "professionalMLSGuard": guard,
+        "metrics": {
+            "whiteBalanceStrength": wb_strength,
+            "lensCorrectionStrength": lens_strength,
+            "vignetteStrength": vignette_strength,
+            "mlsBrightness": brightness_metrics,
+            "cleanWhites": white_metrics,
+            "windowBalance": window_metrics,
+            "mlsFinish": finish_metrics,
+        },
     }))
 
 
