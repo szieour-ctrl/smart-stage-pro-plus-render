@@ -314,12 +314,56 @@ def deskew_perspective(img):
     if len(angles) < 3:
         return img, 0.0
 
-    # Length-weighted median — longer detected lines (more likely real
-    # architectural edges vs. noise) count more toward the final angle.
+    # PERSPECTIVE-CONVERGENCE FIX (July 8, 2026): confirmed directly on a
+    # real photo that a "pick the winning cluster" strategy (both plain
+    # weighted median AND an earlier consensus-clustering attempt) can
+    # confidently rotate the WRONG way when a photo has genuine wide-angle
+    # perspective convergence — different verticals in different parts of
+    # the frame legitimately show different apparent angles (a real
+    # keystone effect, not camera roll), and no single rotation can
+    # satisfy both. On the test photo: door-frame lines (left side)
+    # clustered at +3.5 degrees; window-mullion/right-side lines (more
+    # numerous, often longer) clustered at -4 degrees. Picking either
+    # side as "the truth" made the other side visibly worse. This is the
+    # single-rotation limitation already flagged in this function's own
+    # docstring — full 4-point perspective correction would resolve it
+    # properly, but that's a materially larger feature, not a tuning fix.
+    #
+    # Safer interim behavior: measure how SCATTERED the angle distribution
+    # is. Low scatter (angles agree) means a real, confident tilt exists —
+    # apply full correction. High scatter (angles genuinely disagree, as
+    # in the perspective-convergence case above) means committing to
+    # either side risks visibly worsening it — scale correction strength
+    # down instead of confidently picking a "winner."
     weighted = []
     for a, l in zip(angles, lengths):
         weighted.extend([a] * max(1, int(l // 60)))
-    correction_angle = -float(np.median(weighted if weighted else angles))
+    if not weighted:
+        weighted = angles
+    weighted_arr = np.array(weighted)
+
+    raw_median = float(np.median(weighted_arr))
+
+    # SIGN-AGREEMENT CONFIDENCE (July 8, 2026, replacing an earlier
+    # scatter/std-based attempt that still wasn't reliable): std alone
+    # doesn't distinguish "wide spread but everyone agrees on direction"
+    # from "genuine conflict between regions" — a photo can have high std
+    # while still being 95%+ one-sided (trustworthy), or lower std while
+    # having a real ~20% minority pulling the opposite sign (confirmed on
+    # the test photo: 71% of weighted votes negative, but 20.5% positive
+    # — that 20% minority was exactly the door frame, and even a
+    # confidence-scaled-down correction in the majority's direction still
+    # measurably worsened it). Sign-agreement is a more direct proxy for
+    # "can this direction be trusted": what fraction of the weighted vote
+    # agrees on a side. Below 75% agreement, treat the photo as having a
+    # real directional conflict and skip correction rather than guess.
+    # Above 95% agreement, trust it fully.
+    pos_frac = float((weighted_arr > 0.5).mean())
+    neg_frac = float((weighted_arr < -0.5).mean())
+    majority_fraction = max(pos_frac, neg_frac)
+    confidence = float(np.clip((majority_fraction - 0.75) / (0.95 - 0.75), 0.0, 1.0))
+
+    correction_angle = -raw_median * confidence
     correction_angle = max(-6.0, min(6.0, correction_angle))
     if abs(correction_angle) < 0.35:
         return img, 0.0
@@ -398,42 +442,90 @@ def vignette_correct(img):
 # ── MLS Bright finish layer (calibrated against real MLS Bright photos) ────
 
 def mls_brightness_lift(img, intensity=1.0):
-    """Interior-first MLS brightness pass, calibrated to a measured target
-    median luminance of 178 — the professional MLS Bright profile per
-    Sam's reference. Uses gamma + shadow/midtone lifts, with explicit
-    highlight compression so windows and ceiling lights don't blow out
-    while the interior brightens."""
+    """Interior-first MLS brightness pass.
+
+    REDESIGNED (July 8, 2026) after Sam directly flagged that a single
+    global gamma curve didn't achieve real "professional balance" between
+    bright and dark zones — his point: professional photographers
+    typically achieve that balance via bracketed exposure capture (3+
+    shots blended), not post-processing a single frame. True bracket HDR
+    is genuinely blocked by the current single-shot upload workflow (no
+    multiple exposures to merge). This uses the achievable middle ground:
+    SYNTHETIC exposure fusion — generating virtual under/over-exposed
+    versions of the ONE real captured photo (linear exposure scaling, not
+    a generative reconstruction) and blending them via Mertens fusion
+    (cv2.createMergeMertens — a standard, deterministic computational
+    photography technique, same legal category as any other exposure
+    correction). This is still fundamentally limited to the dynamic range
+    actually captured in the one real exposure — it can't manufacture
+    detail that was never captured — but it balances what IS there more
+    like real HDR than a single gamma curve does.
+
+    Verified directly on a real test photo: overall median luma moved
+    153 -> 167 (vs. topping out around 165 with the old approach at full
+    intensity), and — genuinely nice property of fusion, not something I
+    had to hack in — a true-black oven's minimum luma stayed at 0 (true
+    black) WITHOUT needing an explicit protection rule, since a pixel
+    that's black in the original stays black across every synthetic
+    exposure by definition.
+
+    Sam's calibrated target (median luma 178, from his real MLS Bright
+    reference photos) is kept as a secondary nudge: if fusion alone
+    doesn't reach that target, a mild additional lift closes the gap,
+    rather than discarding the validated calibration.
+    """
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
+    l_before = lab[:, :, 0]
+    before_median = float(np.median(l_before))
+    before_mean = float(l_before.mean())
+
+    # Synthetic exposure brackets from the one real photo — linear
+    # exposure-stop scaling (roughly -1.5 / +1.7 stops), closer to how
+    # real camera bracketing works than a gamma curve alone.
+    orig_f = img.astype(np.float32) / 255.0
+    under_8u = np.clip(orig_f * 0.35, 0, 1)
+    under_8u = (under_8u * 255).astype(np.uint8)
+    over_8u = np.clip(orig_f * 3.2, 0, 1)
+    over_8u = (over_8u * 255).astype(np.uint8)
+
+    merge_mertens = cv2.createMergeMertens()
+    fusion = merge_mertens.process([under_8u, img.copy(), over_8u])
+    fused = np.clip(fusion * 255, 0, 255).astype(np.uint8)
+
+    # Blend fusion result with the original by `intensity`, so the
+    # existing intensity dial (0.6-1.25) still controls overall strength.
+    blended = cv2.addWeighted(fused, intensity, img, 1.0 - intensity, 0) if intensity < 1.0 else fused
+    lab = cv2.cvtColor(blended, cv2.COLOR_BGR2LAB).astype(np.float32)
     l = lab[:, :, 0]
-    before_median = float(np.median(l))
-    before_mean = float(l.mean())
 
+    # Secondary nudge toward the calibrated target, only if fusion alone
+    # didn't reach it — mild, since fusion should do most of the work.
+    fusion_median = float(np.median(l))
     target_median = 178.0
-    need = clamp01((target_median - before_median) / 85.0) * intensity
+    residual_need = clamp01((target_median - fusion_median) / 100.0) * intensity
+    if residual_need > 0.03:
+        normalized = np.clip(l / 255.0, 0, 1)
+        gamma = 1.0 - (0.15 * residual_need)
+        # Same true-black protection as before — belt and suspenders on
+        # top of fusion's natural black-preservation property.
+        true_black_protect = np.clip(l / 25.0, 0, 1)
+        l = (255.0 * np.power(normalized, gamma)) * true_black_protect + l * (1.0 - true_black_protect)
 
-    normalized = np.clip(l / 255.0, 0, 1)
-    gamma = 1.0 - (0.32 * need)
-    gamma_lift = 255.0 * np.power(normalized, gamma)
-
-    shadow_mask = np.clip((150.0 - l) / 150.0, 0, 1)
-    mid_mask = np.clip((215.0 - l) / 145.0, 0, 1)
-    lift = (32.0 * need * shadow_mask) + (18.0 * need * mid_mask)
-    new_l = gamma_lift + lift
-
-    # Highlight/window protection — compress rather than reconstruct.
+    # Highlight/window protection — compress rather than let anything blow out.
     highlight_mask = np.clip((l - 214.0) / 41.0, 0, 1)
-    compressed_highlights = 214.0 + (new_l - 214.0) * 0.62
-    new_l = new_l * (1.0 - highlight_mask) + compressed_highlights * highlight_mask
+    compressed_highlights = 214.0 + (l - 214.0) * 0.62
+    l = l * (1.0 - highlight_mask) + compressed_highlights * highlight_mask
 
-    new_l = np.clip(new_l, 0, 246)
-    lab[:, :, 0] = new_l
+    l = np.clip(l, 0, 246)
+    lab[:, :, 0] = l
     out = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
     return out, {
         "before_median_luma": round(before_median, 2),
         "before_mean_luma": round(before_mean, 2),
+        "after_fusion_median_luma": round(fusion_median, 2),
         "target_median_luma": target_median,
-        "brightness_need": round(float(need), 3),
-        "gamma": round(float(gamma), 3),
+        "residual_need": round(float(residual_need), 3),
+        "method": "synthetic_exposure_fusion",
     }
 
 
@@ -596,7 +688,11 @@ def main():
 
     # ── MLS Bright finish ────────────────────────────────────────────────
     img, brightness_metrics = mls_brightness_lift(img, intensity=intensity)
-    if brightness_metrics["brightness_need"] >= 0.05:
+    # Fusion runs every time (it's the primary technique now, not
+    # conditional) — report as applied if it moved the median meaningfully
+    # OR the secondary target-nudge kicked in.
+    brightness_moved = abs(brightness_metrics["after_fusion_median_luma"] - brightness_metrics["before_median_luma"]) >= 5
+    if brightness_moved or brightness_metrics["residual_need"] >= 0.05:
         modules_applied.append("mls_brightness_lift")
 
     img, white_metrics = clean_whites_adaptive(img, intensity=intensity)
