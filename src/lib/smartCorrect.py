@@ -129,6 +129,29 @@ def white_balance_gray_world(img):
     return np.clip(result, 0, 255).astype(np.uint8), strength
 
 
+def _largest_crop_after_rotation(w, h, angle_deg):
+    """Standard formula for the largest axis-aligned rectangle, with the
+    same aspect ratio as the original, that fits entirely inside a WxH
+    image after it's been rotated by angle_deg — i.e. the region that
+    contains zero fabricated/replicated border pixels. Well-established
+    technique (the "rotate and crop" problem), not something invented for
+    this file."""
+    angle = np.radians(abs(angle_deg))
+    if angle < 1e-6:
+        return w, h
+    width_is_longer = w >= h
+    side_long, side_short = (w, h) if width_is_longer else (h, w)
+    sin_a, cos_a = np.sin(angle), np.cos(angle)
+    if side_short <= 2.0 * sin_a * cos_a * side_long or abs(sin_a - cos_a) < 1e-10:
+        x = 0.5 * side_short
+        wr, hr = (x / sin_a, x / cos_a) if width_is_longer else (x / cos_a, x / sin_a)
+    else:
+        cos_2a = cos_a * cos_a - sin_a * sin_a
+        wr = (w * cos_a - h * sin_a) / cos_2a
+        hr = (h * cos_a - w * sin_a) / cos_2a
+    return wr, hr
+
+
 def deskew_perspective(img):
     """Module 1: perspective/vertical alignment via Hough-line detection.
 
@@ -140,6 +163,15 @@ def deskew_perspective(img):
     testing shows meaningfully converging verticals that a single rotation
     can't fix, this is the function to upgrade next — flagging now rather
     than silently under-delivering on the "perspective alignment" claim.
+
+    CROP FIX (July 8, 2026): rotating an image within a fixed-size canvas
+    leaves the corners of the rotated content outside the frame; the
+    original code filled that gap with BORDER_REPLICATE (smeared copies of
+    edge pixels) rather than real content — a real, if subtle, quality
+    issue at the corners. This now crops down to the largest rectangle
+    containing zero fabricated pixels, then scales back up to the original
+    WxH, so the delivered image has real content everywhere and keeps the
+    exact same pixel dimensions and aspect ratio as the input.
     """
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(gray, 50, 150, apertureSize=3)
@@ -199,7 +231,18 @@ def deskew_perspective(img):
     rot_matrix = cv2.getRotationMatrix2D(center, correction_angle, 1.0)
     rotated = cv2.warpAffine(img, rot_matrix, (w, h),
                               flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-    return rotated, correction_angle
+
+    # Crop out the replicated-border corners, then scale back to original
+    # dimensions so the output always matches the input's pixel size and
+    # aspect ratio exactly.
+    crop_w, crop_h = _largest_crop_after_rotation(w, h, correction_angle)
+    crop_w, crop_h = int(round(crop_w)), int(round(crop_h))
+    x0 = max(0, (w - crop_w) // 2)
+    y0 = max(0, (h - crop_h) // 2)
+    cropped = rotated[y0:y0 + crop_h, x0:x0 + crop_w]
+    result = cv2.resize(cropped, (w, h), interpolation=cv2.INTER_CUBIC)
+
+    return result, correction_angle
 
 
 def exposure_normalize(img):
