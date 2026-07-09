@@ -129,6 +129,16 @@ const SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS = new Set([
   "pan_zoom_reveal",
 ]);
 
+// Presets that are only safe on genuinely open-concept/great-room spaces —
+// the "widen the frame" motion has been observed inventing a doorway/
+// opening on a small enclosed room (flagged by Sam July 9, 2026, real
+// Playground test on room_reveal). Gated on frame.isOpenPlan, which
+// already exists as real data on every room object in index.html
+// (SESSION.rooms[].isOpenPlan, set at the "Open Plan / Single Room /
+// Exterior" mapping step) — not a new field, just a new check on data
+// that was already being captured but never enforced against Kling scope.
+const OPEN_PLAN_ONLY_PRESETS = new Set(["room_reveal"]);
+
 function enforceScopeRules(frame) {
   const hasKnownPair = !!frame.endImageUrl;
   const isExterior = frame.roomType === "exterior";
@@ -137,6 +147,16 @@ function enforceScopeRules(frame) {
     SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS.has(frame.klingMotionPreset);
 
   if (hasKnownPair || isExterior || isAllowedSingleImageInteriorPreset) {
+    if (
+      !hasKnownPair &&
+      !isExterior &&
+      OPEN_PLAN_ONLY_PRESETS.has(frame.klingMotionPreset) &&
+      !frame.isOpenPlan
+    ) {
+      throw new Error(
+        `Kling AI motion rejected: preset "${frame.klingMotionPreset}" is restricted to open-concept/great-room spaces (frame.isOpenPlan must be true) when used single-image without a known pair. On a small, enclosed room this preset has been observed inventing a doorway/opening that doesn't exist in the source photo — the "widen the frame" motion can't be satisfied honestly in a tight space. Mark the room as Open Plan, provide a real vacant+staged pair instead, or choose a different preset (orbit_arc, cinematic_push, crane_up, crane_down, etc. all move the camera without needing more room to reveal).`
+      );
+    }
     return;
   }
 
@@ -257,8 +277,26 @@ const KLING_MOTION_TEMPLATES = {
   // around content already shown — a materially different claim than
   // orbit_arc's "stays centered on one feature" — which is why it needed
   // explicit verification before enabling for single-image interior use.
+  //
+  // KNOWN FAILURE MODE (flagged by Sam, July 9, 2026): on a small, enclosed
+  // room, Kling interpreted "pulling back" as needing more physical space
+  // to pull back INTO, and invented a doorway/opening in a wall that
+  // doesn't exist in the source photo — a real hallucination, not a
+  // one-off. Root cause: the reveal move is spatially harder to satisfy
+  // in a tight room than in an open-concept one where a wider view is
+  // often already implied by adjacent visible space. WARNING — best
+  // suited to open-concept / great-room spaces where widening the frame
+  // doesn't require inventing new architecture. Strongly discourage (or,
+  // once an isOpenPlan-type field exists on the frame schema, hard-gate)
+  // use on small/enclosed rooms until further tested.
+  //
+  // Prompt strengthened same day with explicit anti-hallucination
+  // constraints — the O3 endpoint has no negative_prompt parameter (only
+  // legacy Kling v1/v1.6/v2/v2.1/v3-pro/v3-standard support it), so this
+  // is the only lever available; the constraint has to live in the main
+  // prompt text itself.
   room_reveal:
-    "Slow cinematic reveal movement, camera gently pulling back and widening to bring more of the already-visible room into frame, photorealistic, no distortion, stable architecture, all furniture and fixtures remain fixed and unchanged — do not invent new rooms, walls, fixtures, or furniture beyond what is visible in the source photo",
+    "Slow cinematic reveal movement, camera gently pulling back and widening to bring more of the ALREADY-VISIBLE room into frame, staying fully within the room's existing walls and boundaries as shown in the source photo, photorealistic, no distortion, stable architecture, all furniture and fixtures remain fixed and unchanged. This preset is intended ONLY for large, open-concept spaces where a wide pull-back reveals more of a great room, kitchen, or living area that genuinely extends beyond the current frame — it is NOT intended for small, enclosed, single-purpose rooms (bedroom, bathroom, small dining room, small office) where there is no additional real space to reveal. Strictly forbidden, under all circumstances: do not create, invent, generate, open, or reveal any doorway, archway, opening, hallway, window, wall gap, or adjoining room that is not already fully and unambiguously visible in the source photo. Do not remove, extend, thin, or alter any wall in any way. Do not add floor area, ceiling area, or any architectural element beyond the room's existing, already-photographed boundaries. If the room is small, fully enclosed, or has no visible opening to another space, the camera must stop pulling back at the point where the existing walls fill the frame — it is far better to produce a smaller, more conservative pull-back than to invent any new space, opening, or architectural feature. When in doubt about whether additional revealed area is genuinely present in the source photo, do not reveal it.",
 
   // ── living_room_ambient and corner_to_corner_drift — Cleared (July 9,
   // 2026) via Sam's fal.ai Playground testing and now included in
