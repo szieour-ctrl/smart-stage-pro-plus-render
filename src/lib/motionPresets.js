@@ -41,7 +41,7 @@ const VALID_PRESETS = new Set([
   "push_in", "pull_back",
   "pan_left", "pan_right",
   "tilt_up", "tilt_down",
-  "drift",
+  "drift", "pan_zoom",
   "float", "luxury_parallax", "static",
 ]);
 
