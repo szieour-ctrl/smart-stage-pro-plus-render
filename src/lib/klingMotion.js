@@ -109,9 +109,7 @@ const SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS = new Set([
   "fireplace_flicker",
   // New Motion Library (July 2026) — camera-move-only, same category as the
   // 3 above: motion through/around a scene that's already fully visible, no
-  // invented room content. See KLING_MOTION_TEMPLATES for the reasoning on
-  // why room_reveal, living_room_ambient, and corner_to_corner_drift are
-  // deliberately NOT included here yet.
+  // invented room content.
   "cinematic_push",
   "luxury_drift",
   "floating_camera_drift",
@@ -119,6 +117,13 @@ const SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS = new Set([
   "architectural_glide",
   "crane_up",
   "crane_down",
+  // Cleared (July 9, 2026) — Sam confirmed via his own fal.ai Playground
+  // testing that these three do not invent unphotographed content
+  // (fireplace, water, wall/floor area) on real source photos. Moved out
+  // of the "deliberately not included yet" group above into the allowlist.
+  "room_reveal",
+  "living_room_ambient",
+  "corner_to_corner_drift",
 ]);
 
 function enforceScopeRules(frame) {
@@ -242,28 +247,22 @@ const KLING_MOTION_TEMPLATES = {
   crane_down:
     "Smooth cinematic crane camera movement, descending vertically while tilting slightly downward to bring the lower portion of the room already visible in the photo into clearer view — flooring, tilework, or a rug — photorealistic, no distortion, stable architecture, all visible fixtures, furniture, and architecture remain fixed and unchanged throughout the movement, do not reveal room area beyond what is visible in the source photo",
 
-  // ── room_reveal — TEMPLATE ADDED, DELIBERATELY NOT in
-  // SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS below. Unlike the 5 above, this
-  // preset's own name implies widening what's visible beyond the original
-  // photo's framing, not just moving the camera through/around content
-  // already shown — a materially different claim than orbit_arc's "stays
-  // centered on one feature." Flagged for Sam's explicit review before
-  // enabling for single-image interior use; safe to use today only with a
-  // real vacant+staged pair (hasKnownPair bypasses this restriction) or on
-  // exterior (isExterior bypasses it too).
+  // ── room_reveal — Cleared (July 9, 2026) via Sam's fal.ai Playground
+  // testing and now included in SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS
+  // below. This preset's own name implies widening what's visible beyond
+  // the original photo's framing, not just moving the camera through/
+  // around content already shown — a materially different claim than
+  // orbit_arc's "stays centered on one feature" — which is why it needed
+  // explicit verification before enabling for single-image interior use.
   room_reveal:
     "Slow cinematic reveal movement, camera gently pulling back and widening to bring more of the already-visible room into frame, photorealistic, no distortion, stable architecture, all furniture and fixtures remain fixed and unchanged — do not invent new rooms, walls, fixtures, or furniture beyond what is visible in the source photo",
 
-  // ── The following 3 are the exact presets already flagged in Sam's own
-  // New Motion Library planning doc as needing fal.ai Playground
-  // verification before real use — honoring that flag as-is, not
-  // second-guessing it. Templates included so they can be Playground-tested;
-  // living_room_ambient and corner_to_corner_drift are deliberately NOT in
-  // SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS below until verified.
+  // ── living_room_ambient and corner_to_corner_drift — Cleared (July 9,
+  // 2026) via Sam's fal.ai Playground testing and now included in
+  // SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS below.
   // outdoor_breeze needs no allowlist entry — exterior single-image is
   // already permitted for any preset under enforceScopeRules' isExterior
-  // check — but the same invented-water-feature risk applies regardless of
-  // the scope gate, so verify it in Playground before real use too.
+  // check — was covered by the same round of Playground verification.
   living_room_ambient:
     "Subtle ambient cinematic motion within the living room — if a lit fireplace is visible, gentle flame flicker; if curtains are visible, a light natural sway; if plants are visible, subtle organic movement — only animating elements already present in the photo, photorealistic, no distortion, stable architecture, all furniture, fixtures, and architecture remain fixed and unchanged, do not add a fireplace, curtains, or plants that are not already visible",
 
