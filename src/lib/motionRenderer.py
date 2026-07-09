@@ -53,7 +53,7 @@ def parse_args():
     p.add_argument("--source",     required=True,  help="Input image path")
     p.add_argument("--preset",     required=True,
                    choices=["push_in","pull_back","pan_left","pan_right",
-                             "tilt_up","tilt_down","drift",
+                             "tilt_up","tilt_down","drift","pan_zoom",
                              "float","luxury_parallax","static"])
     p.add_argument("--duration",   type=float, required=True)
     p.add_argument("--output",     required=True,  help="Output .mp4 path")
@@ -193,6 +193,21 @@ def build_motion_curve(preset, n_frames, start_zoom):
             zoom  = 1.15 + 0.05 * ease_in_out(t)      # 1.15 → 1.20
             pan_x = DRIFT_RANGE * (ease_in_out(t) - 0.5)
             pan_y = -DRIFT_RANGE * 0.4 * ease_in_out(t)  # slight upward as we push
+
+        elif preset == "pan_zoom":
+            # Classic "textbook" Ken Burns move — steady lateral pan combined
+            # with a simultaneous zoom-in, so it reads as one cohesive
+            # diagonal-feeling camera move rather than a pure dolly (push_in)
+            # or a pure track (pan_right). Distinct from "drift": drift uses
+            # a small, subtle zoom change (1.15→1.20) as a secondary touch on
+            # top of a diagonal path; pan_zoom uses the full push_in zoom
+            # range (start_zoom→max_zoom) paired with a full-width lateral
+            # pan, so both axes read as equally deliberate. Direction is
+            # left-to-right (positive pan_x convention, matching pan_right)
+            # — the standard convention for this shot type.
+            zoom  = start_zoom + (max_zoom - start_zoom) * ease_in_out(t)
+            pan_x = PAN_RANGE * (ease_in_out(t) - 0.5)
+            pan_y = 0.0
 
         elif preset == "float":
             # Gentle sine-wave breathing — dining rooms, flex spaces, wide shots
