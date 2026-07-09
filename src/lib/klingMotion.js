@@ -124,6 +124,9 @@ const SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS = new Set([
   "room_reveal",
   "living_room_ambient",
   "corner_to_corner_drift",
+  // pan_zoom_reveal — combined pan+zoom, same camera-move-only category as
+  // the presets above, no new content risk (see KLING_MOTION_TEMPLATES).
+  "pan_zoom_reveal",
 ]);
 
 function enforceScopeRules(frame) {
@@ -271,6 +274,17 @@ const KLING_MOTION_TEMPLATES = {
 
   corner_to_corner_drift:
     "Slow diagonal cinematic drift from one corner of the room toward the opposite corner, staying within the room as already framed in the photo, photorealistic, no distortion, stable architecture, all visible furniture, fixtures, and architecture remain fixed and undistorted throughout, do not reveal room area beyond what is visible in the source photo",
+
+  // ── pan_zoom_reveal — classic combined pan+zoom camera move (July 9,
+  // 2026), the Kling-quality counterpart to Ken Burns' new pan_zoom preset.
+  // Same category as cinematic_push/architectural_glide above: pure camera
+  // movement across content already visible in the photo, no invented room
+  // content, so it goes straight into SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS
+  // below without needing separate Playground verification — it's a
+  // combination of two already-verified motion types (a lateral track and
+  // a push-in), not a new content category.
+  pan_zoom_reveal:
+    "Smooth cinematic camera movement combining a steady lateral pan across the room with a simultaneous gentle push-in, revealing more of the space already shown while gliding sideways, photorealistic, no distortion, stable architecture, all visible furniture, fixtures, and architecture remain fixed and unchanged throughout the movement, do not reveal room area beyond what is visible in the source photo",
 };
 
 const VALID_KLING_PRESETS = new Set(Object.keys(KLING_MOTION_TEMPLATES));
