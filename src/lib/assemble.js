@@ -167,25 +167,91 @@ function buildBeforeAfterClip(beforeClipPath, afterClipPath, workDir, outputName
   });
 }
 
-// ── MIX MUSIC INTO VIDEO ──────────────────────────────────────────────────
+// ── MIX AUDIO — music + optional narration ────────────────────────────
+//
+// CHANGE (July 2026, audio build): REPLACES the old flat -20dB-forever
+// mix. That version had no fade in/out, no loudness normalization, and
+// no way to carry a narration track at all — the "Video Only, silent"
+// and "Video + Cinematic Music" options from Sam's original audio-options
+// doc worked, but "Video + AI Narration + Cinematic Music" had nothing to
+// plug into.
+//
+// narrationPath is optional — when absent, behavior is music-only (fade
+// in/out + loudnorm, still a real improvement over the old flat volume).
+// When present:
+//   - sidechaincompress automatically ducks the music WHENEVER narration
+//     audio is actually present in the signal — this is real audio
+//     ducking, not a manually-timed volume envelope. It works correctly
+//     even though narration length rarely matches video length exactly
+//     (narration plays once near the start; music fills the rest at full
+//     volume once narration ends, since sidechaincompress only reduces
+//     music while it detects narration signal).
+//   - amix combines the ducked music and narration into one stream,
+//     padded with silence to match the longer of the two (duration=longest)
+//     rather than cutting off video audio at the shorter track's length.
+//   - loudnorm normalizes final loudness to a standard broadcast target
+//     (-16 LUFS, matches typical streaming/social-video loudness norms)
+//     so tracks of very different source loudness (Suno tracks vs
+//     ElevenLabs TTS output) don't need per-track manual leveling.
 
-function mixAudio(videoPath, musicPath, workDir) {
+function downloadNarrationAudio(narrationUrl, workDir) {
   return new Promise((resolve, reject) => {
-    const outputPath = path.join(workDir, "with_music.mp4");
+    const axios = require("axios");
+    const fs = require("fs");
+    axios.get(narrationUrl, { responseType: "arraybuffer", timeout: 20000 })
+      .then((response) => {
+        const outputPath = path.join(workDir, "narration.mp3");
+        fs.writeFileSync(outputPath, response.data);
+        resolve(outputPath);
+      })
+      .catch(reject);
+  });
+}
 
-    ffmpeg()
-      .input(videoPath)
-      .input(musicPath)
-      .complexFilter([
-        // Music at -20dB under any future voiceover headroom, looped/trimmed
-        // to match video length automatically via shortest flag below.
-        `[1:a]volume=0.25[music]`,
-      ])
-      .outputOptions(["-map", "0:v", "-map", "[music]", "-c:v", "copy", "-c:a", "aac", "-shortest"])
-      .output(outputPath)
-      .on("end", () => resolve(outputPath))
-      .on("error", (err) => reject(new Error(`Audio mix failed: ${err.message}`)))
-      .run();
+function mixAudio(videoPath, musicPath, workDir, narrationPath) {
+  return new Promise(async (resolve, reject) => {
+    try {
+      const outputPath = path.join(workDir, "with_music.mp4");
+      const videoDuration = await probeDuration(videoPath);
+      const fadeOutStart = Math.max(0, videoDuration - 1.5);
+
+      const command = ffmpeg().input(videoPath).input(musicPath);
+      let filterParts;
+
+      if (narrationPath) {
+        command.input(narrationPath);
+        filterParts = [
+          // Music: fade in/out, no manual volume cut — sidechaincompress
+          // below handles ducking dynamically instead of a flat reduction.
+          `[1:a]afade=t=in:st=0:d=1,afade=t=out:st=${fadeOutStart.toFixed(2)}:d=1.5[music_faded]`,
+          // Narration: short fade in only — no fade-out, since it should
+          // finish cleanly on its own, not trail off mid-sentence.
+          `[2:a]afade=t=in:st=0:d=0.3[narration_faded]`,
+          // Ducking: music_faded is the signal being reduced, narration_faded
+          // is the sidechain trigger. threshold/ratio tuned for speech-over-
+          // music (aggressive enough that narration is always intelligible,
+          // not so aggressive that music disappears entirely underneath it).
+          `[music_faded][narration_faded]sidechaincompress=threshold=0.05:ratio=8:attack=5:release=300[music_ducked]`,
+          `[music_ducked][narration_faded]amix=inputs=2:duration=longest:dropout_transition=2[premix]`,
+          `[premix]loudnorm=I=-16:TP=-1.5:LRA=11[audio_out]`,
+        ];
+      } else {
+        filterParts = [
+          `[1:a]afade=t=in:st=0:d=1,afade=t=out:st=${fadeOutStart.toFixed(2)}:d=1.5,volume=0.6[music_faded]`,
+          `[music_faded]loudnorm=I=-16:TP=-1.5:LRA=11[audio_out]`,
+        ];
+      }
+
+      command
+        .complexFilter(filterParts)
+        .outputOptions(["-map", "0:v", "-map", "[audio_out]", "-c:v", "copy", "-c:a", "aac", "-shortest"])
+        .output(outputPath)
+        .on("end", () => resolve(outputPath))
+        .on("error", (err) => reject(new Error(`Audio mix failed: ${err.message}`)))
+        .run();
+    } catch (err) {
+      reject(err);
+    }
   });
 }
 
@@ -215,9 +281,16 @@ function renderFormat(inputPath, dimensions, workDir, outputName) {
 
 // ── ENTRY POINT ────────────────────────────────────────────────────────
 
-async function assembleVideo({ clipPaths, musicPath, formats, workDir }) {
+async function assembleVideo({ clipPaths, musicPath, narrationUrl, formats, workDir }) {
   const concatenated = await concatenateClips(clipPaths, workDir);
-  const withMusic = await mixAudio(concatenated, musicPath, workDir);
+
+  // NEW (audio build): download narration audio if this job requested it.
+  // Absent for any job that didn't request narration, or where narration
+  // generation failed upstream (Netlify still dispatches the job either
+  // way — a failed narration should never block the video itself).
+  const narrationPath = narrationUrl ? await downloadNarrationAudio(narrationUrl, workDir) : null;
+
+  const withMusic = await mixAudio(concatenated, musicPath, workDir, narrationPath);
 
   const outputs = {};
 
