@@ -154,10 +154,11 @@ async function processRenderJob(job) {
     const musicPath = await musicPromise;
     console.log(`[${job.jobId}] Music ready: ${musicPath}`);
 
-    // ── Step 4: Assemble clips + music into final formats ────────────────
+    // ── Step 4: Assemble clips + music (+ optional narration) into final formats
     const outputs = await assembleVideo({
       clipPaths,
       musicPath,
+      narrationUrl: job.narrationAudioUrl || null,
       formats: job.formats || ["16x9", "9x16"],
       workDir,
     });
