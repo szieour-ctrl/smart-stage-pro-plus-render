@@ -59,6 +59,9 @@ async function downloadFrames(frames, workDir) {
       // property picklist silently drops anything not named in it.
       useRevealEffect: !!frame.useRevealEffect,
       roomType: frame.roomType || "default",
+      // NEW (July 14, 2026 — footage-grounded narration) — real display
+      // name, not the small backend-coded vocabulary roomType uses.
+      roomLabel: frame.roomLabel || null,
       motionPreset: frame.motionPreset || "auto",
       // FIX (July 2026): klingMotionPreset was never in this file's returned
       // object at all — same bug class as the continuation-motion fields
