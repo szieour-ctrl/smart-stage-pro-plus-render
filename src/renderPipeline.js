@@ -17,7 +17,7 @@ const { downloadFrames } = require("./lib/downloadFrames");
 const { applyMotionPreset, resolveDuration } = require("./lib/motionPresets");
 const { applyKlingMotion } = require("./lib/klingMotion");
 const { generateMusic } = require("./lib/musicGen");
-const { assembleVideo, buildBeforeAfterClip, computeClipTimeline, extractMidpointFrame, probeDuration } = require("./lib/assemble");
+const { assembleVideo, buildBeforeAfterClip, computeClipTimeline, extractMidpointFrame, probeDuration, mapWithConcurrencyLimit, FFMPEG_CONCURRENCY_LIMIT } = require("./lib/assemble");
 const { generateNarration } = require("./lib/narrationGen");
 const { uploadToCloudinary } = require("./lib/cloudinaryUpload");
 const { notifyWebhook } = require("./lib/notify");
@@ -215,8 +215,14 @@ async function processRenderJob(job) {
         const realDurations = await Promise.all(clipPaths.map(probeDuration));
         const timeline = computeClipTimeline(realDurations);
 
-        const framePaths = await Promise.all(
-          clipPaths.map((clip, i) => extractMidpointFrame(clip, realDurations[i], workDir, i))
+        // FIX (July 14, 2026 — real test failure): was Promise.all,
+        // unbounded — see assemble.js's mapWithConcurrencyLimit header
+        // comment for the full reasoning (a real test job threw a
+        // resource-exhaustion-flavored ffmpeg error here, "Resource
+        // temporarily unavailable," extracting frames for all 9 clips
+        // simultaneously).
+        const framePaths = await mapWithConcurrencyLimit(
+          clipPaths, FFMPEG_CONCURRENCY_LIMIT, (clip, i) => extractMidpointFrame(clip, realDurations[i], workDir, i)
         );
 
         const timelineSegments = localFrames.map((frame, i) => ({
@@ -301,3 +307,4 @@ async function processRenderJob(job) {
 }
 
 module.exports = { processRenderJob };
+
