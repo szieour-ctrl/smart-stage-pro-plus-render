@@ -226,13 +226,23 @@ function mixAudio(videoPath, musicPath, workDir, narrationPath) {
           `[1:a]afade=t=in:st=0:d=1,afade=t=out:st=${fadeOutStart.toFixed(2)}:d=1.5[music_faded]`,
           // Narration: short fade in only — no fade-out, since it should
           // finish cleanly on its own, not trail off mid-sentence.
-          `[2:a]afade=t=in:st=0:d=0.3[narration_faded]`,
-          // Ducking: music_faded is the signal being reduced, narration_faded
-          // is the sidechain trigger. threshold/ratio tuned for speech-over-
-          // music (aggressive enough that narration is always intelligible,
-          // not so aggressive that music disappears entirely underneath it).
-          `[music_faded][narration_faded]sidechaincompress=threshold=0.05:ratio=8:attack=5:release=300[music_ducked]`,
-          `[music_ducked][narration_faded]amix=inputs=2:duration=longest:dropout_transition=2[premix]`,
+          //
+          // FIX (July 14, 2026 — real test failure): a labeled FFmpeg
+          // stream can only be consumed by ONE filter. The original
+          // version fed [narration_faded] into BOTH sidechaincompress
+          // (as the ducking trigger) AND amix (as the actual audio to
+          // mix in) — the second reference failed with "matches no
+          // streams" because sidechaincompress had already consumed it.
+          // asplit=2 makes two independent copies so each filter gets
+          // its own, exactly the tool FFmpeg provides for this.
+          `[2:a]afade=t=in:st=0:d=0.3,asplit=2[narration_for_sidechain][narration_for_mix]`,
+          // Ducking: music_faded is the signal being reduced, the sidechain
+          // copy of narration is the trigger. threshold/ratio tuned for
+          // speech-over-music (aggressive enough that narration is always
+          // intelligible, not so aggressive that music disappears entirely
+          // underneath it).
+          `[music_faded][narration_for_sidechain]sidechaincompress=threshold=0.05:ratio=8:attack=5:release=300[music_ducked]`,
+          `[music_ducked][narration_for_mix]amix=inputs=2:duration=longest:dropout_transition=2[premix]`,
           `[premix]loudnorm=I=-16:TP=-1.5:LRA=11[audio_out]`,
         ];
       } else {
