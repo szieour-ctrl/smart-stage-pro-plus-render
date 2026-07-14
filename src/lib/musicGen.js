@@ -26,11 +26,11 @@ const axios = require("axios");
 const ffmpeg = require("fluent-ffmpeg");
 
 const SUNO_TRACK_LIBRARY = {
-  "japandi_calm":       { label: "Japandi — Calm Piano",        url: "REPLACE_WITH_REAL_CLOUDINARY_URL_1.mp3" },
-  "luxury_cinematic":   { label: "Luxury — Cinematic Strings",  url: "REPLACE_WITH_REAL_CLOUDINARY_URL_2.mp3" },
-  "modern_uplifting":   { label: "Modern — Warm & Uplifting",   url: "REPLACE_WITH_REAL_CLOUDINARY_URL_3.mp3" },
-  "farmhouse_acoustic": { label: "Farmhouse — Light Acoustic",  url: "REPLACE_WITH_REAL_CLOUDINARY_URL_4.mp3" },
-  "default":            { label: "Default — Neutral Ambient",  url: "REPLACE_WITH_REAL_CLOUDINARY_URL_5.mp3" },
+  "japandi_calm":       { label: "Japandi — Calm Piano",        url: "https://res.cloudinary.com/de18zsi7o/video/upload/v1783988761/Marble_Staircase_p67gsf.mp3" },
+  "luxury_cinematic":   { label: "Luxury — Cinematic Strings",  url: "https://res.cloudinary.com/de18zsi7o/video/upload/v1783986942/Marble_Gallery_1_nkefh1.mp3" },
+  "modern_uplifting":   { label: "Modern — Warm & Uplifting",   url: "https://res.cloudinary.com/de18zsi7o/video/upload/v1783988869/Open_Door_Morning_st0bqs.mp3" },
+  "farmhouse_acoustic": { label: "Farmhouse — Light Acoustic",  url: "https://res.cloudinary.com/de18zsi7o/video/upload/v1783988583/MLS_Modern_vms49f.mp3" },
+  "default":            { label: "Default — Neutral Ambient",  url: "https://res.cloudinary.com/de18zsi7o/video/upload/v1783988583/MLS_Modern_vms49f.mp3" },
 };
 
 function resolveTrack(musicStyle) {
