@@ -26,4 +26,23 @@ async function uploadToCloudinary(outputs, projectId) {
   return urls;
 }
 
-module.exports = { uploadToCloudinary };
+// NEW (July 14, 2026 — footage-grounded narration rebuild) — narration
+// audio is generated Railway-side now (see narrationGen.js), so it needs
+// its own upload path here too, for the same reason video outputs do:
+// a durable record of what was actually generated. resource_type "raw"
+// since this is just storage for a stable URL, not something Cloudinary
+// needs to transform (matches the same choice made in the Netlify-side
+// version this replaces, upload-staged.js's signed-upload pattern —
+// this repo already has the real Cloudinary SDK available, so no need
+// for that pattern's native-https workaround here).
+async function uploadAudioToCloudinary(localPath, projectId, label) {
+  const result = await cloudinary.uploader.upload(localPath, {
+    resource_type: "raw",
+    folder: `smart-stage-pro-plus/${projectId}/narration`,
+    public_id: `${label}_${Date.now()}`,
+    overwrite: false,
+  });
+  return result.secure_url;
+}
+
+module.exports = { uploadToCloudinary, uploadAudioToCloudinary };
