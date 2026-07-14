@@ -6,6 +6,36 @@ const ffmpeg = require("fluent-ffmpeg");
 
 const CROSSFADE_DURATION = 0.6; // seconds between clips
 
+// ── CONCURRENCY-LIMITED MAP (July 14, 2026 — real test failure) ────────
+// Two separate real failures in the same render (a narration frame
+// extraction and a clip normalization) both threw resource-exhaustion-
+// flavored ffmpeg errors ("Resource temporarily unavailable", "Error
+// while opening encoder" on a clip with perfectly clean, even
+// dimensions — ruling out the odd-dimension theory from the prior fix).
+// Both call sites were launching one ffmpeg process PER CLIP, all at
+// once, via unbounded Promise.all — up to 9 simultaneous ffmpeg encodes
+// for a 9-frame job. That's a real, plausible cause of exactly this
+// class of intermittent failure on a resource-constrained container,
+// regardless of which specific resource (CPU, memory, file descriptors)
+// is actually the bottleneck. This caps how many run at once instead of
+// firing all of them simultaneously — processes the rest as slots free
+// up, rather than requiring every clip to fit in memory/CPU at the same
+// instant.
+async function mapWithConcurrencyLimit(items, limit, fn) {
+  const results = new Array(items.length);
+  let cursor = 0;
+  async function worker() {
+    while (cursor < items.length) {
+      const i = cursor++;
+      results[i] = await fn(items[i], i);
+    }
+  }
+  const workers = Array.from({ length: Math.min(limit, items.length) }, worker);
+  await Promise.all(workers);
+  return results;
+}
+const FFMPEG_CONCURRENCY_LIMIT = 3; // conservative default — revisit if Railway's plan tier is confirmed to have more headroom
+
 // NEW (July 14, 2026 — real test failure) — mirrors
 // NARRATION_END_BUFFER_SECONDS in generate-narration-background.js. That
 // file sizes the SCRIPT to roughly fit before this buffer; this constant
@@ -175,8 +205,11 @@ async function concatenateClips(clipPaths, workDir) {
   // too. A single Kling clip still needs to end up at a known, consistent
   // resolution/fps/pixel format for mixAudio()/renderFormat() downstream,
   // even though there's no xfade chain to crash with only one clip.
-  const normalizedPaths = await Promise.all(
-    clipPaths.map((clip, i) => normalizeClip(clip, workDir, i))
+  //
+  // FIX (July 14, 2026 — real test failure): was Promise.all, unbounded —
+  // see mapWithConcurrencyLimit's header comment for the full reasoning.
+  const normalizedPaths = await mapWithConcurrencyLimit(
+    clipPaths, FFMPEG_CONCURRENCY_LIMIT, (clip, i) => normalizeClip(clip, workDir, i)
   );
 
   if (normalizedPaths.length === 1) {
@@ -401,4 +434,4 @@ async function assembleVideo({ clipPaths, musicPath, narrationSegments, formats,
   return outputs;
 }
 
-module.exports = { assembleVideo, buildBeforeAfterClip, concatenateClips, mixAudio, renderFormat, computeClipTimeline, extractMidpointFrame, probeDuration };
+module.exports = { assembleVideo, buildBeforeAfterClip, concatenateClips, mixAudio, renderFormat, computeClipTimeline, extractMidpointFrame, probeDuration, mapWithConcurrencyLimit, FFMPEG_CONCURRENCY_LIMIT };
