@@ -17,9 +17,21 @@ const { downloadFrames } = require("./lib/downloadFrames");
 const { applyMotionPreset, resolveDuration } = require("./lib/motionPresets");
 const { applyKlingMotion } = require("./lib/klingMotion");
 const { generateMusic } = require("./lib/musicGen");
-const { assembleVideo, buildBeforeAfterClip } = require("./lib/assemble");
+const { assembleVideo, buildBeforeAfterClip, computeClipTimeline, extractMidpointFrame, probeDuration } = require("./lib/assemble");
+const { generateNarration } = require("./lib/narrationGen");
 const { uploadToCloudinary } = require("./lib/cloudinaryUpload");
 const { notifyWebhook } = require("./lib/notify");
+
+// ── NARRATION VOICE LIBRARY ───────────────────────────────────────────
+// MUST stay in sync with NARRATION_VOICES in build-video-demo.html.
+// Real voice_ids, already confirmed working (Male — Audiobook Narrator,
+// Female — Adeline/Conversational — see the July 13 voice-selection
+// conversation). Not "Default" category voices, which expire Dec 31,
+// 2026 — these are permanent Voice Library picks.
+const NARRATION_VOICE_LIBRARY = {
+  "voice_male_1":   "pVYHFs8oaIDPWJxvmXWW",
+  "voice_female_1": "5l5f8iK3YPeGga21rQIX",
+};
 
 async function processRenderJob(job) {
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), `job-${job.jobId}-`));
@@ -78,10 +90,26 @@ async function processRenderJob(job) {
         // (Ken Burns push-in/parallax that plays after Kling's transformation
         // settles), so we never need to extract a frame from Kling's own
         // video output.
+        // FIX (July 14, 2026 — real test failure): this used to gate on
+        // frame.isBeforeAfter alone — the ORIGINAL flag from the dispatch
+        // payload, set before any download was even attempted. When the
+        // before image 404'd, downloadFrames.js correctly nulled
+        // beforeLocalPath (the LOCAL file our own Ken Burns/continuation
+        // path reads), but isBeforeAfter and remoteBeforeUrl were never
+        // touched — so THIS code, independently, still told Kling to
+        // fetch the same broken URL directly (Kling fetches images
+        // itself, from the public URL, not from our local disk). Kling
+        // correctly rejected it: "Unprocessable Entity." Two different
+        // consumers of "is there really a usable before image" fell out
+        // of sync — downloadFrames.js's local check got fixed, this
+        // remote one didn't. Now gated on beforeLocalPath specifically,
+        // the one field that reflects whether the download ACTUALLY
+        // succeeded, not just whether one was originally expected.
+        const hasRealBeforeImage = frame.isBeforeAfter && !!frame.beforeLocalPath;
         const result = await applyKlingMotion(
           {
-            imageUrl: frame.isBeforeAfter ? frame.remoteBeforeUrl : frame.remoteImageUrl,
-            endImageUrl: frame.isBeforeAfter ? frame.remoteImageUrl : undefined,
+            imageUrl: hasRealBeforeImage ? frame.remoteBeforeUrl : frame.remoteImageUrl,
+            endImageUrl: hasRealBeforeImage ? frame.remoteImageUrl : undefined,
             roomType: frame.roomType,
             // BUG FIX (July 2026): this object never included the preset
             // field at all, in any prior version of this file — confirmed
@@ -105,7 +133,19 @@ async function processRenderJob(job) {
             continuationDurationSeconds: frame.continuationDurationSeconds,
           },
           workDir,
-          () => applyMotionPreset(frame, workDir, carryZoom)
+          // FIX (July 14, 2026 — real test failure): was passing the
+          // original `frame` straight through, unchanged — meaning
+          // frame.motionPreset still held whatever KLING preset was
+          // selected (e.g. "cinematic_push" for Hero Transformation).
+          // Ken Burns has its own, entirely different preset vocabulary
+          // and doesn't recognize Kling preset names — motionPresets.js
+          // correctly caught this and fell back to "auto" anyway, but
+          // logged a confusing "Unknown preset" warning every time,
+          // making a real, intentional fallback look like a bug. Now
+          // explicit: a Kling failure always means Ken Burns renders
+          // with auto, stated directly instead of arrived at via a
+          // failed lookup.
+          () => applyMotionPreset({ ...frame, motionPreset: "auto" }, workDir, carryZoom)
         );
         clipPath = result.path;
         carryZoom = result.endingZoom;
@@ -119,7 +159,15 @@ async function processRenderJob(job) {
           sequenceOrder: frame.sequenceOrder !== undefined ? frame.sequenceOrder : i,
           outcome: result.source,
         });
-      } else if (frame.isBeforeAfter && frame.beforeLocalPath) {
+      } else if (frame.useRevealEffect && frame.isBeforeAfter && frame.beforeLocalPath) {
+        // CHANGE (found during before/after-pair conversation): this used
+        // to fire off isBeforeAfter alone — meaning ANY Ken Burns room
+        // with a real pair on file got this more elaborate reveal treatment
+        // automatically, whether the user wanted it or not (isBeforeAfter
+        // is auto-detected from real gallery data, not a deliberate
+        // choice). Now requires the separate, explicit useRevealEffect
+        // opt-in too — a user who just wants plain single-image Ken Burns
+        // on a room that happens to have a pair on file gets exactly that.
         // Flagship feature: vacant room holds, then wipes into staged version.
         // Build each side's motion clip first, then composite the wipe.
         // Before/After clips don't participate in cross-room zoom continuity —
@@ -150,6 +198,59 @@ async function processRenderJob(job) {
     }
     console.log(`[${job.jobId}] Motion applied to ${clipPaths.length} clips.`);
 
+    // ── Step 2.5: Generate footage-grounded narration (July 14, 2026) ────
+    // Runs HERE, not before rendering — see narrationGen.js's header
+    // comment for the full reasoning. Needs the REAL rendered clips
+    // (their real durations, which can differ from what was requested —
+    // Kling has returned 5s when 4.5s was asked for in real logs) to
+    // compute accurate timeline positions and extract real footage to
+    // ground the script in. Wrapped in its own try/catch: a narration
+    // failure should never take down a video that otherwise rendered
+    // fine, same principle as Kling falling back to Ken Burns rather
+    // than failing the whole job.
+    let narrationSegments = [];
+    let narrationFullScript = null;
+    if (job.wantsNarration) {
+      try {
+        const realDurations = await Promise.all(clipPaths.map(probeDuration));
+        const timeline = computeClipTimeline(realDurations);
+
+        const framePaths = await Promise.all(
+          clipPaths.map((clip, i) => extractMidpointFrame(clip, realDurations[i], workDir, i))
+        );
+
+        const timelineSegments = localFrames.map((frame, i) => ({
+          index: i,
+          roomLabel: frame.roomLabel || frame.roomType || "this room",
+          framePath: framePaths[i],
+          duration: timeline[i].duration,
+          startTime: timeline[i].startTime,
+        }));
+
+        const voiceId = NARRATION_VOICE_LIBRARY[job.voiceKey];
+        if (!voiceId) {
+          throw new Error(`Voice "${job.voiceKey}" is not configured with a real ElevenLabs voice_id.`);
+        }
+
+        const narrationResult = await generateNarration({
+          address: job.address || null,
+          timelineSegments,
+          voiceId,
+          workDir,
+          anthropicKey: process.env.ANTHROPIC_API_KEY,
+          elevenLabsKey: process.env.ELEVENLABS_API_KEY,
+        });
+
+        narrationSegments = narrationResult.segments;
+        narrationFullScript = narrationResult.fullScript;
+        console.log(`[${job.jobId}] Narration generated: ${narrationSegments.length} segments.`);
+      } catch (err) {
+        console.error(`[${job.jobId}] Narration generation failed (non-fatal to the video itself): ${err.message}`);
+        narrationSegments = [];
+        narrationFullScript = null;
+      }
+    }
+
     // ── Step 3: Wait for music ─────────────────────────────────────────
     const musicPath = await musicPromise;
     console.log(`[${job.jobId}] Music ready: ${musicPath}`);
@@ -158,7 +259,7 @@ async function processRenderJob(job) {
     const outputs = await assembleVideo({
       clipPaths,
       musicPath,
-      narrationUrl: job.narrationAudioUrl || null,
+      narrationSegments,
       formats: job.formats || ["16x9", "9x16"],
       workDir,
     });
@@ -174,6 +275,11 @@ async function processRenderJob(job) {
       status: "complete",
       urls,
       klingFrameOutcomes,
+      // NEW (July 14, 2026) — the actual generated script, so Netlify can
+      // store it and show it alongside the finished video (see Sam's
+      // idea: display the script at the result screen, since it was
+      // never shown anywhere before this rebuild either).
+      narrationScript: narrationFullScript,
     });
 
     console.log(`[${job.jobId}] Done.`);
