@@ -50,15 +50,50 @@ const NORMALIZE_HEIGHT = 1080;
 const NORMALIZE_FPS    = 20;
 
 function normalizeClip(clipPath, workDir, index) {
-  return new Promise((resolve, reject) => {
+  return new Promise(async (resolve, reject) => {
     const outputPath = path.join(workDir, `normalized_${index}.mp4`);
+
+    // NEW (July 14, 2026 — real test failure) — a real render failed here
+    // with "Error while opening encoder for output stream #0:0 - maybe
+    // incorrect parameters such as bit_rate, rate, width or height" on
+    // clip index 6, with no further detail on WHY. That error message is
+    // FFmpeg's generic catch-all for the encoder rejecting the stream —
+    // it doesn't say what was actually wrong with the source. Rather than
+    // guess, probe the source clip FIRST and log its real properties, so
+    // if this happens again the log states the actual cause (corrupt
+    // file, zero duration, unusual dimensions) instead of a mystery.
+    try {
+      const meta = await new Promise((res, rej) => {
+        ffmpeg.ffprobe(clipPath, (err, data) => err ? rej(err) : res(data));
+      });
+      const videoStream = meta.streams?.find(s => s.codec_type === "video");
+      console.log(`[normalizeClip] clip ${index} (${clipPath}): ${videoStream?.width}x${videoStream?.height}, duration=${meta.format?.duration}, codec=${videoStream?.codec_name}`);
+    } catch (probeErr) {
+      // The clip is likely corrupt/unreadable if even ffprobe can't read
+      // it — this IS useful diagnostic information, log it and continue
+      // to the real normalization attempt below (which will then fail
+      // with its own, now-better-understood error).
+      console.error(`[normalizeClip] clip ${index} (${clipPath}) failed to probe — likely corrupt or incomplete: ${probeErr.message}`);
+    }
+
     ffmpeg(clipPath)
       .videoFilters([
         // Scale to fit within target dimensions preserving aspect ratio,
         // then pad to exactly the target size — same safe-default pattern
         // already used in renderFormat() below, applied here instead at
         // the per-clip stage so xfade never sees a size mismatch.
-        `scale=${NORMALIZE_WIDTH}:${NORMALIZE_HEIGHT}:force_original_aspect_ratio=decrease`,
+        //
+        // FIX (July 14, 2026 — real test failure): added
+        // force_divisible_by=2. Without it, an unusual source aspect
+        // ratio can make force_original_aspect_ratio=decrease compute an
+        // intermediate ODD dimension (e.g. 1919 instead of 1920) —
+        // libx264's yuv420p output requires both dimensions even, and an
+        // odd intermediate size is a well-documented cause of exactly
+        // this "Error while opening encoder" failure. This forces the
+        // scale step itself to only ever produce even numbers, closing
+        // off that failure mode regardless of the source clip's own
+        // aspect ratio.
+        `scale=${NORMALIZE_WIDTH}:${NORMALIZE_HEIGHT}:force_original_aspect_ratio=decrease:force_divisible_by=2`,
         `pad=${NORMALIZE_WIDTH}:${NORMALIZE_HEIGHT}:(ow-iw)/2:(oh-ih)/2`,
         `fps=${NORMALIZE_FPS}`,
       ])
@@ -73,7 +108,7 @@ function normalizeClip(clipPath, workDir, index) {
       .noAudio()
       .output(outputPath)
       .on("end", () => resolve(outputPath))
-      .on("error", (err) => reject(new Error(`Clip normalization failed for ${clipPath}: ${err.message}`)))
+      .on("error", (err) => reject(new Error(`Clip normalization failed for ${clipPath} (index ${index}): ${err.message}`)))
       .run();
   });
 }
@@ -91,6 +126,43 @@ function probeDuration(clipPath) {
       if (err) return reject(new Error(`ffprobe failed for ${clipPath}: ${err.message}`));
       resolve(metadata.format.duration);
     });
+  });
+}
+
+// ── COMPUTE CLIP TIMELINE (July 2026 — footage-grounded narration) ──────
+// Extracted from concatenateClips' own offset math below — previously
+// that math only existed inline, computed and discarded per-transition,
+// with no way for anything outside this function to know where a given
+// clip actually lands in the final timeline. Narration generation needs
+// exactly that: a real start time per clip, to extract a representative
+// frame from and to place a narration segment at. Single source of
+// truth — concatenateClips now calls this instead of recomputing the
+// same math a second time in a way that could drift out of sync with it.
+function computeClipTimeline(durations) {
+  const timeline = [];
+  let cumulativeStart = 0;
+  for (let i = 0; i < durations.length; i++) {
+    timeline.push({ startTime: Math.max(0, cumulativeStart), duration: durations[i] });
+    cumulativeStart += durations[i] - CROSSFADE_DURATION;
+  }
+  return timeline;
+}
+
+// Extracts one representative frame from a clip — its own local midpoint,
+// independent of where it lands in the crossfaded final timeline (a
+// crossfade blends the very start/end of adjacent clips, but the middle
+// of any clip is always a clean, representative frame of that room).
+function extractMidpointFrame(clipPath, duration, workDir, index) {
+  return new Promise((resolve, reject) => {
+    const outputPath = path.join(workDir, `narration_frame_${index}.jpg`);
+    const midpoint = Math.max(0.1, duration / 2);
+    ffmpeg(clipPath)
+      .inputOptions([`-ss`, `${midpoint.toFixed(2)}`])
+      .outputOptions(["-vframes", "1", "-q:v", "3"])
+      .output(outputPath)
+      .on("end", () => resolve(outputPath))
+      .on("error", (err) => reject(new Error(`extractMidpointFrame failed for clip ${index}: ${err.message}`)))
+      .run();
   });
 }
 
@@ -122,7 +194,10 @@ async function concatenateClips(clipPaths, workDir) {
     // Build chained xfade filter graph using real durations.
     // offset = where in the CUMULATIVE output timeline this transition
     // should begin — i.e. (sum of all preceding clip durations so far,
-    // minus the crossfade overlaps already consumed).
+    // minus the crossfade overlaps already consumed). Now computed via
+    // computeClipTimeline() (see its header comment) rather than inline,
+    // so this math has exactly one home.
+    const timeline = computeClipTimeline(durations);
     let filterParts = [];
     let lastLabel = "0:v";
     let cumulativeOffset = durations[0] - CROSSFADE_DURATION;
@@ -174,101 +249,87 @@ function buildBeforeAfterClip(beforeClipPath, afterClipPath, workDir, outputName
   });
 }
 
-// ── MIX AUDIO — music + optional narration ────────────────────────────
+// ── MIX AUDIO — music + optional narration segments ────────────────────
 //
-// CHANGE (July 2026, audio build): REPLACES the old flat -20dB-forever
-// mix. That version had no fade in/out, no loudness normalization, and
-// no way to carry a narration track at all — the "Video Only, silent"
-// and "Video + Cinematic Music" options from Sam's original audio-options
-// doc worked, but "Video + AI Narration + Cinematic Music" had nothing to
-// plug into.
-//
-// narrationPath is optional — when absent, behavior is music-only (fade
-// in/out + loudnorm, still a real improvement over the old flat volume).
-// When present:
-//   - sidechaincompress automatically ducks the music WHENEVER narration
-//     audio is actually present in the signal — this is real audio
-//     ducking, not a manually-timed volume envelope. It works correctly
-//     even though narration length rarely matches video length exactly
-//     (narration plays once near the start; music fills the rest at full
-//     volume once narration ends, since sidechaincompress only reduces
-//     music while it detects narration signal).
-//   - amix combines the ducked music and narration into one stream,
-//     padded with silence to match the longer of the two (duration=longest)
-//     rather than cutting off video audio at the shorter track's length.
-//   - loudnorm normalizes final loudness to a standard broadcast target
-//     (-16 LUFS, matches typical streaming/social-video loudness norms)
-//     so tracks of very different source loudness (Suno tracks vs
-//     ElevenLabs TTS output) don't need per-track manual leveling.
+// CHANGE (July 14, 2026 — footage-grounded narration rebuild): REPLACES
+// the single continuous narrationPath model. Narration is now generated
+// as separate segments, one per room/clip, each with its own real start
+// time in the final timeline (computed via computeClipTimeline — see its
+// header comment). Each segment gets adelay'd to its real position, all
+// segments are mixed together into one combined narration stream, THEN
+// that combined stream goes through the same sidechain-ducking-against-
+// music approach as before. narrationSegments is an array of
+// { audioPath, startTime } — empty/absent means music-only, same as the
+// old narrationPath being absent.
 
-function downloadNarrationAudio(narrationUrl, workDir) {
-  return new Promise((resolve, reject) => {
-    const axios = require("axios");
-    const fs = require("fs");
-    axios.get(narrationUrl, { responseType: "arraybuffer", timeout: 20000 })
-      .then((response) => {
-        const outputPath = path.join(workDir, "narration.mp3");
-        fs.writeFileSync(outputPath, response.data);
-        resolve(outputPath);
-      })
-      .catch(reject);
-  });
-}
-
-function mixAudio(videoPath, musicPath, workDir, narrationPath) {
+function mixAudio(videoPath, musicPath, workDir, narrationSegments) {
   return new Promise(async (resolve, reject) => {
     try {
       const outputPath = path.join(workDir, "with_music.mp4");
       const videoDuration = await probeDuration(videoPath);
       const fadeOutStart = Math.max(0, videoDuration - 1.5);
+      const hasNarration = narrationSegments && narrationSegments.length > 0;
 
       const command = ffmpeg().input(videoPath).input(musicPath);
       let filterParts;
 
-      if (narrationPath) {
-        command.input(narrationPath);
-
-        // NEW (July 14, 2026 — real test failure): narration was ending
-        // abruptly because nothing capped its length against the video's
-        // actual duration — it just played until the outer "-shortest"
-        // flag hard-cut the whole audio track exactly at the video's end,
-        // wherever that landed mid-sentence. Sizing the SCRIPT to the
-        // estimated video length (generate-narration-background.js) fixes
-        // the common case, but ElevenLabs' real speaking rate can still
-        // vary from the 150wpm assumption used there — this is the
-        // backstop that guarantees the 2-second buffer regardless, right
-        // at the point where it's actually enforceable against the real,
-        // exact video duration (not an estimate).
-        const narrationEndCap = Math.max(0, videoDuration - NARRATION_END_BUFFER_SECONDS);
-        const narrationFadeOutStart = Math.max(0, narrationEndCap - 0.6);
+      if (hasNarration) {
+        narrationSegments.forEach((seg) => command.input(seg.audioPath));
 
         filterParts = [
-          // Music: fade in/out, no manual volume cut — sidechaincompress
-          // below handles ducking dynamically instead of a flat reduction.
           `[1:a]afade=t=in:st=0:d=1,afade=t=out:st=${fadeOutStart.toFixed(2)}:d=1.5[music_faded]`,
-          // Narration: fade in, then HARD CAP at narrationEndCap (atrim is
-          // a no-op if the real narration is already shorter than that —
-          // safe either direction) with its own short fade-out so a
-          // trimmed ending sounds like a deliberate finish, not a cut.
-          //
-          // FIX (July 14, 2026 — real test failure): a labeled FFmpeg
-          // stream can only be consumed by ONE filter. The original
-          // version fed [narration_faded] into BOTH sidechaincompress
-          // (as the ducking trigger) AND amix (as the actual audio to
-          // mix in) — the second reference failed with "matches no
-          // streams" because sidechaincompress had already consumed it.
-          // asplit=2 makes two independent copies so each filter gets
-          // its own, exactly the tool FFmpeg provides for this.
-          `[2:a]afade=t=in:st=0:d=0.3,atrim=end=${narrationEndCap.toFixed(2)},afade=t=out:st=${narrationFadeOutStart.toFixed(2)}:d=0.6,asplit=2[narration_for_sidechain][narration_for_mix]`,
-          // Ducking: music_faded is the signal being reduced, the sidechain
-          // copy of narration is the trigger. threshold/ratio tuned for
-          // speech-over-music (aggressive enough that narration is always
-          // intelligible, not so aggressive that music disappears entirely
-          // underneath it).
+        ];
+
+        // Each segment: fade in/out on its OWN local timeline (0..its own
+        // duration), THEN adelay shifts the whole faded clip to its real
+        // position in the final video. Order matters — afade's st= values
+        // are relative to the stream's own start, so they have to be
+        // applied before the stream gets shifted forward.
+        //
+        // NEW (July 14, 2026 — Sam's speed-correction suggestion): each
+        // segment is ALSO hard-capped (atrim) at the real gap before the
+        // next segment starts. narrationGen.js already corrects for this
+        // by regenerating a too-long segment at a faster ElevenLabs
+        // `speed` — but that correction is clamped to ElevenLabs' real
+        // 0.7–1.2 range, so a segment whose natural length wildly exceeds
+        // its window even at max speed could still theoretically overrun.
+        // This is the backstop that guarantees no audible overlap between
+        // adjacent room narrations regardless — defense in depth, not the
+        // primary fix.
+        const delayedLabels = [];
+        narrationSegments.forEach((seg, i) => {
+          const inputIndex = i + 2; // 0=video, 1=music, 2+=narration segments
+          const delayMs = Math.round(seg.startTime * 1000);
+          const label = `narr_${i}`;
+          const nextSeg = narrationSegments[i + 1];
+          const capDuration = nextSeg ? Math.max(0.1, nextSeg.startTime - seg.startTime) : seg.duration;
+          const fadeOutAt = Math.max(0, Math.min(seg.duration, capDuration) - 0.4);
+          filterParts.push(
+            `[${inputIndex}:a]afade=t=in:st=0:d=0.3,atrim=end=${capDuration.toFixed(2)},afade=t=out:st=${fadeOutAt.toFixed(2)}:d=0.4,adelay=${delayMs}|${delayMs}[${label}]`
+          );
+          delayedLabels.push(`[${label}]`);
+        });
+
+        // Combine all per-room segments onto the shared timeline into one
+        // narration stream — each already sits at its correct offset via
+        // adelay above, so amix here is just summing them, not blending
+        // overlapping speech (segments shouldn't overlap in practice,
+        // since they're spaced by real, non-overlapping clip positions).
+        filterParts.push(
+          `${delayedLabels.join("")}amix=inputs=${narrationSegments.length}:duration=longest:dropout_transition=0[narration_all]`
+        );
+
+        // Defensive cap — same reasoning as the single-track version this
+        // replaces: even with real per-clip timestamps, guarantee nothing
+        // plays into the final buffer before the video ends.
+        const narrationEndCap = Math.max(0, videoDuration - NARRATION_END_BUFFER_SECONDS);
+        filterParts.push(`[narration_all]atrim=end=${narrationEndCap.toFixed(2)},asplit=2[narration_for_sidechain][narration_for_mix]`);
+
+        filterParts.push(
           `[music_faded][narration_for_sidechain]sidechaincompress=threshold=0.05:ratio=8:attack=5:release=300[music_ducked]`,
           `[music_ducked][narration_for_mix]amix=inputs=2:duration=longest:dropout_transition=2[premix]`,
           `[premix]loudnorm=I=-16:TP=-1.5:LRA=11[audio_out]`,
-        ];
+        );
       } else {
         filterParts = [
           `[1:a]afade=t=in:st=0:d=1,afade=t=out:st=${fadeOutStart.toFixed(2)}:d=1.5,volume=0.6[music_faded]`,
@@ -315,16 +376,18 @@ function renderFormat(inputPath, dimensions, workDir, outputName) {
 
 // ── ENTRY POINT ────────────────────────────────────────────────────────
 
-async function assembleVideo({ clipPaths, musicPath, narrationUrl, formats, workDir }) {
+async function assembleVideo({ clipPaths, musicPath, narrationSegments, formats, workDir }) {
   const concatenated = await concatenateClips(clipPaths, workDir);
 
-  // NEW (audio build): download narration audio if this job requested it.
-  // Absent for any job that didn't request narration, or where narration
-  // generation failed upstream (Netlify still dispatches the job either
-  // way — a failed narration should never block the video itself).
-  const narrationPath = narrationUrl ? await downloadNarrationAudio(narrationUrl, workDir) : null;
-
-  const withMusic = await mixAudio(concatenated, musicPath, workDir, narrationPath);
+  // CHANGE (July 14, 2026 — footage-grounded narration rebuild):
+  // narrationSegments now arrives pre-generated (audio already downloaded
+  // to local disk, real start times already computed) — renderPipeline.js
+  // does the generation itself, since it's the one place that knows real
+  // clip durations/positions. This function no longer downloads anything;
+  // it just passes the segments through to mixAudio. Absent/empty for any
+  // job that didn't request narration, or where generation failed
+  // upstream (a failed narration should never block the video itself).
+  const withMusic = await mixAudio(concatenated, musicPath, workDir, narrationSegments || []);
 
   const outputs = {};
 
@@ -338,4 +401,4 @@ async function assembleVideo({ clipPaths, musicPath, narrationUrl, formats, work
   return outputs;
 }
 
-module.exports = { assembleVideo, buildBeforeAfterClip, concatenateClips, mixAudio, renderFormat };
+module.exports = { assembleVideo, buildBeforeAfterClip, concatenateClips, mixAudio, renderFormat, computeClipTimeline, extractMidpointFrame, probeDuration };
