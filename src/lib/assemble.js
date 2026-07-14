@@ -6,6 +6,13 @@ const ffmpeg = require("fluent-ffmpeg");
 
 const CROSSFADE_DURATION = 0.6; // seconds between clips
 
+// NEW (July 14, 2026 — real test failure) — mirrors
+// NARRATION_END_BUFFER_SECONDS in generate-narration-background.js. That
+// file sizes the SCRIPT to roughly fit before this buffer; this constant
+// is the hard enforcement backstop at mix time, against the real, exact
+// video duration rather than an estimate.
+const NARRATION_END_BUFFER_SECONDS = 2;
+
 // ── NORMALIZE CLIP (fixes the real root cause of the xfade crash) ────────
 // CONFIRMED ROOT CAUSE of "Error reinitializing filters! / Failed to
 // inject frame into filter network: Invalid argument" — a real crash from
@@ -220,12 +227,29 @@ function mixAudio(videoPath, musicPath, workDir, narrationPath) {
 
       if (narrationPath) {
         command.input(narrationPath);
+
+        // NEW (July 14, 2026 — real test failure): narration was ending
+        // abruptly because nothing capped its length against the video's
+        // actual duration — it just played until the outer "-shortest"
+        // flag hard-cut the whole audio track exactly at the video's end,
+        // wherever that landed mid-sentence. Sizing the SCRIPT to the
+        // estimated video length (generate-narration-background.js) fixes
+        // the common case, but ElevenLabs' real speaking rate can still
+        // vary from the 150wpm assumption used there — this is the
+        // backstop that guarantees the 2-second buffer regardless, right
+        // at the point where it's actually enforceable against the real,
+        // exact video duration (not an estimate).
+        const narrationEndCap = Math.max(0, videoDuration - NARRATION_END_BUFFER_SECONDS);
+        const narrationFadeOutStart = Math.max(0, narrationEndCap - 0.6);
+
         filterParts = [
           // Music: fade in/out, no manual volume cut — sidechaincompress
           // below handles ducking dynamically instead of a flat reduction.
           `[1:a]afade=t=in:st=0:d=1,afade=t=out:st=${fadeOutStart.toFixed(2)}:d=1.5[music_faded]`,
-          // Narration: short fade in only — no fade-out, since it should
-          // finish cleanly on its own, not trail off mid-sentence.
+          // Narration: fade in, then HARD CAP at narrationEndCap (atrim is
+          // a no-op if the real narration is already shorter than that —
+          // safe either direction) with its own short fade-out so a
+          // trimmed ending sounds like a deliberate finish, not a cut.
           //
           // FIX (July 14, 2026 — real test failure): a labeled FFmpeg
           // stream can only be consumed by ONE filter. The original
@@ -235,7 +259,7 @@ function mixAudio(videoPath, musicPath, workDir, narrationPath) {
           // streams" because sidechaincompress had already consumed it.
           // asplit=2 makes two independent copies so each filter gets
           // its own, exactly the tool FFmpeg provides for this.
-          `[2:a]afade=t=in:st=0:d=0.3,asplit=2[narration_for_sidechain][narration_for_mix]`,
+          `[2:a]afade=t=in:st=0:d=0.3,atrim=end=${narrationEndCap.toFixed(2)},afade=t=out:st=${narrationFadeOutStart.toFixed(2)}:d=0.6,asplit=2[narration_for_sidechain][narration_for_mix]`,
           // Ducking: music_faded is the signal being reduced, the sidechain
           // copy of narration is the trigger. threshold/ratio tuned for
           // speech-over-music (aggressive enough that narration is always
