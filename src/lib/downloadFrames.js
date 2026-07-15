@@ -74,7 +74,17 @@ async function downloadFrames(frames, workDir) {
       // but not sufficient — this file, one layer earlier, was dropping the
       // field before either of them ever saw it.
       klingMotionPreset: frame.klingMotionPreset || null,
-      durationSeconds: frame.durationSeconds || 4.5,
+      // FIX (real render, duration fix had zero effect): was || 4.5 — a
+      // SECOND hardcoded fallback (video-job.js on the Netlify side had
+      // an identical one, also just fixed) that pre-empted
+      // resolveDuration()'s real per-roomType DEFAULT_DURATIONS logic in
+      // motionPresets.js before it ever ran. resolveDuration only
+      // consults DEFAULT_DURATIONS when frame.durationSeconds is falsy —
+      // with TWO layers both defaulting to 4.5 ahead of it, that logic
+      // was unreachable for any normal frame, no matter what
+      // DEFAULT_DURATIONS itself said. null now correctly lets it
+      // through as "no override."
+      durationSeconds: frame.durationSeconds || null,
       sequenceOrder: frame.sequenceOrder ?? i,
       useAiMotion: !!frame.useAiMotion,
       customPrompt: frame.customPrompt || null,
