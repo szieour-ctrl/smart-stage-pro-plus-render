@@ -253,10 +253,16 @@ function xfadeChain(paths, durations, workDir, outputName) {
 // extractMidpointFrame). It never covered this: one single process with
 // 17 simultaneous input STREAMS chained through 16 xfade filters in one
 // complex filter graph. An 11-clip job rendered fine; 17 didn't — a real
-// scaling ceiling, not a one-off. 6 is a conservative starting point
-// (worked reliably in isolation while testing); revisit if a job in the
-// upper range still fails.
-const XFADE_BATCH_SIZE = 6;
+// scaling ceiling, not a one-off.
+//
+// LOWERED to 4 (July 15, 2026): the first fix used 6, batched through a
+// concurrency pool, and crashed again on a 20-clip job — but that crash
+// happened under concurrent-batch contention (see the sequential-
+// processing fix in concatenateClips below), so it never actually
+// confirmed whether 6 holds in true isolation. Given two real production
+// failures already, dropping to 4 as added margin rather than re-testing
+// at exactly the same untested number.
+const XFADE_BATCH_SIZE = 4;
 
 // ── CONCATENATE CLIPS (batched) ───────────────────────────────────────
 async function concatenateClips(clipPaths, workDir) {
@@ -287,8 +293,22 @@ async function concatenateClips(clipPaths, workDir) {
   // call), probe each intermediate's REAL resulting duration (crossfade
   // overlap means it's shorter than a naive sum of its inputs), then
   // repeat on the intermediates. Keeps going until one file remains.
-  // Batches within a round run through the same concurrency limit as
-  // normalizeClip, for the same resource-exhaustion reason.
+  //
+  // FIX (July 15, 2026 — real render still failed after the first
+  // batching attempt): batches were being run through
+  // mapWithConcurrencyLimit at FFMPEG_CONCURRENCY_LIMIT=3 — the same
+  // pool used for normalizeClip. That was the wrong reuse. normalizeClip
+  // is one input per process, so 3 concurrent calls = 3 total open
+  // streams, trivial. Each xfadeChain batch call is itself a heavy
+  // multi-stream ffmpeg operation — running 3 of THOSE concurrently
+  // meant up to 3 processes × 6 inputs ≈ 18 simultaneous streams on the
+  // container at once, barely less aggregate load than the original
+  // 20-in-one-process failure this was supposed to fix. Confirmed by a
+  // real render crashing on batch 1 alone (stream #5:0) — under
+  // contention from the other batches starting alongside it. Batches now
+  // run strictly sequentially — one xfadeChain call at a time, nothing
+  // else competing with it. Costs some wall-clock time; that's the right
+  // trade for a step that's failed twice in production.
   let currentPaths = normalizedPaths;
   let currentDurations = durations;
   let round = 0;
@@ -302,10 +322,12 @@ async function concatenateClips(clipPaths, workDir) {
       });
     }
 
-    const batchOutputs = await mapWithConcurrencyLimit(
-      batches, FFMPEG_CONCURRENCY_LIMIT,
-      (batch, i) => xfadeChain(batch.paths, batch.durations, workDir, `concat_r${round}_${i}.mp4`)
-    );
+    const batchOutputs = [];
+    for (let i = 0; i < batches.length; i++) {
+      batchOutputs.push(
+        await xfadeChain(batches[i].paths, batches[i].durations, workDir, `concat_r${round}_${i}.mp4`)
+      );
+    }
 
     currentDurations = await Promise.all(batchOutputs.map(probeDuration));
     currentPaths = batchOutputs;
