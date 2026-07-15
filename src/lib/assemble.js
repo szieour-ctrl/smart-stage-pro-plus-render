@@ -236,7 +236,33 @@ function xfadeChain(paths, durations, workDir, outputName) {
       .complexFilter(filterParts)
       .outputOptions(["-map", "[outv]", "-pix_fmt", "yuv420p"])
       .output(outputPath)
-      .on("end", () => resolve(outputPath))
+      .on("end", async () => {
+        // FIX (July 15, 2026 — real render failure): ffmpeg's 'end' event
+        // firing means the PROCESS reported success, but on a container
+        // filesystem under I/O load (which a render with several
+        // sequential batch xfadeChain calls definitely has), that can
+        // fire microseconds before the output file is actually durably
+        // visible on disk. Confirmed real: a genuine 2-clip batch's
+        // output (concat_r0_6.mp4) resolved successfully here, then
+        // probeDuration's ffprobe call moments later got "No such file
+        // or directory" on that exact path. This almost certainly
+        // explains the prior silent deaths too — those likely hit this
+        // same race, just before the process-level crash handlers
+        // existed to catch and log the resulting unhandled rejection
+        // instead of the process dying with zero trace.
+        //
+        // Polling a few times with a short delay before giving up gives
+        // the filesystem a moment to catch up rather than trusting the
+        // event's timing blindly.
+        for (let attempt = 0; attempt < 5; attempt++) {
+          if (fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0) {
+            resolve(outputPath);
+            return;
+          }
+          await new Promise((r) => setTimeout(r, 200));
+        }
+        reject(new Error(`xfadeChain reported success but ${outputPath} never became visible on disk after 1s of polling.`));
+      })
       .on("error", (err) => reject(new Error(`Concatenation failed: ${err.message}`)))
       .run();
   });
@@ -339,7 +365,17 @@ async function concatenateClips(clipPaths, workDir) {
     // read again — safe to delete now that their outputs exist on disk.
     // Best-effort: a failed cleanup should never crash the render over
     // something that was only ever a disk-space optimization.
+    // NEW (July 15, 2026 — found while tracing the missing-file bug
+    // above): a batch with a single leftover clip (odd clip counts)
+    // passes that file through unchanged in xfadeChain rather than
+    // creating a new one — so it ends up in BOTH currentPaths (about to
+    // be deleted below) AND batchOutputs (what the NEXT round needs).
+    // Excluding anything that's also a batch output from deletion, so a
+    // passthrough file doesn't get deleted out from under the round that
+    // still needs it.
+    const outputSet = new Set(batchOutputs);
     for (const consumedPath of currentPaths) {
+      if (outputSet.has(consumedPath)) continue;
       try { fs.unlinkSync(consumedPath); } catch (err) { /* non-fatal */ }
     }
 
