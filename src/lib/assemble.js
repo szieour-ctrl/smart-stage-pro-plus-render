@@ -397,7 +397,17 @@ function mixAudio(videoPath, musicPath, workDir, narrationSegments) {
         narrationSegments.forEach((seg) => command.input(seg.audioPath));
 
         filterParts = [
-          `[1:a]afade=t=in:st=0:d=1,afade=t=out:st=${fadeOutStart.toFixed(2)}:d=1.5[music_faded]`,
+          // FIX (Sam's feedback, real render — music drowned narration):
+          // the no-narration branch below reduces music to volume=0.6 as
+          // a baseline. This branch never had that at all — it relied
+          // entirely on sidechaincompress to duck music under speech,
+          // which only reacts to speech peaks and doesn't lower the
+          // floor between phrases/words. Adding an explicit baseline cut
+          // here too (lower than 0.6 — narration needs to stay
+          // intelligible over it, not just quieter), with sidechain
+          // ducking still layered on top for extra reduction during
+          // actual speech.
+          `[1:a]afade=t=in:st=0:d=1,afade=t=out:st=${fadeOutStart.toFixed(2)}:d=1.5,volume=0.35[music_faded]`,
         ];
 
         // Each segment: fade in/out on its OWN local timeline (0..its own
@@ -521,4 +531,4 @@ async function assembleVideo({ clipPaths, musicPath, narrationSegments, formats,
   return outputs;
 }
 
-module.exports = { assembleVideo, buildBeforeAfterClip, concatenateClips, mixAudio, renderFormat, computeClipTimeline, extractMidpointFrame, probeDuration, mapWithConcurrencyLimit, FFMPEG_CONCURRENCY_LIMIT };
+module.exports = { assembleVideo, buildBeforeAfterClip, concatenateClips, mixAudio, renderFormat, computeClipTimeline, extractMidpointFrame, probeDuration, mapWithConcurrencyLimit, FFMPEG_CONCURRENCY_LIMIT, NARRATION_END_BUFFER_SECONDS };
