@@ -18,7 +18,7 @@ const { applyMotionPreset, resolveDuration } = require("./lib/motionPresets");
 const { applyKlingMotion } = require("./lib/klingMotion");
 const { generateMusic } = require("./lib/musicGen");
 const { assembleVideo, buildBeforeAfterClip, computeClipTimeline, extractMidpointFrame, probeDuration, mapWithConcurrencyLimit, FFMPEG_CONCURRENCY_LIMIT } = require("./lib/assemble");
-const { generateNarration } = require("./lib/narrationGen");
+const { generateNarration, groupContiguousByRoom } = require("./lib/narrationGen");
 const { uploadToCloudinary } = require("./lib/cloudinaryUpload");
 const { notifyWebhook } = require("./lib/notify");
 
@@ -51,6 +51,36 @@ async function processRenderJob(job) {
     // ── Step 1: Download all frame images to local disk ──────────────────
     const localFrames = await downloadFrames(job.frames, workDir);
     console.log(`[${job.jobId}] Downloaded ${localFrames.length} frames.`);
+
+    // NEW (narration grouping + intro/outro build): when narration is on,
+    // clip 1 and the last clip in the queue get extra duration so there's
+    // real room for an intro/outro narration beat later, instead of that
+    // narration being crammed into whatever the room's normal hold time
+    // happens to be. Duration-only mechanic for now — actual intro
+    // (address/location) and outro (CTA/sign-off) SCRIPT CONTENT is
+    // separate, not-yet-built work; Sam's call was best-practices help
+    // content for photo ordering, not an auto-generated title card. This
+    // just reserves the time so that future work has somewhere to land.
+    //
+    // Whole-second padding, not a fractional value — Kling's API only
+    // accepts whole-second durations (3-15, see klingMotion.js's
+    // buildKlingRequest), and while it does round fractional requests
+    // itself, staying whole here avoids an unnecessary round-trip through
+    // that rounding logic for the common case.
+    const NARRATION_INTRO_OUTRO_PADDING_SECONDS = 3;
+    if (job.wantsNarration && localFrames.length > 0) {
+      const first = localFrames[0];
+      first.durationSeconds = resolveDuration(first) + NARRATION_INTRO_OUTRO_PADDING_SECONDS;
+      // Guard against localFrames.length === 1: first and last would be
+      // the SAME object reference, so padding both would silently double
+      // it on a single-clip video. Only pad the last clip separately when
+      // there's genuinely more than one.
+      if (localFrames.length > 1) {
+        const last = localFrames[localFrames.length - 1];
+        last.durationSeconds = resolveDuration(last) + NARRATION_INTRO_OUTRO_PADDING_SECONDS;
+      }
+      console.log(`[${job.jobId}] Narration on — padded clip 1${localFrames.length > 1 ? " and last clip" : ""} by ${NARRATION_INTRO_OUTRO_PADDING_SECONDS}s for future intro/outro room.`);
+    }
 
     // ── Step 2: Apply motion preset to each frame → individual clips ─────
     // Runs while music generates in parallel (Step 3 kicks off immediately).
@@ -225,13 +255,18 @@ async function processRenderJob(job) {
           clipPaths, FFMPEG_CONCURRENCY_LIMIT, (clip, i) => extractMidpointFrame(clip, realDurations[i], workDir, i)
         );
 
-        const timelineSegments = localFrames.map((frame, i) => ({
-          index: i,
-          roomLabel: frame.roomLabel || frame.roomType || "this room",
-          framePath: framePaths[i],
-          duration: timeline[i].duration,
-          startTime: timeline[i].startTime,
-        }));
+        // CHANGE (narration coherence fix, per July 14 handoff + Sam's
+        // direct feedback on real output): was strict 1:1 — one segment
+        // per clip, one frame per segment. Replaced with contiguous
+        // room-based grouping (groupContiguousByRoom in narrationGen.js)
+        // — multiple angles/crops of the same room, ordered back-to-back
+        // by the user, now become ONE longer narration segment spanning
+        // all of them, with up to 4 representative frames sent to the
+        // same vision call instead of one call per clip. This is what
+        // actually fixes the ~10-word-per-segment cramping: a 3-angle
+        // bedroom run at ~4s/clip now gets ~12s of real word budget
+        // instead of 3 separate 4s budgets that each cut off mid-thought.
+        const timelineSegments = groupContiguousByRoom(localFrames, framePaths, timeline);
 
         const voiceId = NARRATION_VOICE_LIBRARY[job.voiceKey];
         if (!voiceId) {
