@@ -22,7 +22,7 @@
 const https = require("https");
 const fs = require("fs");
 const path = require("path");
-const { probeDuration } = require("./assemble");
+const { probeDuration, NARRATION_END_BUFFER_SECONDS } = require("./assemble");
 
 const SPEAKING_RATE_WORDS_PER_MINUTE = 150;
 const MIN_SEGMENT_WORDS = 6; // even a 3-second bathroom shot gets a real sentence, not one word
@@ -38,6 +38,33 @@ function wordBudgetForSegment(durationSeconds) {
   // their own clip).
   const words = Math.round((durationSeconds / 60) * SPEAKING_RATE_WORDS_PER_MINUTE);
   return Math.max(MIN_SEGMENT_WORDS, words);
+}
+
+// Room-type tags where a listing having MULTIPLE distinct instances is
+// common — unlike "Kitchen" or "Primary Bedroom," which are typically
+// singular per listing. CONFIRMED REAL BUG (Sam's feedback, a genuine
+// 4-bedroom listing): 3 secondary bedrooms all tagged generic "Bedroom"
+// (only the primary gets its own distinct tag in the UI — see
+// ROOM_TYPES in build-video-demo.html) got merged into one narrated
+// group when shot back-to-back, since groupContiguousByRoom had no way
+// to tell "3 angles of 1 bedroom" apart from "1 angle each of 3
+// different bedrooms" — both look identical as contiguous same-label
+// runs. Disambiguating by occurrence order below fixes it for the
+// common case (one photo per room) at the cost of over-splitting the
+// rarer case (someone genuinely shoots multiple angles of the SAME
+// secondary bedroom) — a soft failure (slightly more, smaller segments)
+// that's clearly preferable to the hard failure this replaces
+// (confidently wrong/skipped room content).
+const REUSABLE_ROOM_TYPES = new Set(["Bedroom", "Bathroom", "Office", "Flex Room", "Other"]);
+
+function disambiguateRoomLabels(localFrames) {
+  const seenCounts = {};
+  return localFrames.map((frame) => {
+    const raw = frame.roomLabel || frame.roomType || "this room";
+    if (!REUSABLE_ROOM_TYPES.has(raw)) return raw;
+    seenCounts[raw] = (seenCounts[raw] || 0) + 1;
+    return seenCounts[raw] === 1 ? raw : `${raw} ${seenCounts[raw]}`;
+  });
 }
 
 // ── GROUP CONTIGUOUS CLIPS BY ROOM ───────────────────────────────────────
@@ -59,9 +86,10 @@ function wordBudgetForSegment(durationSeconds) {
 // — same shape generateSegmentedScript/generateNarration already expect,
 // except framePath (singular) is now framePaths (array).
 function groupContiguousByRoom(localFrames, framePaths, timeline) {
+  const disambiguatedLabels = disambiguateRoomLabels(localFrames);
   const groups = [];
   for (let i = 0; i < localFrames.length; i++) {
-    const roomLabel = localFrames[i].roomLabel || localFrames[i].roomType || "this room";
+    const roomLabel = disambiguatedLabels[i];
     const prior = groups[groups.length - 1];
     if (prior && prior.roomLabel === roomLabel) {
       prior.framePaths.push(framePaths[i]);
@@ -81,6 +109,22 @@ function groupContiguousByRoom(localFrames, framePaths, timeline) {
         duration: timeline[i].duration,
       });
     }
+  }
+
+  // FIX (Sam's feedback, real render — outro cut off mid-sentence after
+  // "schedule your Priv..."): mixAudio's NARRATION_END_BUFFER_SECONDS
+  // hard-trims the ENTIRE narration track 2s before the video's real
+  // end, regardless of what any individual segment needed. The final
+  // group's word budget was being calculated against its full padded
+  // clip duration, with no awareness that buffer eats back into exactly
+  // the room the intro/outro padding was meant to create — so the CTA
+  // script routinely got written long enough to need time that the
+  // buffer then hard-cuts. Subtracting the buffer here means the LAST
+  // group's script is written to what will actually survive to air,
+  // not what fits before a truncation nobody told it about.
+  if (groups.length > 0) {
+    const lastGroup = groups[groups.length - 1];
+    lastGroup.duration = Math.max(1, lastGroup.duration - NARRATION_END_BUFFER_SECONDS);
   }
 
   // Cap representative frames per group — a 5-angle primary bedroom
