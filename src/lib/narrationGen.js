@@ -110,13 +110,17 @@ function generateSegmentedScript(address, segments, apiKey) {
       .map((s, i) => `Group ${i + 1}: "${s.roomLabel}" — ${s.framePaths.length} frame(s) shown for this group — target ${wordBudgetForSegment(s.duration)} words max (this group plays for about ${s.duration.toFixed(1)}s total in the final video).`)
       .join("\n");
 
-    const promptText = `You are writing narration for a real estate video tour. You are shown one or more still frames per group, grouped in the order they appear in the video. Frames within the same group may be different angles or cropped shots of the SAME physical room — not different rooms — so don't assume they're separate spaces just because the framing looks different.
+    const promptText = `You are writing narration for a real estate video tour. You are shown one or more still frames per group, grouped in the order they appear in the video.
+
+IMPORTANT: frames are grouped because they were tagged with the same room-type label (e.g. "Bathroom") and appear consecutively. Most of the time that means they genuinely ARE the same physical room shown from different angles or crops — but room-type tags don't guarantee that. Occasionally a group will actually contain two distinct rooms of the same type placed back-to-back (e.g. a primary bath, then a guest bath). Look at what's actually different across the frames in each group and judge for yourself:
+- If they're clearly the same space (same fixtures, same finishes, same layout from a different angle) — narrate it as one continuous room description, as usual.
+- If they're clearly DIFFERENT rooms that just share a type — say so distinctly in the narration (e.g. "...and down the hall, a second full bath offers..."), don't blend two different rooms into one generic description as if they were one.
 
 Address: ${address || "this property"}
 
 ${segmentDescriptions}
 
-Write ONE short narration segment per GROUP (not per frame), grounded in what you actually see, real details (finishes, light, layout, a genuine standout feature), not generic room-type filler. Say the room name ONCE per group, at the start of that group's segment — never re-announce it for each frame within the group. If a group has multiple frames of the same room, let the segment flow as one continuous thought across the angles (e.g. mention a walk-in closet or ensuite bath visible in a later frame as part of the same sentence/thought), only calling out something new if it's genuinely worth mentioning — don't just narrate "here's another view."
+Write ONE short narration segment per GROUP (not per frame), grounded in what you actually see, real details (finishes, light, layout, a genuine standout feature), not generic room-type filler. Say a room's name once when you start describing it — don't re-announce it for every frame that's clearly still the same space — but if the group turns out to span more than one real room (see above), make sure narration reflects that rather than silently describing only one of them.
 
 This is NOT a mechanical, second-by-second description of each image — it should read like someone who toured the home and picked out what's genuinely worth mentioning, tastefully, in a warm, professional, conversational tone. The segments together should feel like one continuous, cohesive walkthrough — each one can build on the last — not a series of disconnected blurbs.
 
