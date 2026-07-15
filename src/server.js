@@ -17,6 +17,56 @@ app.use(express.json({ limit: "10mb" }));
 
 const PORT = process.env.PORT || 3000;
 
+// NEW (July 15, 2026 — three consecutive silent renderer deaths, no
+// application-level trace, no Railway-config explanation holding up:
+// replica limits at plan max, no healthcheck configured, billing nowhere
+// near the cap, memory graph never actually hitting the 8GB replica
+// ceiling before dying). Every prior theory has been ruled out by
+// checking Railway's own dashboard directly — this isn't more guessing,
+// it's making sure the NEXT death actually leaves a trace to diagnose
+// from, whatever the real cause turns out to be.
+//
+// uncaughtException/unhandledRejection: catches anything that would
+// otherwise crash the process with zero log output. This won't catch a
+// hard SIGKILL (nothing can — that's the OS ending the process with no
+// chance for JS to run at all), but it WILL catch a genuine JS-level
+// crash (a thrown error nothing awaited/caught upstream, a rejected
+// promise nobody handled) that was previously indistinguishable from an
+// OOM/platform-level kill in the logs.
+process.on("uncaughtException", (err) => {
+  console.error("[FATAL uncaughtException]", err.stack || err.message || err);
+  // Deliberately NOT calling process.exit() here — let whatever's
+  // in-flight finish logging/writing if it can. If the process is truly
+  // unrecoverable, Railway's own restart behavior takes over regardless.
+});
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("[FATAL unhandledRejection]", reason instanceof Error ? (reason.stack || reason.message) : reason);
+});
+
+// SIGTERM/SIGINT: if RAILWAY (not the OS OOM killer) is the one ending
+// this process — a redeploy, a manual restart, a platform-initiated
+// graceful shutdown — it sends SIGTERM first, before a harder kill. This
+// logs that distinctly from an uncaught JS error, so future logs can
+// tell "the platform told me to stop" apart from "something crashed."
+["SIGTERM", "SIGINT"].forEach((signal) => {
+  process.on(signal, () => {
+    console.error(`[PROCESS SIGNAL] Received ${signal} — Railway or the OS is ending this process now. Any render in flight will not complete.`);
+    process.exit(0);
+  });
+});
+
+// Periodic memory snapshot — logs actual Node heap + RSS (total process
+// memory, closer to what Railway's own Memory graph measures) every 30s.
+// If the real cause is a slow climb toward SOME ceiling rather than a
+// sudden spike, this shows it happening in real time in the render logs
+// themselves, correlated with exactly which render step was running —
+// something Railway's own graph, aggregated over a full hour, couldn't
+// show clearly enough to pin down last time.
+setInterval(() => {
+  const mem = process.memoryUsage();
+  console.log(`[MEMORY] rss=${(mem.rss / 1024 / 1024).toFixed(0)}MB heapUsed=${(mem.heapUsed / 1024 / 1024).toFixed(0)}MB heapTotal=${(mem.heapTotal / 1024 / 1024).toFixed(0)}MB external=${(mem.external / 1024 / 1024).toFixed(0)}MB`);
+}, 30000).unref(); // .unref() — this timer should never be the reason the process stays alive on its own
+
 // TEMPORARY DIAGNOSTIC (July 7, 2026): SMART_CORRECT_WEBHOOK_URL appears
 // correctly set in Railway's dashboard, but process.env.SMART_CORRECT_WEBHOOK_URL
 // is resolving as undefined at runtime inside notifyWebhook(), causing every
