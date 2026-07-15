@@ -2,6 +2,7 @@
 // mixes in background music, and renders final output formats.
 
 const path = require("path");
+const fs = require("fs");
 const ffmpeg = require("fluent-ffmpeg");
 
 const CROSSFADE_DURATION = 0.6; // seconds between clips
@@ -200,6 +201,64 @@ function extractMidpointFrame(clipPath, duration, workDir, index) {
 // Chains xfade filters across all clips in sequence using REAL probed
 // durations for offset calculation, not an assumed fixed length.
 
+// ── SINGLE XFADE CHAIN ────────────────────────────────────────────────
+// The actual crossfade-chaining logic, extracted so it can run both on a
+// full clip set (small jobs) and on individual batches (large jobs) — see
+// concatenateClips below for why batching exists. Behavior is identical
+// either way: same CROSSFADE_DURATION overlap, same offset math, so
+// total transition count and total overlap time stays consistent
+// regardless of how many ffmpeg invocations it takes to get there —
+// which matters because computeClipTimeline() (used separately, for
+// narration placement in renderPipeline.js) assumes that consistency.
+function xfadeChain(paths, durations, workDir, outputName) {
+  if (paths.length === 1) return Promise.resolve(paths[0]);
+
+  return new Promise((resolve, reject) => {
+    const outputPath = path.join(workDir, outputName);
+    const command = ffmpeg();
+    paths.forEach((clip) => command.input(clip));
+
+    let filterParts = [];
+    let lastLabel = "0:v";
+    let cumulativeOffset = durations[0] - CROSSFADE_DURATION;
+
+    for (let i = 1; i < paths.length; i++) {
+      const nextLabel = `${i}:v`;
+      const outLabel = i === paths.length - 1 ? "outv" : `v${i}`;
+      filterParts.push(
+        `[${lastLabel}][${nextLabel}]xfade=transition=fade:duration=${CROSSFADE_DURATION}:offset=${Math.max(0, cumulativeOffset).toFixed(2)}[${outLabel}]`
+      );
+      lastLabel = outLabel;
+      cumulativeOffset += durations[i] - CROSSFADE_DURATION;
+    }
+
+    command
+      .complexFilter(filterParts)
+      .outputOptions(["-map", "[outv]", "-pix_fmt", "yuv420p"])
+      .output(outputPath)
+      .on("end", () => resolve(outputPath))
+      .on("error", (err) => reject(new Error(`Concatenation failed: ${err.message}`)))
+      .run();
+  });
+}
+
+// Keeps any single xfadeChain() call's simultaneous open-input count
+// bounded. CONFIRMED CAUSE (July 15, 2026 — real render failure, 17
+// clips): "Error reinitializing filters! Failed to inject frame into
+// filter network: Resource temporarily unavailable" on the LAST stream
+// of a 17-input complex filter graph — the exact same resource-
+// exhaustion error signature already root-caused once before in this
+// file (see mapWithConcurrencyLimit's header comment), but that earlier
+// fix only covered too many concurrent ffmpeg PROCESSES (normalizeClip,
+// extractMidpointFrame). It never covered this: one single process with
+// 17 simultaneous input STREAMS chained through 16 xfade filters in one
+// complex filter graph. An 11-clip job rendered fine; 17 didn't — a real
+// scaling ceiling, not a one-off. 6 is a conservative starting point
+// (worked reliably in isolation while testing); revisit if a job in the
+// upper range still fails.
+const XFADE_BATCH_SIZE = 6;
+
+// ── CONCATENATE CLIPS (batched) ───────────────────────────────────────
 async function concatenateClips(clipPaths, workDir) {
   // NEW — normalize every clip BEFORE the single-clip early-return check
   // too. A single Kling clip still needs to end up at a known, consistent
@@ -218,42 +277,48 @@ async function concatenateClips(clipPaths, workDir) {
 
   const durations = await Promise.all(normalizedPaths.map(probeDuration));
 
-  return new Promise((resolve, reject) => {
-    const outputPath = path.join(workDir, "concatenated.mp4");
-    const command = ffmpeg();
+  // Small jobs: one chain, same as before, no behavior change.
+  if (normalizedPaths.length <= XFADE_BATCH_SIZE) {
+    return xfadeChain(normalizedPaths, durations, workDir, "concatenated.mp4");
+  }
 
-    normalizedPaths.forEach((clip) => command.input(clip));
+  // Large jobs: divide-and-conquer. Chain each batch of XFADE_BATCH_SIZE
+  // clips into an intermediate file (bounded input count per ffmpeg
+  // call), probe each intermediate's REAL resulting duration (crossfade
+  // overlap means it's shorter than a naive sum of its inputs), then
+  // repeat on the intermediates. Keeps going until one file remains.
+  // Batches within a round run through the same concurrency limit as
+  // normalizeClip, for the same resource-exhaustion reason.
+  let currentPaths = normalizedPaths;
+  let currentDurations = durations;
+  let round = 0;
 
-    // Build chained xfade filter graph using real durations.
-    // offset = where in the CUMULATIVE output timeline this transition
-    // should begin — i.e. (sum of all preceding clip durations so far,
-    // minus the crossfade overlaps already consumed). Now computed via
-    // computeClipTimeline() (see its header comment) rather than inline,
-    // so this math has exactly one home.
-    const timeline = computeClipTimeline(durations);
-    let filterParts = [];
-    let lastLabel = "0:v";
-    let cumulativeOffset = durations[0] - CROSSFADE_DURATION;
-
-    for (let i = 1; i < clipPaths.length; i++) {
-      const nextLabel = `${i}:v`;
-      const outLabel = i === clipPaths.length - 1 ? "outv" : `v${i}`;
-
-      filterParts.push(
-        `[${lastLabel}][${nextLabel}]xfade=transition=fade:duration=${CROSSFADE_DURATION}:offset=${Math.max(0, cumulativeOffset).toFixed(2)}[${outLabel}]`
-      );
-      lastLabel = outLabel;
-      cumulativeOffset += durations[i] - CROSSFADE_DURATION;
+  while (currentPaths.length > 1) {
+    const batches = [];
+    for (let i = 0; i < currentPaths.length; i += XFADE_BATCH_SIZE) {
+      batches.push({
+        paths: currentPaths.slice(i, i + XFADE_BATCH_SIZE),
+        durations: currentDurations.slice(i, i + XFADE_BATCH_SIZE),
+      });
     }
 
-    command
-      .complexFilter(filterParts)
-      .outputOptions(["-map", "[outv]", "-pix_fmt", "yuv420p"])
-      .output(outputPath)
-      .on("end", () => resolve(outputPath))
-      .on("error", (err) => reject(new Error(`Concatenation failed: ${err.message}`)))
-      .run();
-  });
+    const batchOutputs = await mapWithConcurrencyLimit(
+      batches, FFMPEG_CONCURRENCY_LIMIT,
+      (batch, i) => xfadeChain(batch.paths, batch.durations, workDir, `concat_r${round}_${i}.mp4`)
+    );
+
+    currentDurations = await Promise.all(batchOutputs.map(probeDuration));
+    currentPaths = batchOutputs;
+    round++;
+  }
+
+  // Final result needs to land at the canonical path the rest of the
+  // pipeline (mixAudio, renderFormat) already expects.
+  const finalPath = path.join(workDir, "concatenated.mp4");
+  if (currentPaths[0] !== finalPath) {
+    fs.copyFileSync(currentPaths[0], finalPath);
+  }
+  return finalPath;
 }
 
 // ── BEFORE/AFTER WIPE TRANSITION ─────────────────────────────────────────
