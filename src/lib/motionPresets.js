@@ -25,15 +25,19 @@ const AUTO_PRESETS = {
 };
 
 // Default shot duration by room type
+// RAISED +0.7s across the board (Sam's feedback, real render — "timing
+// on the single frames is about .7s too short and the narration can't
+// breathe... bedroom frames are a blip"). Flat increase, not per-type
+// tuning — the complaint was general, not room-specific.
 const DEFAULT_DURATIONS = {
-  exterior: 5.5,
-  living:   5.5,
-  kitchen:  4.5,
-  dining:   4.0,
-  bedroom:  4.5,
-  bathroom: 3.0,
-  flex:     4.0,
-  default:  4.5,
+  exterior: 6.2,
+  living:   6.2,
+  kitchen:  5.2,
+  dining:   4.7,
+  bedroom:  5.2,
+  bathroom: 3.7,
+  flex:     4.7,
+  default:  5.2,
 };
 
 // All valid preset names — must match motionRenderer.py choices exactly
