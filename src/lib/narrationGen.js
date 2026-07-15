@@ -28,6 +28,7 @@ const SPEAKING_RATE_WORDS_PER_MINUTE = 150;
 const MIN_SEGMENT_WORDS = 6; // even a 3-second bathroom shot gets a real sentence, not one word
 const MIN_SPEED = 0.7;
 const MAX_SPEED = 1.2; // ElevenLabs' real supported range — confirmed via voice_settings.speed
+const MAX_FRAMES_PER_GROUP = 4; // cap on how many representative stills go to one vision call per group
 
 function wordBudgetForSegment(durationSeconds) {
   // Slightly tighter than the whole-video version this replaces (no
@@ -39,36 +40,101 @@ function wordBudgetForSegment(durationSeconds) {
   return Math.max(MIN_SEGMENT_WORDS, words);
 }
 
+// ── GROUP CONTIGUOUS CLIPS BY ROOM ───────────────────────────────────────
+// REPLACES strict 1:1 segment-per-clip mapping (the root cause of the
+// fragmentation Sam flagged after hearing real output — a 3-4.5s clip
+// only budgets ~10 words, not enough for a complete thought even with
+// speed correction working correctly). Users naturally order multiple
+// angles/crops of the same room back-to-back — video_job_frames already
+// carries room_label per clip, so a contiguous run of matching labels is
+// a free, reliable grouping boundary. A run of length 1 just becomes a
+// single-clip group, handled identically to a multi-clip one — no special
+// case needed anywhere downstream.
+//
+// localFrames: the same array renderPipeline.js already has (room_label
+// per frame). framePaths/timeline: parallel arrays, same length/order,
+// already produced by extractMidpointFrame + computeClipTimeline.
+//
+// Returns: [{ index, roomLabel, framePaths: [...], startTime, duration }]
+// — same shape generateSegmentedScript/generateNarration already expect,
+// except framePath (singular) is now framePaths (array).
+function groupContiguousByRoom(localFrames, framePaths, timeline) {
+  const groups = [];
+  for (let i = 0; i < localFrames.length; i++) {
+    const roomLabel = localFrames[i].roomLabel || localFrames[i].roomType || "this room";
+    const prior = groups[groups.length - 1];
+    if (prior && prior.roomLabel === roomLabel) {
+      prior.framePaths.push(framePaths[i]);
+      // Group duration = span from the group's own start to the end of
+      // its own last clip (used for the word-budget prompt below). This
+      // is deliberately NOT the same as availableWindow (computed later
+      // in generateNarration from consecutive groups' real startTimes) —
+      // that one accounts for how much real silence exists before the
+      // NEXT group starts talking, which is what actually gates whether
+      // a too-long read needs speed correction.
+      prior.duration = (timeline[i].startTime + timeline[i].duration) - prior.startTime;
+    } else {
+      groups.push({
+        roomLabel,
+        framePaths: [framePaths[i]],
+        startTime: timeline[i].startTime,
+        duration: timeline[i].duration,
+      });
+    }
+  }
+
+  // Cap representative frames per group — a 5-angle primary bedroom
+  // shouldn't send 5 full images to one vision call. Keep first, last,
+  // and evenly spaced frames in between for real angle coverage rather
+  // than just the first N in sequence.
+  groups.forEach((g) => {
+    if (g.framePaths.length > MAX_FRAMES_PER_GROUP) {
+      const step = (g.framePaths.length - 1) / (MAX_FRAMES_PER_GROUP - 1);
+      const keepIndices = [...new Set(
+        Array.from({ length: MAX_FRAMES_PER_GROUP }, (_, k) => Math.round(k * step))
+      )];
+      g.framePaths = keepIndices.map((idx) => g.framePaths[idx]);
+    }
+  });
+
+  return groups.map((g, i) => ({ index: i, ...g }));
+}
+
 // ── SEGMENTED, VISION-GROUNDED SCRIPT ────────────────────────────────────
-// segments: [{ index, roomLabel, framePath, duration }]
+// segments: [{ index, roomLabel, framePaths: [...], duration }] — one or
+// more representative frames per segment (see groupContiguousByRoom).
 // Returns: [{ index, text }] in the same order.
 function generateSegmentedScript(address, segments, apiKey) {
   return new Promise((resolve, reject) => {
     const segmentDescriptions = segments
-      .map((s, i) => `Frame ${i + 1}: "${s.roomLabel}" — target ${wordBudgetForSegment(s.duration)} words max (this segment plays for about ${s.duration.toFixed(1)}s in the final video).`)
+      .map((s, i) => `Group ${i + 1}: "${s.roomLabel}" — ${s.framePaths.length} frame(s) shown for this group — target ${wordBudgetForSegment(s.duration)} words max (this group plays for about ${s.duration.toFixed(1)}s total in the final video).`)
       .join("\n");
 
-    const promptText = `You are writing narration for a real estate video tour. You are shown one still frame from each room, in the order they appear in the video.
+    const promptText = `You are writing narration for a real estate video tour. You are shown one or more still frames per group, grouped in the order they appear in the video. Frames within the same group may be different angles or cropped shots of the SAME physical room — not different rooms — so don't assume they're separate spaces just because the framing looks different.
 
 Address: ${address || "this property"}
 
 ${segmentDescriptions}
 
-Write ONE short narration segment per frame, grounded in what you actually see in that specific photo — real details (finishes, light, layout, a genuine standout feature), not generic room-type filler. This is NOT a mechanical, second-by-second description of the image — it should read like someone who toured the home and picked out what's genuinely worth mentioning, tastefully, in a warm, professional, conversational tone. The segments together should feel like one continuous, cohesive walkthrough — each one can build on the last — not a series of disconnected blurbs.
+Write ONE short narration segment per GROUP (not per frame), grounded in what you actually see, real details (finishes, light, layout, a genuine standout feature), not generic room-type filler. Say the room name ONCE per group, at the start of that group's segment — never re-announce it for each frame within the group. If a group has multiple frames of the same room, let the segment flow as one continuous thought across the angles (e.g. mention a walk-in closet or ensuite bath visible in a later frame as part of the same sentence/thought), only calling out something new if it's genuinely worth mentioning — don't just narrate "here's another view."
+
+This is NOT a mechanical, second-by-second description of each image — it should read like someone who toured the home and picked out what's genuinely worth mentioning, tastefully, in a warm, professional, conversational tone. The segments together should feel like one continuous, cohesive walkthrough — each one can build on the last — not a series of disconnected blurbs.
 
 Rules:
 - Third person only (never "I" or "my listing").
-- Never invent square footage, bedroom/bathroom counts, or amenities not visible in the photo.
-- Respect each segment's word target — it's timed to that specific clip's length; going over means it gets cut off mid-sentence.
-- The FINAL segment should end with a brief, natural closing line inviting a showing — still within that segment's own word limit.
-- Return ONLY a JSON array, nothing else — no markdown fences, no prose before or after. Exact shape: [{"index": 0, "text": "..."}, {"index": 1, "text": "..."}, ...] with exactly ${segments.length} entries, one per frame, in the order shown.`;
+- Never invent square footage, bedroom/bathroom counts, or amenities not visible in the photos.
+- Respect each group's word target — it's timed to that group's real length; going over means it gets cut off mid-sentence.
+- The FINAL group's segment should end with a brief, natural closing line inviting a showing — still within that group's own word limit.
+- Return ONLY a JSON array, nothing else — no markdown fences, no prose before or after. Exact shape: [{"index": 0, "text": "..."}, {"index": 1, "text": "..."}, ...] with exactly ${segments.length} entries, one per group, in the order shown.`;
 
     const content = [{ type: "text", text: promptText }];
-    segments.forEach((s) => {
-      const imageData = fs.readFileSync(s.framePath).toString("base64");
-      content.push({
-        type: "image",
-        source: { type: "base64", media_type: "image/jpeg", data: imageData },
+    segments.forEach((s, i) => {
+      s.framePaths.forEach((framePath) => {
+        const imageData = fs.readFileSync(framePath).toString("base64");
+        content.push({
+          type: "image",
+          source: { type: "base64", media_type: "image/jpeg", data: imageData },
+        });
       });
     });
 
@@ -151,7 +217,7 @@ function generateSegmentAudio(text, voiceId, apiKey, speed) {
 }
 
 // ── ORCHESTRATOR ──────────────────────────────────────────────────────
-// timelineSegments: [{ index, roomLabel, framePath, duration, startTime }]
+// timelineSegments: [{ index, roomLabel, framePaths, duration, startTime }]
 // Returns: { segments: [{ audioPath, startTime, duration, text }], fullScript: string }
 // `duration` in the returned segments is the REAL rendered audio length
 // (after any speed correction), NOT the target clip duration — assemble.js
@@ -208,4 +274,4 @@ async function generateNarration({ address, timelineSegments, voiceId, workDir, 
   };
 }
 
-module.exports = { generateNarration, wordBudgetForSegment };
+module.exports = { generateNarration, wordBudgetForSegment, groupContiguousByRoom };
