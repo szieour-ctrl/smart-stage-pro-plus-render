@@ -10,12 +10,26 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
+// CHANGE (July 2026 — signed-delivery security fix): uploaded as
+// type: "authenticated" now, not the default public "upload" type. This
+// means result.secure_url is NOT usable on its own anymore — Cloudinary
+// will 401 on it without a valid signed token. That's intentional: the
+// finished video is expensive (Kling cost already paid at Generate) and
+// was previously reachable forever by anyone who grabbed the raw URL out
+// of a network response or email. Every consumer of this video now has
+// to mint its own short-lived signed URL at the moment it's actually
+// needed — see signVideoUrl() in video-job.js (Netlify) and the matching
+// helper in compliance-page.js. This function still returns
+// result.secure_url per its existing signature (nothing downstream that
+// calls it changes shape), but that value is now inert on its own and
+// must be passed through signing before it's ever shown to a person.
 async function uploadToCloudinary(outputs, projectId) {
   const urls = {};
 
   for (const [format, localPath] of Object.entries(outputs)) {
     const result = await cloudinary.uploader.upload(localPath, {
       resource_type: "video",
+      type: "authenticated",
       folder: `smart-stage-pro-plus/${projectId}`,
       public_id: `video_${format}_${Date.now()}`,
       overwrite: false,
