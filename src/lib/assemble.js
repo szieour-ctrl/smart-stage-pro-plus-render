@@ -255,14 +255,14 @@ function xfadeChain(paths, durations, workDir, outputName) {
 // complex filter graph. An 11-clip job rendered fine; 17 didn't — a real
 // scaling ceiling, not a one-off.
 //
-// LOWERED to 4 (July 15, 2026): the first fix used 6, batched through a
-// concurrency pool, and crashed again on a 20-clip job — but that crash
-// happened under concurrent-batch contention (see the sequential-
-// processing fix in concatenateClips below), so it never actually
-// confirmed whether 6 holds in true isolation. Given two real production
-// failures already, dropping to 4 as added margin rather than re-testing
-// at exactly the same untested number.
-const XFADE_BATCH_SIZE = 4;
+// LOWERED to 3 (July 15, 2026 — same exact death, second time in a row,
+// now with even longer clips than the first failure — 11.2s padded vs
+// 9.52s last time, same silent cutoff right after the last clip
+// normalizes, right at the transition into concatenation's heaviest
+// phase). Memory graph data was inconclusive on the first failure, but
+// two consecutive identical deaths at growing clip sizes is a strong
+// enough pattern to act on rather than wait for cleaner metrics.
+const XFADE_BATCH_SIZE = 3;
 
 // ── CONCATENATE CLIPS (batched) ───────────────────────────────────────
 async function concatenateClips(clipPaths, workDir) {
@@ -327,6 +327,20 @@ async function concatenateClips(clipPaths, workDir) {
       batchOutputs.push(
         await xfadeChain(batches[i].paths, batches[i].durations, workDir, `concat_r${round}_${i}.mp4`)
       );
+    }
+
+    // NEW (July 15, 2026 — same crash, second time in a row, at growing
+    // clip sizes): every normalized clip and every prior round's
+    // intermediate files were sitting on disk for the ENTIRE render with
+    // zero cleanup — a real, growing footprint as clip durations
+    // increased this session (padded clips went from 7.52s to 9.52s to
+    // 11.2s across three consecutive test rounds). currentPaths here are
+    // exactly what THIS round just consumed as input and will never be
+    // read again — safe to delete now that their outputs exist on disk.
+    // Best-effort: a failed cleanup should never crash the render over
+    // something that was only ever a disk-space optimization.
+    for (const consumedPath of currentPaths) {
+      try { fs.unlinkSync(consumedPath); } catch (err) { /* non-fatal */ }
     }
 
     currentDurations = await Promise.all(batchOutputs.map(probeDuration));
