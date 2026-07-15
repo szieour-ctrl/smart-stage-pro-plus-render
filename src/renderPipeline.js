@@ -67,7 +67,14 @@ async function processRenderJob(job) {
     // buildKlingRequest), and while it does round fractional requests
     // itself, staying whole here avoids an unnecessary round-trip through
     // that rounding logic for the common case.
-    const NARRATION_INTRO_OUTRO_PADDING_SECONDS = 3;
+    // RAISED from 3 to 5 (Sam's feedback, real render — outro cut off
+    // mid-sentence): mixAudio's NARRATION_END_BUFFER_SECONDS (2s) is now
+    // subtracted from the last group's usable duration when its word
+    // budget is calculated (see groupContiguousByRoom in narrationGen.js)
+    // — so net real extra room for the outro was only 3-2=1s at the old
+    // padding value, too thin for a full closing line. 5s padding now
+    // nets ~3s of real usable extra time after that subtraction.
+    const NARRATION_INTRO_OUTRO_PADDING_SECONDS = 5;
     if (job.wantsNarration && localFrames.length > 0) {
       const first = localFrames[0];
       first.durationSeconds = resolveDuration(first) + NARRATION_INTRO_OUTRO_PADDING_SECONDS;
