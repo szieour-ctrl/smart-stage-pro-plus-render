@@ -397,17 +397,13 @@ function mixAudio(videoPath, musicPath, workDir, narrationSegments) {
         narrationSegments.forEach((seg) => command.input(seg.audioPath));
 
         filterParts = [
-          // FIX (Sam's feedback, real render — music drowned narration):
-          // the no-narration branch below reduces music to volume=0.6 as
-          // a baseline. This branch never had that at all — it relied
-          // entirely on sidechaincompress to duck music under speech,
-          // which only reacts to speech peaks and doesn't lower the
-          // floor between phrases/words. Adding an explicit baseline cut
-          // here too (lower than 0.6 — narration needs to stay
-          // intelligible over it, not just quieter), with sidechain
-          // ducking still layered on top for extra reduction during
-          // actual speech.
-          `[1:a]afade=t=in:st=0:d=1,afade=t=out:st=${fadeOutStart.toFixed(2)}:d=1.5,volume=0.35[music_faded]`,
+          // FIX #2 (Sam's feedback, real render — still too loud): 0.35
+          // wasn't enough headroom. Dropping further to 0.2, and
+          // tightening the sidechain ducking itself (lower threshold =
+          // engages more easily, higher ratio = ducks harder once
+          // engaged) so music is genuinely a soft bed under narration,
+          // not competing with it.
+          `[1:a]afade=t=in:st=0:d=1,afade=t=out:st=${fadeOutStart.toFixed(2)}:d=1.5,volume=0.2[music_faded]`,
         ];
 
         // Each segment: fade in/out on its OWN local timeline (0..its own
@@ -456,7 +452,7 @@ function mixAudio(videoPath, musicPath, workDir, narrationSegments) {
         filterParts.push(`[narration_all]atrim=end=${narrationEndCap.toFixed(2)},asplit=2[narration_for_sidechain][narration_for_mix]`);
 
         filterParts.push(
-          `[music_faded][narration_for_sidechain]sidechaincompress=threshold=0.05:ratio=8:attack=5:release=300[music_ducked]`,
+          `[music_faded][narration_for_sidechain]sidechaincompress=threshold=0.02:ratio=15:attack=5:release=300[music_ducked]`,
           `[music_ducked][narration_for_mix]amix=inputs=2:duration=longest:dropout_transition=2[premix]`,
           `[premix]loudnorm=I=-16:TP=-1.5:LRA=11[audio_out]`,
         );
@@ -506,8 +502,93 @@ function renderFormat(inputPath, dimensions, workDir, outputName) {
 
 // ── ENTRY POINT ────────────────────────────────────────────────────────
 
-async function assembleVideo({ clipPaths, musicPath, narrationSegments, formats, workDir }) {
-  const concatenated = await concatenateClips(clipPaths, workDir);
+// ── CLOSING CARD (Sam's idea, built July 15, 2026) ──────────────────────
+// Text fades in the instant narration's LAST spoken word actually ends
+// (not the clip's nominal duration — the real, possibly speed-corrected
+// end timestamp, passed in from renderPipeline.js), holds through the
+// video's own natural tail. That tail already exists by design: mixAudio
+// reserves NARRATION_END_BUFFER_SECONDS (2s) of narration-free video at
+// the very end specifically so speech never gets cut off by the video
+// ending — this reuses that exact same reserved window rather than
+// adding new video length on top of it.
+//
+// Background is the LAST frame's real source still (not a video-
+// extracted frame) at reduced opacity, overlaid on whatever's already
+// playing at that point in the timeline (the tail of the last clip's own
+// motion) rather than a hard cut to a static image — reads as the shot
+// settling into a closing card, not an abrupt swap.
+//
+// Gracefully skipped (returns the input path unchanged) if timing
+// doesn't make sense — e.g. narration ran long enough that there's no
+// real tail left to show a card in. A closing card is a nice-to-have;
+// it should never be the reason a render fails.
+function escapeDrawtext(text) {
+  // ffmpeg drawtext treats \ : ' as filter-syntax-significant — escape
+  // them so an address with an apostrophe or a colon doesn't break the
+  // filter graph or get silently mangled.
+  return text.replace(/\\/g, "\\\\\\\\").replace(/:/g, "\\:").replace(/'/g, "\u2019");
+}
+
+async function applyClosingCard(videoPath, workDir, { stillImagePath, text, narrationEndTime, videoDuration }) {
+  const tailAvailable = videoDuration - narrationEndTime;
+  if (tailAvailable < 0.8) {
+    console.warn(`Closing card skipped — only ${tailAvailable.toFixed(2)}s of tail after narration ends, not enough to show it meaningfully.`);
+    return videoPath;
+  }
+
+  const outputPath = path.join(workDir, "with_closing_card.mp4");
+  const fadeInDuration = 0.6;
+  const enableExpr = `gte(t,${narrationEndTime.toFixed(2)})`;
+  const alphaExpr = `if(lt(t,${narrationEndTime.toFixed(2)}),0,min(1,(t-${narrationEndTime.toFixed(2)})/${fadeInDuration}))`;
+
+  return new Promise((resolve, reject) => {
+    const command = ffmpeg()
+      .input(videoPath)
+      .input(stillImagePath)
+      .inputOptions(["-loop", "1"]); // still image held as a continuous stream for the overlay's enable window to gate against
+
+    const filterParts = [
+      // Fill-crop the still to the video's own frame size, then dim it —
+      // aa=0.45 means it reads as a backdrop, not a full replacement of
+      // whatever's already on screen underneath.
+      `[1:v]scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,format=rgba,colorchannelmixer=aa=0.45[dimmed_still]`,
+      `[0:v][dimmed_still]overlay=0:0:enable='${enableExpr}':shortest=0[with_still]`,
+      `[with_still]drawtext=text='${escapeDrawtext(text)}':fontcolor=white:fontsize=54:fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:borderw=2:bordercolor=black@0.6:x=(w-text_w)/2:y=(h-text_h)/2:alpha='${alphaExpr}':enable='${enableExpr}'[outv]`,
+    ];
+
+    command
+      .complexFilter(filterParts)
+      .outputOptions(["-map", "[outv]", "-map", "0:a?", "-c:a", "copy", "-pix_fmt", "yuv420p", "-shortest"])
+      .output(outputPath)
+      .on("end", () => resolve(outputPath))
+      .on("error", (err) => {
+        // Non-fatal by design — see header comment. A closing-card
+        // filter-graph issue (bad font path, escaping edge case) should
+        // degrade to "no closing card," never fail the whole render.
+        console.warn(`Closing card overlay failed (non-fatal, video proceeds without it): ${err.message}`);
+        resolve(videoPath);
+      })
+      .run();
+  });
+}
+
+async function assembleVideo({ clipPaths, musicPath, narrationSegments, formats, workDir, closingCard }) {
+  let concatenated = await concatenateClips(clipPaths, workDir);
+
+  // Closing card runs on the pure video track, BEFORE mixAudio — mixAudio
+  // does -c:v copy (passthrough, no video re-encode), so any video-level
+  // compositing has to happen before it, not after.
+  if (closingCard && narrationSegments && narrationSegments.length > 0) {
+    const lastSeg = narrationSegments[narrationSegments.length - 1];
+    const narrationEndTime = lastSeg.startTime + lastSeg.duration;
+    const videoDuration = await probeDuration(concatenated);
+    concatenated = await applyClosingCard(concatenated, workDir, {
+      stillImagePath: closingCard.stillImagePath,
+      text: closingCard.text,
+      narrationEndTime,
+      videoDuration,
+    });
+  }
 
   // CHANGE (July 14, 2026 — footage-grounded narration rebuild):
   // narrationSegments now arrives pre-generated (audio already downloaded
