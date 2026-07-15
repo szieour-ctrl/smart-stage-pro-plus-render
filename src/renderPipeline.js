@@ -304,12 +304,26 @@ async function processRenderJob(job) {
     console.log(`[${job.jobId}] Music ready: ${musicPath}`);
 
     // ── Step 4: Assemble clips + music (+ optional narration) into final formats
+    // Closing card (Sam's idea, July 15, 2026): only meaningful if
+    // narration actually produced real segments — no narration means no
+    // "end of narration" moment to fade in on. Text degrades gracefully
+    // if address is missing (still shows the CTA alone) rather than
+    // skipping the card entirely.
+    const lastFrame = localFrames[localFrames.length - 1];
+    const closingCard = (narrationSegments && narrationSegments.length > 0)
+      ? {
+          stillImagePath: lastFrame.localPath,
+          text: job.address ? `${job.address} \u00b7 Schedule Your Private Showing` : "Schedule Your Private Showing",
+        }
+      : null;
+
     const outputs = await assembleVideo({
       clipPaths,
       musicPath,
       narrationSegments,
       formats: job.formats || ["16x9", "9x16"],
       workDir,
+      closingCard,
     });
     console.log(`[${job.jobId}] Assembled ${Object.keys(outputs).length} formats.`);
 
