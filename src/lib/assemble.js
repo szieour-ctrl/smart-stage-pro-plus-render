@@ -232,11 +232,31 @@ function xfadeChain(paths, durations, workDir, outputName) {
       cumulativeOffset += durations[i] - CROSSFADE_DURATION;
     }
 
+    // NEW (July 15, 2026 — real render hang, 32+ minutes of total
+    // silence with the process itself still healthy per the memory
+    // logger): nothing previously bounded how long a single xfadeChain
+    // ffmpeg call could run. If the process spawns and then genuinely
+    // never emits 'end' OR 'error' — a real ffmpeg hang, not a crash —
+    // this used to wait forever with zero recourse. XFADE_TIMEOUT_MS
+    // gives it a generous window (this file's own batches are small,
+    // ≤3 clips each) before force-killing the process and failing
+    // cleanly instead of silently consuming Railway resources forever.
+    const XFADE_TIMEOUT_MS = 120000; // 2 minutes — generous for a ≤3-clip batch
+    let settled = false;
+    const timeoutHandle = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      console.error(`[xfadeChain] TIMEOUT after ${XFADE_TIMEOUT_MS}ms — killing hung ffmpeg process for ${outputPath}.`);
+      try { command.kill("SIGKILL"); } catch (err) { /* best-effort */ }
+      reject(new Error(`xfadeChain timed out after ${XFADE_TIMEOUT_MS}ms for ${outputPath} — ffmpeg process spawned but never completed or errored.`));
+    }, XFADE_TIMEOUT_MS);
+
     command
       .complexFilter(filterParts)
       .outputOptions(["-map", "[outv]", "-pix_fmt", "yuv420p"])
       .output(outputPath)
       .on("end", async () => {
+        if (settled) return;
         // FIX (July 15, 2026 — real render failure): ffmpeg's 'end' event
         // firing means the PROCESS reported success, but on a container
         // filesystem under I/O load (which a render with several
@@ -256,14 +276,24 @@ function xfadeChain(paths, durations, workDir, outputName) {
         // event's timing blindly.
         for (let attempt = 0; attempt < 5; attempt++) {
           if (fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0) {
+            settled = true;
+            clearTimeout(timeoutHandle);
             resolve(outputPath);
             return;
           }
           await new Promise((r) => setTimeout(r, 200));
         }
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeoutHandle);
         reject(new Error(`xfadeChain reported success but ${outputPath} never became visible on disk after 1s of polling.`));
       })
-      .on("error", (err) => reject(new Error(`Concatenation failed: ${err.message}`)))
+      .on("error", (err) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeoutHandle);
+        reject(new Error(`Concatenation failed: ${err.message}`));
+      })
       .run();
   });
 }
@@ -350,9 +380,10 @@ async function concatenateClips(clipPaths, workDir) {
 
     const batchOutputs = [];
     for (let i = 0; i < batches.length; i++) {
-      batchOutputs.push(
-        await xfadeChain(batches[i].paths, batches[i].durations, workDir, `concat_r${round}_${i}.mp4`)
-      );
+      console.log(`[concatenateClips] Round ${round}, batch ${i}/${batches.length - 1} starting (${batches[i].paths.length} clips)...`);
+      const out = await xfadeChain(batches[i].paths, batches[i].durations, workDir, `concat_r${round}_${i}.mp4`);
+      console.log(`[concatenateClips] Round ${round}, batch ${i}/${batches.length - 1} done.`);
+      batchOutputs.push(out);
     }
 
     // NEW (July 15, 2026 — same crash, second time in a row, at growing
