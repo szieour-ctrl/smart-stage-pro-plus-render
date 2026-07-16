@@ -24,11 +24,17 @@ const fs = require("fs");
 const path = require("path");
 const { probeDuration, NARRATION_END_BUFFER_SECONDS } = require("./assemble");
 
-const SPEAKING_RATE_WORDS_PER_MINUTE = 150;
+const SPEAKING_RATE_WORDS_PER_MINUTE = 135; // LOWERED from 150 (Sam's feedback, real render — narration almost universally hit MAX_SPEED and still ran over): extra safety margin on top of the content-ambition fix below, which is the primary cause.
 const MIN_SEGMENT_WORDS = 6; // even a 3-second bathroom shot gets a real sentence, not one word
 const MIN_SPEED = 0.7;
 const MAX_SPEED = 1.2; // ElevenLabs' real supported range — confirmed via voice_settings.speed
 const MAX_FRAMES_PER_GROUP = 4; // cap on how many representative stills go to one vision call per group
+// NEW (Sam's feedback — "there is never a breath between clips"): segments
+// were timed to fit right up to the instant the NEXT one starts, with zero
+// deliberate silence built in. Subtracting this from the available window
+// (below) guarantees real, audible breathing room between rooms instead of
+// narration butting up against itself.
+const SEGMENT_BREATHING_ROOM_SECONDS = 0.5;
 
 function wordBudgetForSegment(durationSeconds) {
   // Slightly tighter than the whole-video version this replaces (no
@@ -164,15 +170,16 @@ Address: ${address || "this property"}
 
 ${segmentDescriptions}
 
-Write ONE short narration segment per GROUP (not per frame), grounded in what you actually see, real details (finishes, light, layout, a genuine standout feature), not generic room-type filler. Say a room's name once when you start describing it — don't re-announce it for every frame that's clearly still the same space — but if the group turns out to span more than one real room (see above), make sure narration reflects that rather than silently describing only one of them.
+Write ONE short narration segment per GROUP (not per frame). Pick exactly ONE specific, vivid detail per group — not a list, not room type plus finishes plus layout plus a value statement. One real, grounded observation (a material, a light quality, a single standout feature) said naturally, the way someone would mention the one thing that actually caught their eye walking through — not an inventory of the room. Say the room's name once when you start describing it — don't re-announce it for every frame that's clearly still the same space — but if the group turns out to span more than one real room (see above), make sure narration reflects that rather than silently describing only one of them.
 
-This is NOT a mechanical, second-by-second description of each image — it should read like someone who toured the home and picked out what's genuinely worth mentioning, tastefully, in a warm, professional, conversational tone. The segments together should feel like one continuous, cohesive walkthrough — each one can build on the last — not a series of disconnected blurbs.
+This is NOT a mechanical, second-by-second description of each image, and it is NOT a features list — it should read like someone who toured the home and mentioned the ONE thing worth noting about each room in passing, tastefully, in a warm, professional, conversational tone, then moved on. The segments together should feel like one continuous, cohesive walkthrough — each one can build on the last — not a series of disconnected blurbs, and never more than ONE sentence, two at the absolute most, per group.
 
 Rules:
 - Third person only (never "I" or "my listing").
 - Never invent square footage, bedroom/bathroom counts, or amenities not visible in the photos.
+- ONE sentence per group. Two only if both are short. This is the single most important constraint — a segment that tries to name the room, list what's in it, AND editorialize about value will not fit its window and will get cut off mid-sentence. Pick the one detail that matters most and say only that.
 - Respect each group's word target — it's timed to that group's real length; going over means it gets cut off mid-sentence.
-- The FINAL group's segment should end with a brief, natural closing line inviting a showing — still within that group's own word limit.
+- The FINAL group's segment should end with a brief, natural closing line inviting a showing — still one sentence, still within that group's own word limit, not stacked on top of a full room description.
 - Return ONLY a JSON array, nothing else — no markdown fences, no prose before or after. Exact shape: [{"index": 0, "text": "..."}, {"index": 1, "text": "..."}, ...] with exactly ${segments.length} entries, one per group, in the order shown.`;
 
     const content = [{ type: "text", text: promptText }];
@@ -291,7 +298,7 @@ async function generateNarration({ address, timelineSegments, voiceId, workDir, 
     // clip's own nominal duration. Two segments back-to-back with no gap
     // between them is exactly the overlap risk this whole fix closes.
     const nextSeg = timelineSegments[i + 1];
-    const availableWindow = nextSeg ? (nextSeg.startTime - seg.startTime) : seg.duration;
+    const availableWindow = Math.max(1, (nextSeg ? (nextSeg.startTime - seg.startTime) : seg.duration) - SEGMENT_BREATHING_ROOM_SECONDS);
 
     let audioBuffer = await generateSegmentAudio(scriptEntry.text, voiceId, elevenLabsKey);
     let audioPath = path.join(workDir, `narration_seg_${seg.index}.mp3`);
