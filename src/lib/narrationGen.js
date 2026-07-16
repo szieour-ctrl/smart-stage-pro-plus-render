@@ -170,6 +170,8 @@ Address: ${address || "this property"}
 
 ${segmentDescriptions}
 
+IMPORTANT — exterior accuracy: for any group whose room label suggests an EXTERIOR shot (exterior, yard, backyard, front yard, pool, patio, curb appeal), be cautious about ONE specific thing: this platform sometimes adds outdoor furniture/staging (a firepit, patio dining set, planters) or enhances landscaping (fresh lawn, trimmed hedges, seasonal flowers) that may not reflect the property's real, permanent condition. Do NOT describe added outdoor furniture or specific landscaping details (lawn condition, plantings, hedges) as if they're confirmed, permanent features of the property. Time of day and lighting (golden hour warmth, twilight glow) ARE safe to describe normally — that's just atmosphere, not a factual claim about the property itself. Stick to the home's own architectural features (roofline, siding material, window style) plus safe lighting/mood description; just avoid asserting specific outdoor furnishings or landscaping as real. Interior rooms don't need this caution; describe what you actually see in interiors normally.
+
 Write ONE short narration segment per GROUP (not per frame). Pick exactly ONE specific, vivid detail per group — not a list, not room type plus finishes plus layout plus a value statement. One real, grounded observation (a material, a light quality, a single standout feature) said naturally, the way someone would mention the one thing that actually caught their eye walking through — not an inventory of the room. Say the room's name once when you start describing it — don't re-announce it for every frame that's clearly still the same space — but if the group turns out to span more than one real room (see above), make sure narration reflects that rather than silently describing only one of them.
 
 This is NOT a mechanical, second-by-second description of each image, and it is NOT a features list — it should read like someone who toured the home and mentioned the ONE thing worth noting about each room in passing, tastefully, in a warm, professional, conversational tone, then moved on. The segments together should feel like one continuous, cohesive walkthrough — each one can build on the last — not a series of disconnected blurbs, and never more than ONE sentence, two at the absolute most, per group.
@@ -304,6 +306,7 @@ async function generateNarration({ address, timelineSegments, voiceId, workDir, 
     let audioPath = path.join(workDir, `narration_seg_${seg.index}.mp3`);
     fs.writeFileSync(audioPath, audioBuffer);
     let realDuration = await probeDuration(audioPath);
+    let appliedSpeed = 1.0; // NEW — tracked outside the if-block below so the wpm log after it can always reference it safely, whether or not correction actually ran
 
     // Only correct when the real read is actually TOO LONG for its
     // window — a segment that finishes early is never a problem (silence
@@ -313,12 +316,25 @@ async function generateNarration({ address, timelineSegments, voiceId, workDir, 
     // rather than distort the voice further — assemble.js's per-segment
     // cap (see mixAudio) is the final backstop for that rare case.
     if (realDuration > availableWindow) {
-      const correctionSpeed = Math.min(MAX_SPEED, Math.max(MIN_SPEED, realDuration / availableWindow));
-      console.warn(`Narration segment ${seg.index}: ${realDuration.toFixed(2)}s ran over its ${availableWindow.toFixed(2)}s window — regenerating at speed=${correctionSpeed.toFixed(2)}.`);
-      audioBuffer = await generateSegmentAudio(scriptEntry.text, voiceId, elevenLabsKey, correctionSpeed);
+      appliedSpeed = Math.min(MAX_SPEED, Math.max(MIN_SPEED, realDuration / availableWindow));
+      console.warn(`Narration segment ${seg.index}: ${realDuration.toFixed(2)}s ran over its ${availableWindow.toFixed(2)}s window — regenerating at speed=${appliedSpeed.toFixed(2)}.`);
+      audioBuffer = await generateSegmentAudio(scriptEntry.text, voiceId, elevenLabsKey, appliedSpeed);
       fs.writeFileSync(audioPath, audioBuffer);
       realDuration = await probeDuration(audioPath);
     }
+
+    // NEW (Sam's question — is one voice's pace better matched than the
+    // other, and what's the actual wpm): ElevenLabs has no direct wpm
+    // setting, only a speed MULTIPLIER on top of each voice's own
+    // inherent pace (baked in from its training audio) — so different
+    // voices genuinely can sound faster/slower at the identical speed
+    // value. Rather than guess, log the REAL measured wpm per segment —
+    // actual word count over actual final audio duration, correcting for
+    // the speed multiplier already applied — so real data accumulates
+    // across renders instead of a one-off estimate.
+    const wordCount = scriptEntry.text.trim().split(/\s+/).length;
+    const measuredWpm = (wordCount / realDuration) * 60;
+    console.log(`[narration wpm] segment ${seg.index}: voiceId=${voiceId} words=${wordCount} duration=${realDuration.toFixed(2)}s speed=${appliedSpeed.toFixed(2)} → ${measuredWpm.toFixed(0)} wpm`);
 
     results.push({ audioPath, startTime: seg.startTime, duration: realDuration, availableWindow, text: scriptEntry.text });
   }
