@@ -160,6 +160,28 @@ function probeDuration(clipPath) {
   });
 }
 
+// NEW (July 16, 2026 — real render error: closing-card append failed with
+// "Error reinitializing filters! ... Invalid argument" on stream #1:0 —
+// a genuine format mismatch, not the old resource-exhaustion signature.
+// No fps was ever explicitly enforced anywhere in this pipeline; the main
+// concatenated video's effective fps just drifts from whatever the
+// original clips + several rounds of xfadeChain re-encoding happen to
+// produce, while a fresh -loop 1 single-image render defaults to
+// whatever ffmpeg's own default is — those two don't reliably match.
+// Probing the real value and forcing the closing card to it explicitly
+// closes that gap instead of assuming a hardcoded number.
+function probeFps(clipPath) {
+  return new Promise((resolve, reject) => {
+    ffmpeg.ffprobe(clipPath, (err, metadata) => {
+      if (err) return reject(new Error(`ffprobe (fps) failed for ${clipPath}: ${err.message}`));
+      const videoStream = (metadata.streams || []).find(s => s.codec_type === "video");
+      const rateStr = videoStream?.r_frame_rate || "30/1";
+      const [num, den] = rateStr.split("/").map(Number);
+      resolve(den ? num / den : 30);
+    });
+  });
+}
+
 // ── COMPUTE CLIP TIMELINE (July 2026 — footage-grounded narration) ──────
 // Extracted from concatenateClips' own offset math below — previously
 // that math only existed inline, computed and discarded per-transition,
@@ -484,7 +506,7 @@ function mixAudio(videoPath, musicPath, workDir, narrationSegments) {
           // engages more easily, higher ratio = ducks harder once
           // engaged) so music is genuinely a soft bed under narration,
           // not competing with it.
-          `[1:a]afade=t=in:st=0:d=1,afade=t=out:st=${fadeOutStart.toFixed(2)}:d=1.5,volume=0.2[music_faded]`,
+          `[1:a]afade=t=in:st=0:d=1,afade=t=out:st=${fadeOutStart.toFixed(2)}:d=1.5,volume=0.3[music_faded]`,
         ];
 
         // Each segment: fade in/out on its OWN local timeline (0..its own
@@ -548,7 +570,7 @@ function mixAudio(videoPath, musicPath, workDir, narrationSegments) {
         filterParts.push(`[narration_all]atrim=end=${narrationEndCap.toFixed(2)},asplit=2[narration_for_sidechain][narration_for_mix]`);
 
         filterParts.push(
-          `[music_faded][narration_for_sidechain]sidechaincompress=threshold=0.02:ratio=15:attack=5:release=300[music_ducked]`,
+          `[music_faded][narration_for_sidechain]sidechaincompress=threshold=0.03:ratio=10:attack=5:release=300[music_ducked]`,
           `[music_ducked][narration_for_mix]amix=inputs=2:duration=longest:dropout_transition=2[premix]`,
           // FIX #3 (Sam's feedback, real render — still no noticeable
           // volume change despite two real upstream fixes): loudnorm
@@ -665,7 +687,7 @@ function escapeDrawtext(text) {
 const CLOSING_CARD_DURATION_SECONDS = 4.0;
 const CLOSING_CARD_FADE_SECONDS = 0.6;
 
-function renderClosingCardClip(stillImagePath, text, workDir) {
+function renderClosingCardClip(stillImagePath, text, workDir, fps) {
   return new Promise((resolve, reject) => {
     const outputPath = path.join(workDir, "closing_card.mp4");
     const command = ffmpeg()
@@ -708,7 +730,7 @@ function renderClosingCardClip(stillImagePath, text, workDir) {
 
     command
       .complexFilter(filterParts)
-      .outputOptions(["-map", "[outv]", "-pix_fmt", "yuv420p"])
+      .outputOptions(["-map", "[outv]", "-r", fps.toFixed(3), "-pix_fmt", "yuv420p"])
       .output(outputPath)
       .on("end", () => {
         if (settled) return;
@@ -740,7 +762,8 @@ async function assembleVideo({ clipPaths, musicPath, narrationSegments, formats,
   if (closingCard && narrationSegments && narrationSegments.length > 0) {
     try {
       const videoDuration = await probeDuration(concatenated);
-      const cardPath = await renderClosingCardClip(closingCard.stillImagePath, closingCard.text, workDir);
+      const fps = await probeFps(concatenated);
+      const cardPath = await renderClosingCardClip(closingCard.stillImagePath, closingCard.text, workDir, fps);
       concatenated = await xfadeChain(
         [concatenated, cardPath],
         [videoDuration, CLOSING_CARD_DURATION_SECONDS],
