@@ -626,23 +626,58 @@ async function applyClosingCard(videoPath, workDir, { stillImagePath, text, narr
     const command = ffmpeg()
       .input(videoPath)
       .input(stillImagePath)
-      .inputOptions(["-loop", "1"]); // still image held as a continuous stream for the overlay's enable window to gate against
+      // FIX (July 15, 2026 — real render hang, confirmed root cause):
+      // -loop 1 with no duration cap makes this an INFINITE stream.
+      // Combined with overlay's shortest=0 below (which explicitly told
+      // ffmpeg not to end the output when the shorter input finishes),
+      // the filter graph had no natural end — it could run forever, no
+      // crash, no error, just never completing. That's exactly what a
+      // silent hang looks like. Capping the loop to videoDuration makes
+      // this a finite stream from the start, matching the main video's
+      // own length, so there's no ambiguity for "shortest" semantics to
+      // get wrong.
+      .inputOptions(["-loop", "1", "-t", videoDuration.toFixed(2)]);
 
     const filterParts = [
       // Fill-crop the still to the video's own frame size, then dim it —
       // aa=0.45 means it reads as a backdrop, not a full replacement of
       // whatever's already on screen underneath.
       `[1:v]scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,format=rgba,colorchannelmixer=aa=0.45[dimmed_still]`,
-      `[0:v][dimmed_still]overlay=0:0:enable='${enableExpr}':shortest=0[with_still]`,
+      // shortest=0 REMOVED — both inputs are finite now (see the -t fix
+      // above), so there's nothing left for that override to protect
+      // against, and it was the other half of the hang.
+      `[0:v][dimmed_still]overlay=0:0:enable='${enableExpr}'[with_still]`,
       `[with_still]drawtext=text='${escapeDrawtext(text)}':fontcolor=white:fontsize=54:fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:borderw=2:bordercolor=black@0.6:x=(w-text_w)/2:y=(h-text_h)/2:alpha='${alphaExpr}':enable='${enableExpr}'[outv]`,
     ];
+
+    // NEW — same hard-timeout principle as xfadeChain's fix earlier this
+    // session: if this filter graph somehow hangs again despite the fix
+    // above, it now fails within a bounded window instead of running
+    // for 32+ minutes with zero recourse.
+    const CLOSING_CARD_TIMEOUT_MS = 60000;
+    let settled = false;
+    const timeoutHandle = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      console.warn(`Closing card overlay timed out after ${CLOSING_CARD_TIMEOUT_MS}ms — killing process, proceeding without it.`);
+      try { command.kill("SIGKILL"); } catch (err) { /* best-effort */ }
+      resolve(videoPath);
+    }, CLOSING_CARD_TIMEOUT_MS);
 
     command
       .complexFilter(filterParts)
       .outputOptions(["-map", "[outv]", "-map", "0:a?", "-c:a", "copy", "-pix_fmt", "yuv420p", "-shortest"])
       .output(outputPath)
-      .on("end", () => resolve(outputPath))
+      .on("end", () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeoutHandle);
+        resolve(outputPath);
+      })
       .on("error", (err) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeoutHandle);
         // Non-fatal by design — see header comment. A closing-card
         // filter-graph issue (bad font path, escaping edge case) should
         // degrade to "no closing card," never fail the whole render.
