@@ -535,7 +535,19 @@ function mixAudio(videoPath, musicPath, workDir, narrationSegments) {
         filterParts.push(
           `[music_faded][narration_for_sidechain]sidechaincompress=threshold=0.02:ratio=15:attack=5:release=300[music_ducked]`,
           `[music_ducked][narration_for_mix]amix=inputs=2:duration=longest:dropout_transition=2[premix]`,
-          `[premix]loudnorm=I=-16:TP=-1.5:LRA=11[audio_out]`,
+          // FIX #3 (Sam's feedback, real render — still no noticeable
+          // volume change despite two real upstream fixes): loudnorm
+          // here was normalizing the COMBINED mix's overall integrated
+          // loudness to -16 LUFS, with zero awareness of the internal
+          // music/narration balance everything upstream was carefully
+          // tuning. If hitting that target meant boosting music's
+          // relative contribution back up, loudnorm would do exactly
+          // that — silently undoing the volume=0.2 + sidechain ducking
+          // work above. Replaced with alimiter, which only prevents
+          // clipping (a safety ceiling) and does nothing to re-balance
+          // the mix — so the upstream tuning actually survives to the
+          // final output now.
+          `[premix]alimiter=limit=0.95[audio_out]`,
         );
       } else {
         filterParts = [
@@ -647,7 +659,28 @@ async function applyClosingCard(videoPath, workDir, { stillImagePath, text, narr
       // above), so there's nothing left for that override to protect
       // against, and it was the other half of the hang.
       `[0:v][dimmed_still]overlay=0:0:enable='${enableExpr}'[with_still]`,
-      `[with_still]drawtext=text='${escapeDrawtext(text)}':fontcolor=white:fontsize=54:fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:borderw=2:bordercolor=black@0.6:x=(w-text_w)/2:y=(h-text_h)/2:alpha='${alphaExpr}':enable='${enableExpr}'[outv]`,
+      // FIX (July 15/16, 2026 — closing card hung TWICE now, second
+      // time even after the -t duration-cap fix): total silence for the
+      // FULL 60s timeout both times, no partial progress — that pattern
+      // fits a hang during filter/font INITIALIZATION more than genuine
+      // ongoing processing. The hardcoded fontfile path was always the
+      // riskiest, most container-specific guess in this whole function
+      // (flagged as an open risk when this was first built). Confirmed
+      // via this ffmpeg build's own banner (from the very first
+      // concatenation crash log this session) that --enable-libfontconfig
+      // --enable-libfreetype are both compiled in — so a fontconfig
+      // family-name lookup (font=) works without needing to know an
+      // exact file path that may not exist in this specific container,
+      // unlike fontfile= which requires the literal path to be correct.
+      // FURTHER SAFETY (Sam's follow-up — right instinct to keep pushing
+      // on this): a family-name lookup (font='DejaVu Sans Bold') still
+      // bets that specific font is installed and indexed by fontconfig
+      // in this container. Dropping the font parameter entirely removes
+      // that guess too — drawtext falls back to whatever fontconfig
+      // resolves as a default, which only fails if this container has
+      // NO fonts installed at all (a much narrower, easier-to-diagnose
+      // failure than "this exact family isn't the one installed").
+      `[with_still]drawtext=text='${escapeDrawtext(text)}':fontcolor=white:fontsize=54:borderw=2:bordercolor=black@0.6:x=(w-text_w)/2:y=(h-text_h)/2:alpha='${alphaExpr}':enable='${enableExpr}'[outv]`,
     ];
 
     // NEW — same hard-timeout principle as xfadeChain's fix earlier this
