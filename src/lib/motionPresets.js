@@ -25,19 +25,28 @@ const AUTO_PRESETS = {
 };
 
 // Default shot duration by room type
-// RAISED +0.7s across the board (Sam's feedback, real render — "timing
-// on the single frames is about .7s too short and the narration can't
-// breathe... bedroom frames are a blip"). Flat increase, not per-type
-// tuning — the complaint was general, not room-specific.
+// RAISED again (Sam's feedback, real render — "Bedroom durations are not
+// nearly long enough for narration"): the earlier +0.7s flat bump was
+// real and did apply correctly (confirmed against actual rendered clip
+// durations), but it didn't fully account for a second-order effect of
+// the room-disambiguation fix earlier this session (narrationGen.js's
+// REUSABLE_ROOM_TYPES) — correctly-separated bedrooms/bathrooms/etc. now
+// mostly end up as SINGLE-clip narration segments instead of merged
+// multi-clip groups. A single clip's actual usable narration window is
+// its duration minus crossfade overlap on BOTH sides (~1.2s total,
+// CROSSFADE_DURATION twice), not the raw clip length — so these room
+// types specifically needed more headroom than the flat bump gave them.
+// Kitchen/dining/exterior/living aren't in REUSABLE_ROOM_TYPES (rarely
+// duplicated per listing), so they're unaffected and left as-is.
 const DEFAULT_DURATIONS = {
   exterior: 6.2,
   living:   6.2,
   kitchen:  5.2,
   dining:   4.7,
-  bedroom:  5.2,
-  bathroom: 3.7,
-  flex:     4.7,
-  default:  5.2,
+  bedroom:  6.8,
+  bathroom: 5.2,
+  flex:     6.2,
+  default:  6.5,
 };
 
 // All valid preset names — must match motionRenderer.py choices exactly
@@ -49,9 +58,36 @@ const VALID_PRESETS = new Set([
   "float", "luxury_parallax", "static",
 ]);
 
+// FIX (Sam's catch, real render — confirmed via the room-label
+// screenshot): most staged photos' real room_type doesn't exactly match
+// PRO Plus's fixed ROOM_TYPES list (e.g. Smart Stage PRO's own naming
+// might be "Bedroom 2" or something fully custom), so the frontend's
+// matchToRoomType() correctly falls back to "Other" for display — but
+// that meant resolveDuration() only ever saw roomType: "Other", which
+// isn't a DEFAULT_DURATIONS key, silently landing everything on the
+// generic default instead of the room-specific tuning (bedroom's 6.8s,
+// etc.). frame.roomLabel already carries the REAL text through to
+// Railway (confirmed in downloadFrames.js) — scanning it for keywords
+// recovers the right duration category even when the exact type didn't
+// match, without touching the display label at all.
+function inferDurationCategoryFromLabel(label) {
+  const l = (label || "").toLowerCase();
+  if (l.includes("bed")) return "bedroom";
+  if (l.includes("bath")) return "bathroom";
+  if (l.includes("kitchen")) return "kitchen";
+  if (l.includes("dining")) return "dining";
+  if (l.includes("living") || l.includes("family")) return "living";
+  if (l.includes("exterior") || l.includes("yard") || l.includes("pool") || l.includes("front")) return "exterior";
+  if (l.includes("flex") || l.includes("office") || l.includes("loft") || l.includes("laundry") || l.includes("closet")) return "flex";
+  return null;
+}
+
 function resolveDuration(frame) {
   if (frame.durationSeconds) return frame.durationSeconds;
-  return DEFAULT_DURATIONS[frame.roomType] || DEFAULT_DURATIONS.default;
+  if (DEFAULT_DURATIONS[frame.roomType]) return DEFAULT_DURATIONS[frame.roomType];
+  const inferred = inferDurationCategoryFromLabel(frame.roomLabel);
+  if (inferred) return DEFAULT_DURATIONS[inferred];
+  return DEFAULT_DURATIONS.default;
 }
 
 function resolvePreset(frame) {
