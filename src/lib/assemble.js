@@ -484,12 +484,20 @@ function buildBeforeAfterClip(beforeClipPath, afterClipPath, workDir, outputName
 // music approach as before. narrationSegments is an array of
 // { audioPath, startTime } — empty/absent means music-only, same as the
 // old narrationPath being absent.
+//
+// knownVideoDuration (new, July 17, 2026): assembleVideo now computes the
+// real final duration from known values (see its header comment for the
+// full race-condition reasoning) and passes it here explicitly, rather
+// than this function re-probing videoPath itself via ffprobe on a file
+// that may have just been written moments earlier. Falls back to probing
+// if omitted, so this stays safe to call directly (e.g. future tooling,
+// tests) without always needing a caller to compute it first.
 
-function mixAudio(videoPath, musicPath, workDir, narrationSegments) {
+function mixAudio(videoPath, musicPath, workDir, narrationSegments, knownVideoDuration) {
   return new Promise(async (resolve, reject) => {
     try {
       const outputPath = path.join(workDir, "with_music.mp4");
-      const videoDuration = await probeDuration(videoPath);
+      const videoDuration = knownVideoDuration != null ? knownVideoDuration : await probeDuration(videoPath);
       const musicDuration = await probeDuration(musicPath);
       const fadeOutStart = Math.max(0, videoDuration - 1.5);
       const hasNarration = narrationSegments && narrationSegments.length > 0;
@@ -833,6 +841,29 @@ function renderClosingCardClip(stillImagePath, addressLine, ctaLine, workDir, fp
 async function assembleVideo({ clipPaths, musicPath, narrationSegments, formats, workDir, closingCard }) {
   let concatenated = await concatenateClips(clipPaths, workDir);
 
+  // FIX (July 17, 2026 — real render, music dead after the last narration
+  // segment with no recovery, unchanged across three different looping
+  // fixes): Sam's real observation — ducking recovers fine after EVERY
+  // other segment, only fails to recover after the LAST one, right where
+  // the video ends — means this was never a looping-mechanism bug at all.
+  // It means the audio stream's real rendered length was ending almost
+  // exactly where the last narration segment ends: not a stuck duck, an
+  // actually-finished stream. mixAudio was re-probing THIS function's
+  // freshly-xfadeChain'd "with_closing_card.mp4" via ffprobe immediately
+  // after writing it. xfadeChain's own existence+size polling (July 15
+  // fix) guarantees the file EXISTS and is non-empty, but never verified
+  // its MP4 container metadata (moov atom) was fully flushed for ffprobe
+  // to read correctly — a related but distinct race from the one already
+  // fixed. A short/stale probed duration would make every downstream
+  // atrim/fade target in mixAudio wrong in the same direction, regardless
+  // of which looping technique tried to fill the gap — exactly matching
+  // three fixes in a row producing no observable change. Fix: compute the
+  // real final duration from KNOWN values (the real probed clip duration,
+  // taken BEFORE the risky re-probe, + the closing card's own fixed
+  // duration) instead of re-probing the file just written, and pass it
+  // down explicitly. Removes the race rather than papering over it.
+  let finalVideoDuration = await probeDuration(concatenated);
+
   // Closing card runs on the pure video track, BEFORE mixAudio — mixAudio
   // does -c:v copy (passthrough, no video re-encode), so any video-level
   // work has to happen before it, not after.
@@ -843,15 +874,18 @@ async function assembleVideo({ clipPaths, musicPath, narrationSegments, formats,
   // a closing card is a nice-to-have, never the reason a render fails.
   if (closingCard && narrationSegments && narrationSegments.length > 0) {
     try {
-      const videoDuration = await probeDuration(concatenated);
       const fps = await probeFps(concatenated);
       const cardPath = await renderClosingCardClip(closingCard.stillImagePath, closingCard.addressLine, closingCard.ctaLine, workDir, fps);
       concatenated = await xfadeChain(
         [concatenated, cardPath],
-        [videoDuration, CLOSING_CARD_DURATION_SECONDS],
+        [finalVideoDuration, CLOSING_CARD_DURATION_SECONDS],
         workDir,
         "with_closing_card.mp4"
       );
+      // Real duration after a 2-clip xfade = sum of both durations minus
+      // one crossfade overlap — same formula computeClipTimeline uses.
+      // Computed directly instead of re-probing the file we just wrote.
+      finalVideoDuration = finalVideoDuration + CLOSING_CARD_DURATION_SECONDS - CROSSFADE_DURATION;
     } catch (err) {
       console.warn(`Closing card skipped (non-fatal, video proceeds without it): ${err.message}`);
     }
@@ -865,7 +899,7 @@ async function assembleVideo({ clipPaths, musicPath, narrationSegments, formats,
   // it just passes the segments through to mixAudio. Absent/empty for any
   // job that didn't request narration, or where generation failed
   // upstream (a failed narration should never block the video itself).
-  const withMusic = await mixAudio(concatenated, musicPath, workDir, narrationSegments || []);
+  const withMusic = await mixAudio(concatenated, musicPath, workDir, narrationSegments || [], finalVideoDuration);
 
   const outputs = {};
 
