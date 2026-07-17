@@ -85,6 +85,12 @@ async function processRenderJob(job) {
       if (localFrames.length > 1) {
         const last = localFrames[localFrames.length - 1];
         last.durationSeconds = resolveDuration(last) + NARRATION_INTRO_OUTRO_PADDING_SECONDS;
+        // NEW (Sam's request — outro end motion): flags the last clip for
+        // resolvePreset() in motionPresets.js, which defaults it to the
+        // calm "float" preset instead of whatever directional preset its
+        // room type would normally get — only takes effect if the user
+        // left it on "auto"; an explicit user choice still wins.
+        last.isOutro = true;
       }
       console.log(`[${job.jobId}] Narration on — padded clip 1${localFrames.length > 1 ? " and last clip" : ""} by ${NARRATION_INTRO_OUTRO_PADDING_SECONDS}s for future intro/outro room.`);
     }
@@ -304,34 +310,19 @@ async function processRenderJob(job) {
     console.log(`[${job.jobId}] Music ready: ${musicPath}`);
 
     // ── Step 4: Assemble clips + music (+ optional narration) into final formats
-    // Closing card (Sam's idea, July 15, 2026): only meaningful if
-    // narration actually produced real segments — no narration means no
-    // "end of narration" moment to fade in on. Text degrades gracefully
-    // if address is missing (CTA-only, single centered line — see
-    // assemble.js's renderClosingCardClip) rather than skipping the
-    // card entirely.
-    // FIX (July 17, 2026 — real render, text illegibly small/cramped):
-    // was one combined string ("address · CTA") rendered as a single
-    // line at one fontsize. Now split into two fields so assemble.js can
-    // render them as two stacked lines at different sizes — CTA is the
-    // actual action we want taken, so it gets the larger, more prominent
-    // line; address is secondary context above it.
-    const lastFrame = localFrames[localFrames.length - 1];
-    const closingCard = (narrationSegments && narrationSegments.length > 0)
-      ? {
-          stillImagePath: lastFrame.localPath,
-          addressLine: job.address || null,
-          ctaLine: "Schedule Your Private Showing",
-        }
-      : null;
-
+    // NOTE (July 16, 2026): the automated closing-card feature (live
+    // ffmpeg overlay/append) has been removed entirely — it caused 4
+    // separate real bugs across this session (hangs, an fps mismatch)
+    // despite repeated targeted fixes. Superseded by a standalone
+    // downloadable closing-card image (generate-closing-card.js, Netlify
+    // side) the user generates once and adds as their own last photo —
+    // no special-casing needed here at all, it's just an ordinary frame.
     const outputs = await assembleVideo({
       clipPaths,
       musicPath,
       narrationSegments,
       formats: job.formats || ["16x9", "9x16"],
       workDir,
-      closingCard,
     });
     console.log(`[${job.jobId}] Assembled ${Object.keys(outputs).length} formats.`);
 
