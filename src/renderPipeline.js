@@ -307,13 +307,21 @@ async function processRenderJob(job) {
     // Closing card (Sam's idea, July 15, 2026): only meaningful if
     // narration actually produced real segments — no narration means no
     // "end of narration" moment to fade in on. Text degrades gracefully
-    // if address is missing (still shows the CTA alone) rather than
-    // skipping the card entirely.
+    // if address is missing (CTA-only, single centered line — see
+    // assemble.js's renderClosingCardClip) rather than skipping the
+    // card entirely.
+    // FIX (July 17, 2026 — real render, text illegibly small/cramped):
+    // was one combined string ("address · CTA") rendered as a single
+    // line at one fontsize. Now split into two fields so assemble.js can
+    // render them as two stacked lines at different sizes — CTA is the
+    // actual action we want taken, so it gets the larger, more prominent
+    // line; address is secondary context above it.
     const lastFrame = localFrames[localFrames.length - 1];
     const closingCard = (narrationSegments && narrationSegments.length > 0)
       ? {
           stillImagePath: lastFrame.localPath,
-          text: job.address ? `${job.address} \u00b7 Schedule Your Private Showing` : "Schedule Your Private Showing",
+          addressLine: job.address || null,
+          ctaLine: "Schedule Your Private Showing",
         }
       : null;
 
