@@ -506,7 +506,7 @@ function mixAudio(videoPath, musicPath, workDir, narrationSegments) {
           // engages more easily, higher ratio = ducks harder once
           // engaged) so music is genuinely a soft bed under narration,
           // not competing with it.
-          `[1:a]afade=t=in:st=0:d=1,afade=t=out:st=${fadeOutStart.toFixed(2)}:d=1.5,volume=0.3[music_faded]`,
+          `[1:a]afade=t=in:st=0:d=1,afade=t=out:st=${fadeOutStart.toFixed(2)}:d=1.5,volume=0.35[music_faded]`,
         ];
 
         // Each segment: fade in/out on its OWN local timeline (0..its own
