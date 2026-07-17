@@ -838,68 +838,127 @@ function renderClosingCardClip(stillImagePath, addressLine, ctaLine, workDir, fp
   });
 }
 
+// ── CLOSING CARD AUDIO (decoupled from the main mix, July 17, 2026) ──────
+// REPLACES four straight failed attempts to extend/loop the MAIN mix's
+// audio to cover the card (aloop filter, -stream_loop input, multi-input
+// concat loop, then an analytically-computed duration to dodge a probe
+// race) — each change produced literally no observable difference across
+// real tests, and Sam confirmed the deciding fact: the card audio/music
+// was fine BEFORE the closing card existed at all; adding the card is
+// what broke the LAST MOTION CLIP's own audio, not just the card's.
+// That means the bug was never really about which looping technique
+// extends the audio, or which duration number targets it — it's that
+// folding the card into the SAME big mixAudio filter graph as a moving
+// target kept perturbing something in a working system. Rather than
+// hunt for a fifth fix inside that shared graph, this decouples the two
+// concerns entirely: mixAudio runs on the ORIGINAL video only, exactly
+// as it did before the closing card existed (zero behavior change to the
+// part that was already proven working) — then the card gets appended
+// afterward, in total isolation, with its own small independent music
+// stinger rather than being threaded through the main mix's timing math
+// at all. Costs a slightly-less-than-perfectly-continuous fade across
+// the boundary (main mix's own natural fade-out, then a fresh fade-in on
+// the stinger) in exchange for the main video's audio being structurally
+// unable to regress from the card's presence ever again.
+const CARD_AUDIO_FADE_IN_SECONDS = 0.6;
+const CARD_AUDIO_FADE_OUT_SECONDS = 1.2;
+const CARD_AUDIO_VOLUME = 0.3;
+
+function buildCardAudioStinger(musicPath, workDir) {
+  return new Promise((resolve, reject) => {
+    const outputPath = path.join(workDir, "card_audio.mp3");
+    ffmpeg(musicPath)
+      .setDuration(CLOSING_CARD_DURATION_SECONDS)
+      .audioFilters([
+        `afade=t=in:st=0:d=${CARD_AUDIO_FADE_IN_SECONDS}`,
+        `afade=t=out:st=${(CLOSING_CARD_DURATION_SECONDS - CARD_AUDIO_FADE_OUT_SECONDS).toFixed(2)}:d=${CARD_AUDIO_FADE_OUT_SECONDS}`,
+        `volume=${CARD_AUDIO_VOLUME}`,
+      ])
+      .audioCodec("libmp3lame")
+      .output(outputPath)
+      .on("end", () => resolve(outputPath))
+      .on("error", (err) => reject(new Error(`Card audio stinger failed: ${err.message}`)))
+      .run();
+  });
+}
+
+// mainPath already has final mixed audio (music + narration) muxed in —
+// this appends the visual card via the same proven xfade transition, and
+// concats the card's own short stinger onto the end of the main audio
+// track. No dependency on the main track's internal duration/fade math
+// at all; the two audio pieces are simply placed back to back.
+function appendClosingCardWithAudio(mainPath, closingCard, musicPath, workDir) {
+  return new Promise(async (resolve, reject) => {
+    try {
+      const outputPath = path.join(workDir, "with_closing_card.mp4");
+      const mainDuration = await probeDuration(mainPath);
+      const fps = await probeFps(mainPath);
+      const cardPath = await renderClosingCardClip(closingCard.stillImagePath, closingCard.addressLine, closingCard.ctaLine, workDir, fps);
+      const cardAudioPath = await buildCardAudioStinger(musicPath, workDir);
+
+      const command = ffmpeg().input(mainPath).input(cardPath).input(cardAudioPath);
+      const xfadeOffset = Math.max(0, mainDuration - CROSSFADE_DURATION);
+      const filterParts = [
+        `[0:v][1:v]xfade=transition=fade:duration=${CROSSFADE_DURATION}:offset=${xfadeOffset.toFixed(2)}[outv]`,
+        `[0:a][2:a]concat=n=2:v=0:a=1[outa]`,
+      ];
+
+      const CARD_APPEND_TIMEOUT_MS = 60000;
+      let settled = false;
+      const timeoutHandle = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        console.warn(`[appendClosingCardWithAudio] TIMEOUT after ${CARD_APPEND_TIMEOUT_MS}ms — killing process, proceeding without closing card.`);
+        try { command.kill("SIGKILL"); } catch (err) { /* best-effort */ }
+        reject(new Error("Closing card append timed out"));
+      }, CARD_APPEND_TIMEOUT_MS);
+
+      command
+        .complexFilter(filterParts)
+        .outputOptions(["-map", "[outv]", "-map", "[outa]", "-c:v", "libx264", "-c:a", "aac", "-pix_fmt", "yuv420p"])
+        .output(outputPath)
+        .on("end", () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timeoutHandle);
+          resolve(outputPath);
+        })
+        .on("error", (err) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timeoutHandle);
+          reject(new Error(`Closing card append failed: ${err.message}`));
+        })
+        .run();
+    } catch (err) {
+      reject(err);
+    }
+  });
+}
+
 async function assembleVideo({ clipPaths, musicPath, narrationSegments, formats, workDir, closingCard }) {
   let concatenated = await concatenateClips(clipPaths, workDir);
 
-  // FIX (July 17, 2026 — real render, music dead after the last narration
-  // segment with no recovery, unchanged across three different looping
-  // fixes): Sam's real observation — ducking recovers fine after EVERY
-  // other segment, only fails to recover after the LAST one, right where
-  // the video ends — means this was never a looping-mechanism bug at all.
-  // It means the audio stream's real rendered length was ending almost
-  // exactly where the last narration segment ends: not a stuck duck, an
-  // actually-finished stream. mixAudio was re-probing THIS function's
-  // freshly-xfadeChain'd "with_closing_card.mp4" via ffprobe immediately
-  // after writing it. xfadeChain's own existence+size polling (July 15
-  // fix) guarantees the file EXISTS and is non-empty, but never verified
-  // its MP4 container metadata (moov atom) was fully flushed for ffprobe
-  // to read correctly — a related but distinct race from the one already
-  // fixed. A short/stale probed duration would make every downstream
-  // atrim/fade target in mixAudio wrong in the same direction, regardless
-  // of which looping technique tried to fill the gap — exactly matching
-  // three fixes in a row producing no observable change. Fix: compute the
-  // real final duration from KNOWN values (the real probed clip duration,
-  // taken BEFORE the risky re-probe, + the closing card's own fixed
-  // duration) instead of re-probing the file just written, and pass it
-  // down explicitly. Removes the race rather than papering over it.
-  let finalVideoDuration = await probeDuration(concatenated);
+  // CHANGE (July 17, 2026 — see appendClosingCardWithAudio's header
+  // comment above for the full reasoning): mixAudio now runs on the
+  // ORIGINAL video only, exactly as it did before the closing card ever
+  // existed — no card-extended duration threaded through it, no special
+  // casing here at all. This is a deliberate return to the last known-
+  // good state for the main video's audio.
+  let withMusic = await mixAudio(concatenated, musicPath, workDir, narrationSegments || []);
 
-  // Closing card runs on the pure video track, BEFORE mixAudio — mixAudio
-  // does -c:v copy (passthrough, no video re-encode), so any video-level
-  // work has to happen before it, not after.
-  //
-  // No narrationEndTime dependency anymore — the card only ever starts
-  // after the main video (narration + its buffer) has already finished,
-  // so there's nothing left to time it against. Wrapped in try/catch:
-  // a closing card is a nice-to-have, never the reason a render fails.
+  // Closing card is appended AFTER audio mixing now, as a fully separate,
+  // isolated step with its own independent audio stinger — see
+  // appendClosingCardWithAudio's header comment for why. Wrapped in
+  // try/catch: a closing card is a nice-to-have, never the reason a
+  // render fails.
   if (closingCard && narrationSegments && narrationSegments.length > 0) {
     try {
-      const fps = await probeFps(concatenated);
-      const cardPath = await renderClosingCardClip(closingCard.stillImagePath, closingCard.addressLine, closingCard.ctaLine, workDir, fps);
-      concatenated = await xfadeChain(
-        [concatenated, cardPath],
-        [finalVideoDuration, CLOSING_CARD_DURATION_SECONDS],
-        workDir,
-        "with_closing_card.mp4"
-      );
-      // Real duration after a 2-clip xfade = sum of both durations minus
-      // one crossfade overlap — same formula computeClipTimeline uses.
-      // Computed directly instead of re-probing the file we just wrote.
-      finalVideoDuration = finalVideoDuration + CLOSING_CARD_DURATION_SECONDS - CROSSFADE_DURATION;
+      withMusic = await appendClosingCardWithAudio(withMusic, closingCard, musicPath, workDir);
     } catch (err) {
       console.warn(`Closing card skipped (non-fatal, video proceeds without it): ${err.message}`);
     }
   }
-
-  // CHANGE (July 14, 2026 — footage-grounded narration rebuild):
-  // narrationSegments now arrives pre-generated (audio already downloaded
-  // to local disk, real start times already computed) — renderPipeline.js
-  // does the generation itself, since it's the one place that knows real
-  // clip durations/positions. This function no longer downloads anything;
-  // it just passes the segments through to mixAudio. Absent/empty for any
-  // job that didn't request narration, or where generation failed
-  // upstream (a failed narration should never block the video itself).
-  const withMusic = await mixAudio(concatenated, musicPath, workDir, narrationSegments || [], finalVideoDuration);
 
   const outputs = {};
 
