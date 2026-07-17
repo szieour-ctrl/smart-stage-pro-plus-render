@@ -472,6 +472,48 @@ function buildBeforeAfterClip(beforeClipPath, afterClipPath, workDir, outputName
   });
 }
 
+// ── STRIP TRAILING SILENCE (for safe looping) ────────────────────────────
+// NEW (July 17, 2026 — real render, music still dead silent through the
+// tail/card even with the -stream_loop input-level fix): confirmed two
+// consecutive real tests where the video track and closing card were both
+// correct, but the last ~9.5s of audio was flat silence — not "loud then
+// cut off," genuinely nothing. The file is called music_fitted.mp3 —
+// whatever fits musicGen.js's Suno output to the target duration most
+// likely does it by padding a short track with silence at the TAIL rather
+// than stretching/extending the music itself, the simplest way to hit an
+// exact duration target. That means the file's own last several seconds
+// are ALREADY silent before stream_loop ever gets to it — looping a file
+// whose tail is silence just loops back into more silence, it never
+// reaches back to real audio, especially when the shortfall being covered
+// (~9.5s here: narration end buffer + closing card) is smaller than
+// whatever silence padding is already baked into the tail. Stripping
+// trailing silence before looping guarantees every loop wraps into real
+// musical content instead of replaying dead air. Reverse → remove
+// (now-leading) silence → reverse back is the standard ffmpeg approach,
+// since silenceremove only trims from the start of a stream natively.
+// Best-effort: if this step itself fails for any reason, falls back to
+// looping the original file — a possibly-silent loop is still strictly
+// no worse than what shipped before this fix, never a reason to fail the
+// whole render.
+function stripTrailingSilenceForLoop(musicPath, workDir) {
+  return new Promise((resolve) => {
+    const outputPath = path.join(workDir, "music_trimmed_for_loop.mp3");
+    ffmpeg(musicPath)
+      .audioFilters([
+        "areverse",
+        "silenceremove=start_periods=1:start_duration=0:start_threshold=-45dB:detection=peak",
+        "areverse",
+      ])
+      .output(outputPath)
+      .on("end", () => resolve(outputPath))
+      .on("error", (err) => {
+        console.warn(`[stripTrailingSilenceForLoop] failed, falling back to original music file (non-fatal, loop may include silent tail): ${err.message}`);
+        resolve(musicPath);
+      })
+      .run();
+  });
+}
+
 // ── MIX AUDIO — music + optional narration segments ────────────────────
 //
 // CHANGE (July 14, 2026 — footage-grounded narration rebuild): REPLACES
@@ -493,6 +535,11 @@ function mixAudio(videoPath, musicPath, workDir, narrationSegments) {
       const fadeOutStart = Math.max(0, videoDuration - 1.5);
       const hasNarration = narrationSegments && narrationSegments.length > 0;
 
+      // FIX (July 17, 2026 — see stripTrailingSilenceForLoop's header
+      // comment above): loop the tail-trimmed file, not the raw fitted
+      // one, so -stream_loop below always wraps into real music.
+      const loopableMusicPath = await stripTrailingSilenceForLoop(musicPath, workDir);
+
       const command = ffmpeg().input(videoPath);
       // FIX (July 17, 2026 — real render, music still silent through the
       // tail/card despite the aloop-filter version of this fix): aloop is
@@ -505,7 +552,7 @@ function mixAudio(videoPath, musicPath, workDir, narrationSegments) {
       // looping decoded frames — no boundary artifact, standard approach
       // for precisely looping a compressed audio file to an exact target
       // duration. atrim below still does the precise cut to videoDuration.
-      command.input(musicPath).inputOptions(["-stream_loop", "-1"]);
+      command.input(loopableMusicPath).inputOptions(["-stream_loop", "-1"]);
       let filterParts;
 
       if (hasNarration) {
