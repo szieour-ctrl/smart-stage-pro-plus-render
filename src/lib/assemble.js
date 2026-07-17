@@ -506,7 +506,19 @@ function mixAudio(videoPath, musicPath, workDir, narrationSegments) {
           // engages more easily, higher ratio = ducks harder once
           // engaged) so music is genuinely a soft bed under narration,
           // not competing with it.
-          `[1:a]afade=t=in:st=0:d=1,afade=t=out:st=${fadeOutStart.toFixed(2)}:d=1.5,volume=0.35[music_faded]`,
+          // FIX (July 17, 2026 — real render, closing card silent): music
+          // (music_fitted.mp3) is fitted to the ORIGINAL clip timeline,
+          // generated in renderPipeline.js Step 2 before the closing card
+          // exists. Once the card extends videoDuration past music's own
+          // real length, the old single afade-out just ran out of source
+          // audio early and went silent well before its own scripted
+          // fade-out point — Sam's screenshot/report confirmed dead air
+          // under the last clip's tail AND the whole closing card. aloop
+          // (infinite loop) + atrim to the real full videoDuration means
+          // music always has material to play for the entire video,
+          // including the card, with the fade-out landing at the true
+          // final moment instead of on already-silent track.
+          `[1:a]aloop=loop=-1:size=2e9,atrim=0:${videoDuration.toFixed(2)},asetpts=PTS-STARTPTS,afade=t=in:st=0:d=1,afade=t=out:st=${fadeOutStart.toFixed(2)}:d=1.5,volume=0.35[music_faded]`,
         ];
 
         // Each segment: fade in/out on its OWN local timeline (0..its own
@@ -588,7 +600,10 @@ function mixAudio(videoPath, musicPath, workDir, narrationSegments) {
         );
       } else {
         filterParts = [
-          `[1:a]afade=t=in:st=0:d=1,afade=t=out:st=${fadeOutStart.toFixed(2)}:d=1.5,volume=0.6[music_faded]`,
+          // Same aloop/atrim fix as the narration branch above — music
+          // needs to cover the real full videoDuration (including any
+          // closing card), not just its own original fitted length.
+          `[1:a]aloop=loop=-1:size=2e9,atrim=0:${videoDuration.toFixed(2)},asetpts=PTS-STARTPTS,afade=t=in:st=0:d=1,afade=t=out:st=${fadeOutStart.toFixed(2)}:d=1.5,volume=0.6[music_faded]`,
           `[music_faded]loudnorm=I=-16:TP=-1.5:LRA=11[audio_out]`,
         ];
       }
@@ -704,7 +719,7 @@ function escapeDrawtext(text) {
 const CLOSING_CARD_DURATION_SECONDS = 4.0;
 const CLOSING_CARD_FADE_SECONDS = 0.6;
 
-function renderClosingCardClip(stillImagePath, text, workDir, fps) {
+function renderClosingCardClip(stillImagePath, addressLine, ctaLine, workDir, fps) {
   return new Promise((resolve, reject) => {
     const outputPath = path.join(workDir, "closing_card.mp4");
     const command = ffmpeg()
@@ -723,14 +738,33 @@ function renderClosingCardClip(stillImagePath, text, workDir, fps) {
     // after the main video (narration + its buffer) has already ended.
     const alphaExpr = `min(1,t/${CLOSING_CARD_FADE_SECONDS})`;
 
+    // FIX (July 17, 2026 — real render, first card ever seen on screen):
+    // was one drawtext with address + CTA jammed into a single line at a
+    // single fontsize (54) — Sam's real screenshot showed it cramped and
+    // hard to read. drawtext doesn't handle multi-line text reliably in
+    // one call, so this is two separate stacked drawtext filters instead:
+    // address (if present) smaller, above center; CTA larger, below
+    // center — CTA is the action we actually want taken, so it gets the
+    // visual weight. Degrades gracefully to a single centered CTA line
+    // (old single-line layout) when there's no address at all.
     const filterParts = [
       // Fill-crop to the standard frame size, then darken directly on
       // the pixel values (eq=brightness) rather than the old alpha-
       // blend-over-a-second-stream approach — simpler, and there's
       // nothing else in this clip for it to blend against.
       `[0:v]scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,eq=brightness=-0.28[dimmed]`,
-      `[dimmed]drawtext=text='${escapeDrawtext(text)}':fontcolor=white:fontsize=54:borderw=2:bordercolor=black@0.6:x=(w-text_w)/2:y=(h-text_h)/2:alpha='${alphaExpr}'[outv]`,
     ];
+
+    if (addressLine) {
+      filterParts.push(
+        `[dimmed]drawtext=text='${escapeDrawtext(addressLine)}':fontcolor=white:fontsize=42:borderw=2:bordercolor=black@0.6:x=(w-text_w)/2:y=(h/2)-60:alpha='${alphaExpr}'[with_addr]`,
+        `[with_addr]drawtext=text='${escapeDrawtext(ctaLine)}':fontcolor=white:fontsize=68:borderw=3:bordercolor=black@0.6:x=(w-text_w)/2:y=(h/2)+10:alpha='${alphaExpr}'[outv]`
+      );
+    } else {
+      filterParts.push(
+        `[dimmed]drawtext=text='${escapeDrawtext(ctaLine)}':fontcolor=white:fontsize=68:borderw=3:bordercolor=black@0.6:x=(w-text_w)/2:y=(h-text_h)/2:alpha='${alphaExpr}'[outv]`
+      );
+    }
 
     // Standalone single-image render — much simpler than the old
     // overlay version, so 30s is generous rather than needing the full
@@ -780,7 +814,7 @@ async function assembleVideo({ clipPaths, musicPath, narrationSegments, formats,
     try {
       const videoDuration = await probeDuration(concatenated);
       const fps = await probeFps(concatenated);
-      const cardPath = await renderClosingCardClip(closingCard.stillImagePath, closingCard.text, workDir, fps);
+      const cardPath = await renderClosingCardClip(closingCard.stillImagePath, closingCard.addressLine, closingCard.ctaLine, workDir, fps);
       concatenated = await xfadeChain(
         [concatenated, cardPath],
         [videoDuration, CLOSING_CARD_DURATION_SECONDS],
