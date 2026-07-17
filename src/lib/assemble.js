@@ -493,7 +493,19 @@ function mixAudio(videoPath, musicPath, workDir, narrationSegments) {
       const fadeOutStart = Math.max(0, videoDuration - 1.5);
       const hasNarration = narrationSegments && narrationSegments.length > 0;
 
-      const command = ffmpeg().input(videoPath).input(musicPath);
+      const command = ffmpeg().input(videoPath);
+      // FIX (July 17, 2026 — real render, music still silent through the
+      // tail/card despite the aloop-filter version of this fix): aloop is
+      // a frame-based filter, and on compressed audio (MP3) it doesn't
+      // reliably decode a PARTIAL final loop — the loop boundary landed
+      // right around the end of narration/start of the closing card, and
+      // that trailing fragment came out as silence rather than looped
+      // music. Real, confirmed on a test render. -stream_loop on the
+      // INPUT re-reads the file itself at the demux level instead of
+      // looping decoded frames — no boundary artifact, standard approach
+      // for precisely looping a compressed audio file to an exact target
+      // duration. atrim below still does the precise cut to videoDuration.
+      command.input(musicPath).inputOptions(["-stream_loop", "-1"]);
       let filterParts;
 
       if (hasNarration) {
@@ -512,13 +524,15 @@ function mixAudio(videoPath, musicPath, workDir, narrationSegments) {
           // exists. Once the card extends videoDuration past music's own
           // real length, the old single afade-out just ran out of source
           // audio early and went silent well before its own scripted
-          // fade-out point — Sam's screenshot/report confirmed dead air
-          // under the last clip's tail AND the whole closing card. aloop
-          // (infinite loop) + atrim to the real full videoDuration means
-          // music always has material to play for the entire video,
-          // including the card, with the fade-out landing at the true
-          // final moment instead of on already-silent track.
-          `[1:a]aloop=loop=-1:size=2e9,atrim=0:${videoDuration.toFixed(2)},asetpts=PTS-STARTPTS,afade=t=in:st=0:d=1,afade=t=out:st=${fadeOutStart.toFixed(2)}:d=1.5,volume=0.35[music_faded]`,
+          // fade-out point. Fixed by looping the music INPUT itself
+          // (-stream_loop -1, set on command.input(musicPath) above) and
+          // atrim-ing to the real full videoDuration here — first attempt
+          // used the aloop FILTER instead, which mishandles a partial
+          // final loop on compressed (MP3) audio and came out silent for
+          // exactly the trailing fragment covering the tail/card, per a
+          // second real test. Input-level looping re-reads the file at
+          // the demux level, so there's no frame-boundary artifact.
+          `[1:a]atrim=0:${videoDuration.toFixed(2)},asetpts=PTS-STARTPTS,afade=t=in:st=0:d=1,afade=t=out:st=${fadeOutStart.toFixed(2)}:d=1.5,volume=0.35[music_faded]`,
         ];
 
         // Each segment: fade in/out on its OWN local timeline (0..its own
@@ -600,10 +614,11 @@ function mixAudio(videoPath, musicPath, workDir, narrationSegments) {
         );
       } else {
         filterParts = [
-          // Same aloop/atrim fix as the narration branch above — music
-          // needs to cover the real full videoDuration (including any
-          // closing card), not just its own original fitted length.
-          `[1:a]aloop=loop=-1:size=2e9,atrim=0:${videoDuration.toFixed(2)},asetpts=PTS-STARTPTS,afade=t=in:st=0:d=1,afade=t=out:st=${fadeOutStart.toFixed(2)}:d=1.5,volume=0.6[music_faded]`,
+          // Same input-level -stream_loop + atrim fix as the narration
+          // branch above — music needs to cover the real full
+          // videoDuration (including any closing card), not just its own
+          // original fitted length.
+          `[1:a]atrim=0:${videoDuration.toFixed(2)},asetpts=PTS-STARTPTS,afade=t=in:st=0:d=1,afade=t=out:st=${fadeOutStart.toFixed(2)}:d=1.5,volume=0.6[music_faded]`,
           `[music_faded]loudnorm=I=-16:TP=-1.5:LRA=11[audio_out]`,
         ];
       }
