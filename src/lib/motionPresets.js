@@ -98,6 +98,16 @@ function resolvePreset(frame) {
       return frame.motionPreset;
     }
   }
+  // NEW (Sam's request — outro end motion): the closing clip needs a calm,
+  // non-directional settle, not whatever a room-type's normal AUTO_PRESETS
+  // entry happens to be (a push_in or pan on the final shot reads as
+  // jarring right when narration/music are winding down, not building
+  // momentum). "float" is already the existing gentle sine-wave breathing
+  // preset used elsewhere for shots where directional movement would feel
+  // forced — reused here rather than inventing a new motionRenderer.py
+  // preset. Only applies when the user left this clip on "auto" — an
+  // explicit preset choice above always wins.
+  if (frame.isOutro) return "float";
   return AUTO_PRESETS[frame.roomType] || AUTO_PRESETS.default;
 }
 
