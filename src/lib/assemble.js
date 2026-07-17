@@ -472,48 +472,6 @@ function buildBeforeAfterClip(beforeClipPath, afterClipPath, workDir, outputName
   });
 }
 
-// ── STRIP TRAILING SILENCE (for safe looping) ────────────────────────────
-// NEW (July 17, 2026 — real render, music still dead silent through the
-// tail/card even with the -stream_loop input-level fix): confirmed two
-// consecutive real tests where the video track and closing card were both
-// correct, but the last ~9.5s of audio was flat silence — not "loud then
-// cut off," genuinely nothing. The file is called music_fitted.mp3 —
-// whatever fits musicGen.js's Suno output to the target duration most
-// likely does it by padding a short track with silence at the TAIL rather
-// than stretching/extending the music itself, the simplest way to hit an
-// exact duration target. That means the file's own last several seconds
-// are ALREADY silent before stream_loop ever gets to it — looping a file
-// whose tail is silence just loops back into more silence, it never
-// reaches back to real audio, especially when the shortfall being covered
-// (~9.5s here: narration end buffer + closing card) is smaller than
-// whatever silence padding is already baked into the tail. Stripping
-// trailing silence before looping guarantees every loop wraps into real
-// musical content instead of replaying dead air. Reverse → remove
-// (now-leading) silence → reverse back is the standard ffmpeg approach,
-// since silenceremove only trims from the start of a stream natively.
-// Best-effort: if this step itself fails for any reason, falls back to
-// looping the original file — a possibly-silent loop is still strictly
-// no worse than what shipped before this fix, never a reason to fail the
-// whole render.
-function stripTrailingSilenceForLoop(musicPath, workDir) {
-  return new Promise((resolve) => {
-    const outputPath = path.join(workDir, "music_trimmed_for_loop.mp3");
-    ffmpeg(musicPath)
-      .audioFilters([
-        "areverse",
-        "silenceremove=start_periods=1:start_duration=0:start_threshold=-45dB:detection=peak",
-        "areverse",
-      ])
-      .output(outputPath)
-      .on("end", () => resolve(outputPath))
-      .on("error", (err) => {
-        console.warn(`[stripTrailingSilenceForLoop] failed, falling back to original music file (non-fatal, loop may include silent tail): ${err.message}`);
-        resolve(musicPath);
-      })
-      .run();
-  });
-}
-
 // ── MIX AUDIO — music + optional narration segments ────────────────────
 //
 // CHANGE (July 14, 2026 — footage-grounded narration rebuild): REPLACES
@@ -532,54 +490,65 @@ function mixAudio(videoPath, musicPath, workDir, narrationSegments) {
     try {
       const outputPath = path.join(workDir, "with_music.mp4");
       const videoDuration = await probeDuration(videoPath);
+      const musicDuration = await probeDuration(musicPath);
       const fadeOutStart = Math.max(0, videoDuration - 1.5);
       const hasNarration = narrationSegments && narrationSegments.length > 0;
 
-      // FIX (July 17, 2026 — see stripTrailingSilenceForLoop's header
-      // comment above): loop the tail-trimmed file, not the raw fitted
-      // one, so -stream_loop below always wraps into real music.
-      const loopableMusicPath = await stripTrailingSilenceForLoop(musicPath, workDir);
+      // FIX (July 17, 2026 — third attempt at the same underlying bug):
+      // music_fitted.mp3 is shorter than the real final videoDuration
+      // (closing card + real per-clip duration variance both add time
+      // AFTER music is generated in renderPipeline.js Step 2), so it
+      // needs to be extended to cover the whole video. Two prior attempts
+      // both failed on real renders: the `aloop` FILTER mishandles a
+      // partial final loop on compressed audio; `-stream_loop` on the
+      // INPUT then also produced dead silence on a real test — and
+      // musicGen.js confirms music_fitted.mp3 has no baked-in silence at
+      // all (fitTrackToDuration always loops+trims to a fully-packed
+      // file), which rules out the "silent tail" theory the second fix
+      // was chasing. Root cause of the stream_loop failure is unconfirmed
+      // (possibly a version-specific quirk combining -stream_loop with
+      // -filter_complex on this container's ffmpeg build), but rather
+      // than debug that further, this switches to plain `concat` —
+      // the exact same filter xfadeChain already uses reliably for every
+      // clip transition in this codebase all session. The music file is
+      // added as N separate inputs (enough copies to cover videoDuration)
+      // and concatenated explicitly in the filtergraph, then atrim cuts
+      // it to the exact needed length. No input-level looping involved.
+      const musicCopies = Math.max(1, Math.ceil(videoDuration / musicDuration));
 
       const command = ffmpeg().input(videoPath);
-      // FIX (July 17, 2026 — real render, music still silent through the
-      // tail/card despite the aloop-filter version of this fix): aloop is
-      // a frame-based filter, and on compressed audio (MP3) it doesn't
-      // reliably decode a PARTIAL final loop — the loop boundary landed
-      // right around the end of narration/start of the closing card, and
-      // that trailing fragment came out as silence rather than looped
-      // music. Real, confirmed on a test render. -stream_loop on the
-      // INPUT re-reads the file itself at the demux level instead of
-      // looping decoded frames — no boundary artifact, standard approach
-      // for precisely looping a compressed audio file to an exact target
-      // duration. atrim below still does the precise cut to videoDuration.
-      command.input(loopableMusicPath).inputOptions(["-stream_loop", "-1"]);
+      for (let i = 0; i < musicCopies; i++) {
+        command.input(musicPath);
+      }
+      // Music occupies input indices 1..musicCopies; narration (if any)
+      // starts right after.
+      const narrationStartIndex = 1 + musicCopies;
+
       let filterParts;
+      const musicInputLabels = [];
+      for (let i = 0; i < musicCopies; i++) {
+        musicInputLabels.push(`[${i + 1}:a]`);
+      }
+      // Single copy needs no concat at all — just alias it directly so
+      // the rest of the graph can always reference [music_looped]
+      // uniformly regardless of how many copies were needed.
+      const musicLoopedFilter =
+        musicCopies === 1
+          ? `[1:a]anull[music_looped]`
+          : `${musicInputLabels.join("")}concat=n=${musicCopies}:v=0:a=1[music_looped]`;
 
       if (hasNarration) {
         narrationSegments.forEach((seg) => command.input(seg.audioPath));
 
         filterParts = [
+          musicLoopedFilter,
           // FIX #2 (Sam's feedback, real render — still too loud): 0.35
           // wasn't enough headroom. Dropping further to 0.2, and
           // tightening the sidechain ducking itself (lower threshold =
           // engages more easily, higher ratio = ducks harder once
           // engaged) so music is genuinely a soft bed under narration,
           // not competing with it.
-          // FIX (July 17, 2026 — real render, closing card silent): music
-          // (music_fitted.mp3) is fitted to the ORIGINAL clip timeline,
-          // generated in renderPipeline.js Step 2 before the closing card
-          // exists. Once the card extends videoDuration past music's own
-          // real length, the old single afade-out just ran out of source
-          // audio early and went silent well before its own scripted
-          // fade-out point. Fixed by looping the music INPUT itself
-          // (-stream_loop -1, set on command.input(musicPath) above) and
-          // atrim-ing to the real full videoDuration here — first attempt
-          // used the aloop FILTER instead, which mishandles a partial
-          // final loop on compressed (MP3) audio and came out silent for
-          // exactly the trailing fragment covering the tail/card, per a
-          // second real test. Input-level looping re-reads the file at
-          // the demux level, so there's no frame-boundary artifact.
-          `[1:a]atrim=0:${videoDuration.toFixed(2)},asetpts=PTS-STARTPTS,afade=t=in:st=0:d=1,afade=t=out:st=${fadeOutStart.toFixed(2)}:d=1.5,volume=0.35[music_faded]`,
+          `[music_looped]atrim=0:${videoDuration.toFixed(2)},asetpts=PTS-STARTPTS,afade=t=in:st=0:d=1,afade=t=out:st=${fadeOutStart.toFixed(2)}:d=1.5,volume=0.35[music_faded]`,
         ];
 
         // Each segment: fade in/out on its OWN local timeline (0..its own
@@ -600,7 +569,7 @@ function mixAudio(videoPath, musicPath, workDir, narrationSegments) {
         // primary fix.
         const delayedLabels = [];
         narrationSegments.forEach((seg, i) => {
-          const inputIndex = i + 2; // 0=video, 1=music, 2+=narration segments
+          const inputIndex = narrationStartIndex + i; // 0=video, 1..musicCopies=music, rest=narration segments
           const delayMs = Math.round(seg.startTime * 1000);
           const label = `narr_${i}`;
           const nextSeg = narrationSegments[i + 1];
@@ -661,11 +630,11 @@ function mixAudio(videoPath, musicPath, workDir, narrationSegments) {
         );
       } else {
         filterParts = [
-          // Same input-level -stream_loop + atrim fix as the narration
-          // branch above — music needs to cover the real full
-          // videoDuration (including any closing card), not just its own
-          // original fitted length.
-          `[1:a]atrim=0:${videoDuration.toFixed(2)},asetpts=PTS-STARTPTS,afade=t=in:st=0:d=1,afade=t=out:st=${fadeOutStart.toFixed(2)}:d=1.5,volume=0.6[music_faded]`,
+          musicLoopedFilter,
+          // Same concat-based extension as the narration branch above —
+          // music needs to cover the real full videoDuration (including
+          // any closing card), not just its own original fitted length.
+          `[music_looped]atrim=0:${videoDuration.toFixed(2)},asetpts=PTS-STARTPTS,afade=t=in:st=0:d=1,afade=t=out:st=${fadeOutStart.toFixed(2)}:d=1.5,volume=0.6[music_faded]`,
           `[music_faded]loudnorm=I=-16:TP=-1.5:LRA=11[audio_out]`,
         ];
       }
