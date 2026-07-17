@@ -593,9 +593,26 @@ function mixAudio(videoPath, musicPath, workDir, narrationSegments) {
         ];
       }
 
+      // FIX (July 17, 2026 — real render, closing card silently truncated):
+      // videoPath here is probed AFTER assembleVideo's optional closing-card
+      // step, so videoDuration already reflects the full video INCLUDING the
+      // appended card. But [audio_out] above (music via amix duration=longest,
+      // or narration) only ever spans the ORIGINAL clip timeline — music's own
+      // length comes from generateMusic({durationSeconds: totalDuration}) back
+      // in renderPipeline.js Step 2, computed before the closing card exists,
+      // and narration never extends past its own last segment + buffer either.
+      // The old "-shortest" output flag then truncated the OUTPUT to whichever
+      // mapped stream was shorter — which was always the audio, landing almost
+      // exactly at the end of narration/buffer and silently cutting off the
+      // entire closing card that had already rendered fine on the video track.
+      // Explicitly padding audio with silence out to the real video duration
+      // means -shortest (kept below as a defensive rounding backstop, not the
+      // active truncation mechanism) has nothing left to cut.
+      filterParts.push(`[audio_out]apad=whole_dur=${videoDuration.toFixed(2)}[audio_out_padded]`);
+
       command
         .complexFilter(filterParts)
-        .outputOptions(["-map", "0:v", "-map", "[audio_out]", "-c:v", "copy", "-c:a", "aac", "-shortest"])
+        .outputOptions(["-map", "0:v", "-map", "[audio_out_padded]", "-c:v", "copy", "-c:a", "aac", "-shortest"])
         .output(outputPath)
         .on("end", () => resolve(outputPath))
         .on("error", (err) => reject(new Error(`Audio mix failed: ${err.message}`)))
