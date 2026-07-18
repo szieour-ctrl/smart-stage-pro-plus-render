@@ -702,8 +702,29 @@ function mixAudio(videoPath, musicPath, workDir, narrationSegments, knownVideoDu
         // Defensive cap — same reasoning as the single-track version this
         // replaces: even with real per-clip timestamps, guarantee nothing
         // plays into the final buffer before the video ends.
+        //
+        // FIX (July 18, 2026 — real render, Sam's report: "music stops
+        // with narration, and there's still 2s of dead space"): this used
+        // to atrim+asplit WITHOUT padding, then rely on the final
+        // amix=duration=longest below to extend the mix out to match
+        // music_ducked's full length. In practice, amix's duration=longest
+        // isn't reliably extending past the point where the SHORTER input
+        // (this narration stream, intentionally short by narrationEndCap)
+        // ends — a known real-world FFmpeg quirk, not just a theoretical
+        // one. The old apad(whole_dur=videoDuration) at the very end of
+        // this function (see below) was padding the ALREADY-truncated
+        // mix out to the right total length — with silence, not
+        // continued music, since by then the real music content inside
+        // the mix was already gone. That's exactly the reported bug:
+        // music dying early, then dead air filling the rest, instead of
+        // narration-free music genuinely continuing through the reserved
+        // end buffer. Padding narration to the FULL videoDuration HERE —
+        // before it ever reaches sidechaincompress or the final amix —
+        // makes both audio streams provably the same length going in, so
+        // neither filter's own duration-matching behavior can truncate
+        // anything early regardless of how reliable that behavior is.
         const narrationEndCap = Math.max(0, videoDuration - NARRATION_END_BUFFER_SECONDS);
-        filterParts.push(`[narration_all]atrim=end=${narrationEndCap.toFixed(2)},asplit=2[narration_for_sidechain][narration_for_mix]`);
+        filterParts.push(`[narration_all]atrim=end=${narrationEndCap.toFixed(2)},apad=whole_dur=${videoDuration.toFixed(2)},asplit=2[narration_for_sidechain][narration_for_mix]`);
 
         filterParts.push(
           `[music_faded][narration_for_sidechain]sidechaincompress=threshold=0.03:ratio=10:attack=5:release=300[music_ducked]`,
