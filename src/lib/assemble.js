@@ -446,28 +446,102 @@ async function concatenateClips(clipPaths, workDir) {
   return finalPath;
 }
 
-// ── BEFORE/AFTER WIPE TRANSITION ─────────────────────────────────────────
-// Vacant room (pull_back) holds briefly, then wipes left-to-right into
-// the staged version (push_in). This is the flagship PRO Plus feature —
-// no general video tool can do this because it requires the paired
-// vacant/staged Cloudinary URLs that only exist because PRO staged it.
+// ── REVEAL PRESETS — Ken Burns tier (July 17, 2026) ──────────────────────
+// Replaces the old hardcoded buildBeforeAfterClip(), which produced the
+// exact same wipeleft/0.8s/pull_back+push_in clip regardless of what a
+// user picked — confirmed dead-end from the July 16 handoff ("Reveal
+// presets... never actually implemented. buildBeforeAfterClip() still
+// hardcodes one wipe transition/timing for every preset").
+//
+// Real, fixed 3-phase structure, locked via the reveal-preset spec
+// session (see 06_DECISIONS in Notion):
+//   Phase 1 — Opener (1.5s):       vacant/before image, motionRenderer.py
+//                                  preset from REVEAL_PRESETS[key].openerMotion
+//   Phase 2 — Wipe (0.4s):         ffmpeg xfade between opener and
+//                                  continuation, transition type from
+//                                  REVEAL_PRESETS[key].wipeTransition
+//   Phase 3 — Continuation (4.0s): staged/after image, motionRenderer.py
+//                                  preset = the user's End Motion choice
+// Total clip duration: 1.5 + 4.0 - overlap... see buildRevealClip's own
+// comment for the exact xfade-offset math (wipe duration is TIME SPENT
+// crossfading, not extra time added on top of the two phase durations).
+//
+// pull_back is excluded from every preset's End Motion list on purpose —
+// paired with ANY opener (soft_hold or restrained_push), a pull_back
+// continuation would reverse the reveal direction and read as a
+// collision, exactly the problem Sam flagged with the old hardcoded
+// pull_back(vacant)+push_in(staged) pairing.
+const REVEAL_OPENER_DURATION = 1.5;
+const REVEAL_WIPE_DURATION = 0.4;
+const REVEAL_CONTINUATION_DURATION = 4.0;
 
-function buildBeforeAfterClip(beforeClipPath, afterClipPath, workDir, outputName) {
+// wipeTransition values are real ffmpeg xfade transition names.
+// ASSUMPTION FLAGGED FOR SAM: the locked spec confirms opener motion +
+// End Motion exclusions per preset, but did not lock an exact ffmpeg
+// transition name per preset — these three are my proposed defaults,
+// not yet confirmed. Easy to change, all in one place.
+const REVEAL_PRESETS = {
+  classic_reveal: {
+    label: "Classic Reveal",
+    openerMotion: "soft_hold",
+    wipeTransition: "wipeleft",
+    allowedEndMotions: ["push_in", "pan_left", "pan_right", "tilt_up", "tilt_down", "drift", "float", "luxury_parallax"],
+  },
+  luxury_drift: {
+    label: "Luxury Drift",
+    openerMotion: "soft_hold",
+    // "circleopen" reads as a center-out reveal rather than a directional
+    // wipe — matches the "elegant lateral drift" identity better than a
+    // hard-left wipe would.
+    wipeTransition: "circleopen",
+    allowedEndMotions: ["drift", "pan_left", "pan_right", "float", "luxury_parallax"],
+  },
+  cinematic_reveal: {
+    label: "Cinematic Reveal",
+    openerMotion: "restrained_push",
+    // "smoothleft" (softer falloff than wipeleft) to differentiate from
+    // Classic Reveal's harder wipe, and to match the gentler continuous-
+    // push feel of a restrained_push opener.
+    wipeTransition: "smoothleft",
+    allowedEndMotions: ["push_in", "pan_left", "pan_right", "tilt_up", "tilt_down", "drift", "float", "luxury_parallax"],
+  },
+};
+
+// beforeClipPath / afterClipPath are pre-rendered motionRenderer.py clips
+// — beforeClipPath at REVEAL_OPENER_DURATION using the preset's
+// openerMotion, afterClipPath at REVEAL_CONTINUATION_DURATION using the
+// user's chosen End Motion. This function ONLY does the wipe compositing;
+// it does not call motionRenderer.py itself, so the caller (renderPipeline.js)
+// controls exactly what source images and durations went into each phase.
+function buildRevealClip(beforeClipPath, afterClipPath, presetKey, workDir, outputName) {
   return new Promise((resolve, reject) => {
+    const preset = REVEAL_PRESETS[presetKey];
+    if (!preset) {
+      reject(new Error(`buildRevealClip: unknown reveal preset "${presetKey}"`));
+      return;
+    }
     const outputPath = path.join(workDir, outputName);
+
+    // xfade's `offset` is measured from the start of the FIRST input and
+    // marks where the crossfade begins — so offset = openerDuration - wipeDuration
+    // means the crossfade starts wipeDuration seconds before the opener
+    // clip ends, and finishes exactly as the opener clip's trimmed length
+    // runs out. Total output duration = openerDuration + continuationDuration - wipeDuration
+    // (the wipe is time SHARED between the two phases, not added on top).
+    const offset = REVEAL_OPENER_DURATION - REVEAL_WIPE_DURATION;
 
     ffmpeg()
       .input(beforeClipPath)
       .input(afterClipPath)
       .complexFilter([
-        `[0:v]trim=duration=3,setpts=PTS-STARTPTS[vacant]`,
-        `[1:v]trim=duration=4,setpts=PTS-STARTPTS[staged]`,
-        `[vacant][staged]xfade=transition=wipeleft:duration=0.8:offset=2.5[out]`,
+        `[0:v]trim=duration=${REVEAL_OPENER_DURATION},setpts=PTS-STARTPTS[opener]`,
+        `[1:v]trim=duration=${REVEAL_CONTINUATION_DURATION},setpts=PTS-STARTPTS[continuation]`,
+        `[opener][continuation]xfade=transition=${preset.wipeTransition}:duration=${REVEAL_WIPE_DURATION}:offset=${offset}[out]`,
       ])
       .outputOptions(["-map", "[out]", "-pix_fmt", "yuv420p"])
       .output(outputPath)
       .on("end", () => resolve(outputPath))
-      .on("error", (err) => reject(new Error(`Before/After wipe failed: ${err.message}`)))
+      .on("error", (err) => reject(new Error(`Reveal Preset "${presetKey}" wipe failed: ${err.message}`)))
       .run();
   });
 }
@@ -972,4 +1046,4 @@ async function assembleVideo({ clipPaths, musicPath, narrationSegments, formats,
   return outputs;
 }
 
-module.exports = { assembleVideo, buildBeforeAfterClip, concatenateClips, mixAudio, renderFormat, computeClipTimeline, extractMidpointFrame, probeDuration, mapWithConcurrencyLimit, FFMPEG_CONCURRENCY_LIMIT, NARRATION_END_BUFFER_SECONDS };
+module.exports = { assembleVideo, buildRevealClip, REVEAL_PRESETS, REVEAL_OPENER_DURATION, REVEAL_WIPE_DURATION, REVEAL_CONTINUATION_DURATION, concatenateClips, mixAudio, renderFormat, computeClipTimeline, extractMidpointFrame, probeDuration, mapWithConcurrencyLimit, FFMPEG_CONCURRENCY_LIMIT, NARRATION_END_BUFFER_SECONDS };
