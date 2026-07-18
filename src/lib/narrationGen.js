@@ -147,6 +147,31 @@ function groupContiguousByRoom(localFrames, framePaths, timeline) {
     }
   });
 
+  // FIX (July 18, 2026 — real render, Sam's report: narration routinely
+  // ran over even on ordinary mid-video segments, not just the outro; and
+  // "there's supposed to be a breathing pause between clips" wasn't
+  // actually happening). Root cause, confirmed against assemble.js's real
+  // numbers: this function was handing generateSegmentedScript's word-
+  // budget PROMPT the group's raw `duration` (for a single-clip group,
+  // just that clip's own rendered length) — but the ENFORCEMENT check in
+  // generateNarration() below computed something ELSE: the real gap to
+  // the NEXT group's startTime, minus SEGMENT_BREATHING_ROOM_SECONDS.
+  // Those two numbers were never the same number. computeClipTimeline()
+  // in assemble.js spaces consecutive clips CROSSFADE_DURATION (0.6s)
+  // apart specifically BECAUSE of the crossfade overlap — so the real gap
+  // between one segment's start and the next is always 0.6s tighter than
+  // a clip's raw duration, before SEGMENT_BREATHING_ROOM_SECONDS (0.5s)
+  // is even subtracted on top. That's up to 1.1s of real-world tightening
+  // the word budget never saw — Claude was routinely told it had ~1s more
+  // room than it actually got, wrote to that generous budget, and then
+  // got cut off against the real one. Computing availableWindow ONCE here
+  // — the same value used for both the prompt AND the correction check
+  // below — makes the two impossible to disagree again.
+  groups.forEach((g, i) => {
+    const nextStart = i < groups.length - 1 ? groups[i + 1].startTime : null;
+    g.availableWindow = Math.max(1, (nextStart !== null ? nextStart - g.startTime : g.duration) - SEGMENT_BREATHING_ROOM_SECONDS);
+  });
+
   return groups.map((g, i) => ({ index: i, ...g }));
 }
 
@@ -157,7 +182,7 @@ function groupContiguousByRoom(localFrames, framePaths, timeline) {
 function generateSegmentedScript(address, segments, apiKey) {
   return new Promise((resolve, reject) => {
     const segmentDescriptions = segments
-      .map((s, i) => `Group ${i + 1}: "${s.roomLabel}" — ${s.framePaths.length} frame(s) shown for this group — target ${wordBudgetForSegment(s.duration)} words max (this group plays for about ${s.duration.toFixed(1)}s total in the final video).`)
+      .map((s, i) => `Group ${i + 1}: "${s.roomLabel}" — ${s.framePaths.length} frame(s) shown for this group — target ${wordBudgetForSegment(s.availableWindow)} words max (this group has about ${s.availableWindow.toFixed(1)}s of real speaking room before the next group starts).`)
       .join("\n");
 
     const promptText = `You are writing narration for a real estate video tour. You are shown one or more still frames per group, grouped in the order they appear in the video.
@@ -181,6 +206,7 @@ Rules:
 - Never invent square footage, bedroom/bathroom counts, or amenities not visible in the photos.
 - ONE sentence per group. Two only if both are short. This is the single most important constraint — a segment that tries to name the room, list what's in it, AND editorialize about value will not fit its window and will get cut off mid-sentence. Pick the one detail that matters most and say only that.
 - Respect each group's word target — it's timed to that group's real length; going over means it gets cut off mid-sentence.
+- Vary how each segment opens. Do NOT start consecutive (or most) segments with the same phrase (e.g. "Here we have," "This room features") — that reads as a stutter when segments play back to back. Vary sentence structure across the whole script the way a real person naturally would, not a template being refilled per room.
 - The FINAL group's segment should end with a brief, natural closing line inviting a showing — still one sentence, still within that group's own word limit, not stacked on top of a full room description.
 - If the FINAL group's image looks like a branded closing card rather than an ordinary room photo — visible overlaid text (an address, a tagline), a darkened or gradient-scrimmed background rather than a naturally-lit room — do NOT describe it as if it were a normal room, and do NOT read the on-screen text aloud verbatim like you're narrating a sign. Instead, say a natural, warm spoken sign-off that complements what's already shown on screen (the viewer can already see the address and the invitation in the image itself) — something a real person would say as a genuine closing thought, not a repetition of text they can already read.
 - Return ONLY a JSON array, nothing else — no markdown fences, no prose before or after. Exact shape: [{"index": 0, "text": "..."}, {"index": 1, "text": "..."}, ...] with exactly ${segments.length} entries, one per group, in the order shown.`;
@@ -296,12 +322,14 @@ async function generateNarration({ address, timelineSegments, voiceId, workDir, 
     const scriptEntry = scriptSegments.find((s) => s.index === seg.index);
     if (!scriptEntry || !scriptEntry.text) continue; // skip a missing segment rather than fail the whole narration
 
-    // NEW (July 14, 2026 — Sam's speed-correction suggestion): the real
-    // available window before the NEXT segment's audio starts — not this
-    // clip's own nominal duration. Two segments back-to-back with no gap
-    // between them is exactly the overlap risk this whole fix closes.
-    const nextSeg = timelineSegments[i + 1];
-    const availableWindow = Math.max(1, (nextSeg ? (nextSeg.startTime - seg.startTime) : seg.duration) - SEGMENT_BREATHING_ROOM_SECONDS);
+    // FIX (July 18, 2026) — this used to recompute availableWindow here,
+    // independently from what generateSegmentedScript's prompt was told.
+    // Now reads seg.availableWindow, set once in groupContiguousByRoom —
+    // the exact same number the word-budget prompt targeted. See that
+    // function's comment for the full diagnosis (a real render where
+    // narration routinely overran, confirmed against assemble.js's
+    // CROSSFADE_DURATION/SEGMENT_BREATHING_ROOM_SECONDS math).
+    const availableWindow = seg.availableWindow;
 
     let audioBuffer = await generateSegmentAudio(scriptEntry.text, voiceId, elevenLabsKey);
     let audioPath = path.join(workDir, `narration_seg_${seg.index}.mp3`);
