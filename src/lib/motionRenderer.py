@@ -24,6 +24,18 @@ Preset reference:
   float            — gentle sine-wave breathing, static-feeling shots
   luxury_parallax  — Kling continuation beat: ease-in diagonal settle
   static           — MLS clarity wide shot, no motion
+  soft_hold        — Reveal Presets opener (Classic Reveal, Luxury Drift):
+                      near-static, barely-perceptible zoom. Deliberately
+                      does not commit to a direction, so it can never
+                      collide with whatever End Motion the continuation
+                      phase picks.
+  restrained_push  — Reveal Presets opener (Cinematic Reveal): a small
+                      fraction of push_in's full range. Reads as the first
+                      beat of one continuous push that the continuation
+                      phase finishes — NOT a full move of its own. Only
+                      safe to pair with a continuation that keeps pushing
+                      forward; pull_back is excluded from every Reveal
+                      Preset's End Motion list for exactly this reason.
 
 Usage (called by motionPresets.js via child_process.spawn):
   python3 motionRenderer.py \
@@ -54,7 +66,8 @@ def parse_args():
     p.add_argument("--preset",     required=True,
                    choices=["push_in","pull_back","pan_left","pan_right",
                              "tilt_up","tilt_down","drift","pan_zoom",
-                             "float","luxury_parallax","static"])
+                             "float","luxury_parallax","static",
+                             "soft_hold","restrained_push"])
     p.add_argument("--duration",   type=float, required=True)
     p.add_argument("--output",     required=True,  help="Output .mp4 path")
     p.add_argument("--start-zoom", type=float, default=1.0, dest="start_zoom")
@@ -240,6 +253,33 @@ def build_motion_curve(preset, n_frames, start_zoom):
             drift = (1.0 - 1.0 / zoom) * 0.30 if zoom > 1.0 else 0.0
             pan_x = drift * t_in
             pan_y = -drift * 0.6 * t_in
+
+        elif preset == "soft_hold":
+            # Reveal Presets opener — Classic Reveal, Luxury Drift.
+            # Deliberately near-static: a tiny ease-in-out zoom creep,
+            # much smaller than "float"'s already-subtle breathing, and
+            # zero pan on either axis. The point is to read as "holding
+            # on the vacant room" rather than any camera move at all, so
+            # the wipe into the continuation phase never has to fight a
+            # direction the opener already established.
+            SOFT_HOLD_AMOUNT = 0.04
+            zoom  = start_zoom + SOFT_HOLD_AMOUNT * ease_in_out(t)
+            pan_x = 0.0
+            pan_y = 0.0
+
+        elif preset == "restrained_push":
+            # Reveal Presets opener — Cinematic Reveal only. A small
+            # fraction of push_in's full range (0.10 vs push_in's up to
+            # 0.5+ zoom delta) — reads as the FIRST beat of one continuous
+            # push that the continuation phase (almost always push_in)
+            # finishes after the wipe, not a complete move on its own.
+            # Only pair this with a continuation that keeps pushing
+            # forward — never pull_back, which is why pull_back is
+            # excluded from Cinematic Reveal's End Motion list.
+            RESTRAINED_PUSH_AMOUNT = 0.10
+            zoom  = start_zoom + RESTRAINED_PUSH_AMOUNT * ease_in_out(t)
+            pan_x = 0.0
+            pan_y = 0.0
 
         else:  # static
             zoom  = 1.0
