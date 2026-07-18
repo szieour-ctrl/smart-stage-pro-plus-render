@@ -49,13 +49,19 @@ const DEFAULT_DURATIONS = {
   default:  6.5,
 };
 
-// All valid preset names — must match motionRenderer.py choices exactly
+// All valid preset names — must match motionRenderer.py choices exactly.
+// soft_hold/restrained_push added (July 17, 2026) — Reveal Presets opener
+// motions (Ken Burns tier). Without these here, resolvePreset() would log
+// "Unknown preset" and silently fall back to AUTO_PRESETS[roomType] for
+// every reveal opener clip — no crash, no visible error, just the wrong
+// motion rendered.
 const VALID_PRESETS = new Set([
   "push_in", "pull_back",
   "pan_left", "pan_right",
   "tilt_up", "tilt_down",
   "drift", "pan_zoom",
   "float", "luxury_parallax", "static",
+  "soft_hold", "restrained_push",
 ]);
 
 // FIX (Sam's catch, real render — confirmed via the room-label
