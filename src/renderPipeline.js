@@ -17,7 +17,7 @@ const { downloadFrames } = require("./lib/downloadFrames");
 const { applyMotionPreset, resolveDuration } = require("./lib/motionPresets");
 const { applyKlingMotion } = require("./lib/klingMotion");
 const { generateMusic } = require("./lib/musicGen");
-const { assembleVideo, buildRevealClip, REVEAL_PRESETS, REVEAL_OPENER_DURATION, REVEAL_CONTINUATION_DURATION, computeClipTimeline, extractMidpointFrame, probeDuration, mapWithConcurrencyLimit, FFMPEG_CONCURRENCY_LIMIT } = require("./lib/assemble");
+const { assembleVideo, buildRevealClip, REVEAL_PRESETS, REVEAL_OPENER_DURATION, REVEAL_WIPE_DURATION, REVEAL_CONTINUATION_DURATION, computeClipTimeline, extractMidpointFrame, probeDuration, mapWithConcurrencyLimit, FFMPEG_CONCURRENCY_LIMIT } = require("./lib/assemble");
 const { generateNarration, groupContiguousByRoom } = require("./lib/narrationGen");
 const { uploadToCloudinary } = require("./lib/cloudinaryUpload");
 const { notifyWebhook } = require("./lib/notify");
@@ -32,6 +32,39 @@ const NARRATION_VOICE_LIBRARY = {
   "voice_male_1":   "pVYHFs8oaIDPWJxvmXWW",
   "voice_female_1": "5l5f8iK3YPeGga21rQIX",
 };
+
+// NEW (July 18, 2026 — Sam's request, after a real render where the flat
+// +0.8s breathing-room padding silently didn't apply and the only way to
+// notice was manually diffing clip durations across log lines). This
+// probes the REAL rendered file — not an echoed-back request value — and
+// logs a hard, impossible-to-miss [err]-tagged line if the actual output
+// doesn't match what was asked for. Deliberately does NOT throw: a
+// padding mismatch means a tighter narration window, not a broken video,
+// so the render should still complete — same "fail loud, not fail hard"
+// principle Kling's fallback and narration's own try/catch already use
+// elsewhere in this file. Tolerance (0.3s) covers normal fps-quantization
+// and encoder rounding, not a real dropped-padding bug — motionRenderer.py
+// rounds frame count via round(duration*fps), and buildRevealClip's xfade
+// crossfade timing has its own small rounding, so exact-to-the-millisecond
+// matches were never realistic even when everything is working correctly.
+const CLIP_DURATION_TOLERANCE_SECONDS = 0.3;
+async function verifyClipDuration(jobId, label, clipPath, expectedDuration) {
+  try {
+    const actualDuration = await probeDuration(clipPath);
+    const diff = Math.abs(actualDuration - expectedDuration);
+    if (diff > CLIP_DURATION_TOLERANCE_SECONDS) {
+      console.error(
+        `[${jobId}] [PADDING MISMATCH] ${label}: expected ${expectedDuration.toFixed(2)}s, ` +
+        `actual rendered duration ${actualDuration.toFixed(2)}s (off by ${diff.toFixed(2)}s). ` +
+        `Narration padding for this clip did NOT reach the rendered file — check that the ` +
+        `deployed renderPipeline.js/assemble.js actually match what's in the repo.`
+      );
+    }
+  } catch (e) {
+    // Never let a verification failure itself break the render.
+    console.error(`[${jobId}] [PADDING MISMATCH CHECK FAILED] ${label}: could not probe ${clipPath}: ${e.message}`);
+  }
+}
 
 async function processRenderJob(job) {
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), `job-${job.jobId}-`));
@@ -314,10 +347,25 @@ async function processRenderJob(job) {
           continuationDuration
         );
         carryZoom = 1.0; // reset after a reveal beat
+
+        if (job.wantsNarration) {
+          const expectedRevealDuration = REVEAL_OPENER_DURATION + continuationDuration - REVEAL_WIPE_DURATION;
+          await verifyClipDuration(job.jobId, `frame ${i} (reveal, ${presetKey})`, clipPath, expectedRevealDuration);
+        }
       } else {
         const result = await applyMotionPreset(frame, workDir, carryZoom);
         clipPath = result.path;
         carryZoom = result.endingZoom;
+
+        // Kling frames are deliberately excluded from this check — Kling's
+        // own returned duration routinely differs from what was requested
+        // (confirmed in real logs, e.g. "returned 5s when 4.5s was asked
+        // for"), which is expected vendor behavior, not a padding bug.
+        // This branch only ever runs for standard Ken Burns clips, so no
+        // extra guard is needed here beyond job.wantsNarration.
+        if (job.wantsNarration) {
+          await verifyClipDuration(job.jobId, `frame ${i} (standard, ${frame.motionPreset || "auto"})`, clipPath, frame.durationSeconds);
+        }
       }
       clipPaths.push(clipPath);
     }
