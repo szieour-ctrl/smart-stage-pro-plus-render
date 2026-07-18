@@ -509,11 +509,22 @@ const REVEAL_PRESETS = {
 
 // beforeClipPath / afterClipPath are pre-rendered motionRenderer.py clips
 // — beforeClipPath at REVEAL_OPENER_DURATION using the preset's
-// openerMotion, afterClipPath at REVEAL_CONTINUATION_DURATION using the
-// user's chosen End Motion. This function ONLY does the wipe compositing;
-// it does not call motionRenderer.py itself, so the caller (renderPipeline.js)
-// controls exactly what source images and durations went into each phase.
-function buildRevealClip(beforeClipPath, afterClipPath, presetKey, workDir, outputName) {
+// openerMotion, afterClipPath at continuationDurationOverride (or
+// REVEAL_CONTINUATION_DURATION if omitted) using the user's chosen End
+// Motion. This function ONLY does the wipe compositing; it does not call
+// motionRenderer.py itself, so the caller (renderPipeline.js) controls
+// exactly what source images and durations went into each phase.
+//
+// continuationDurationOverride (July 18, 2026) — lets renderPipeline.js's
+// intro/outro narration padding (+5s on the last clip) actually reach a
+// Reveal Preset's continuation phase. Without this, a padded reveal clip
+// silently rendered at the bare fixed duration anyway — confirmed as the
+// real cause of a narration cutoff on a real render (see renderPipeline.js's
+// padding-block comment for the full diagnosis). The xfade `offset` math
+// doesn't need to change for this — offset only depends on opener/wipe
+// durations, both still fixed, since it's measured from the start of the
+// FIRST input regardless of how long the second input's trimmed clip is.
+function buildRevealClip(beforeClipPath, afterClipPath, presetKey, workDir, outputName, continuationDurationOverride) {
   return new Promise((resolve, reject) => {
     const preset = REVEAL_PRESETS[presetKey];
     if (!preset) {
@@ -521,6 +532,7 @@ function buildRevealClip(beforeClipPath, afterClipPath, presetKey, workDir, outp
       return;
     }
     const outputPath = path.join(workDir, outputName);
+    const continuationDuration = continuationDurationOverride || REVEAL_CONTINUATION_DURATION;
 
     // xfade's `offset` is measured from the start of the FIRST input and
     // marks where the crossfade begins — so offset = openerDuration - wipeDuration
@@ -535,7 +547,7 @@ function buildRevealClip(beforeClipPath, afterClipPath, presetKey, workDir, outp
       .input(afterClipPath)
       .complexFilter([
         `[0:v]trim=duration=${REVEAL_OPENER_DURATION},setpts=PTS-STARTPTS[opener]`,
-        `[1:v]trim=duration=${REVEAL_CONTINUATION_DURATION},setpts=PTS-STARTPTS[continuation]`,
+        `[1:v]trim=duration=${continuationDuration},setpts=PTS-STARTPTS[continuation]`,
         `[opener][continuation]xfade=transition=${preset.wipeTransition}:duration=${REVEAL_WIPE_DURATION}:offset=${offset}[out]`,
       ])
       .outputOptions(["-map", "[out]", "-pix_fmt", "yuv420p"])
