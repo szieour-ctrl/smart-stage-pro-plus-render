@@ -17,7 +17,7 @@ const { downloadFrames } = require("./lib/downloadFrames");
 const { applyMotionPreset, resolveDuration } = require("./lib/motionPresets");
 const { applyKlingMotion } = require("./lib/klingMotion");
 const { generateMusic } = require("./lib/musicGen");
-const { assembleVideo, buildBeforeAfterClip, computeClipTimeline, extractMidpointFrame, probeDuration, mapWithConcurrencyLimit, FFMPEG_CONCURRENCY_LIMIT } = require("./lib/assemble");
+const { assembleVideo, buildRevealClip, REVEAL_PRESETS, REVEAL_OPENER_DURATION, REVEAL_CONTINUATION_DURATION, computeClipTimeline, extractMidpointFrame, probeDuration, mapWithConcurrencyLimit, FFMPEG_CONCURRENCY_LIMIT } = require("./lib/assemble");
 const { generateNarration, groupContiguousByRoom } = require("./lib/narrationGen");
 const { uploadToCloudinary } = require("./lib/cloudinaryUpload");
 const { notifyWebhook } = require("./lib/notify");
@@ -203,35 +203,54 @@ async function processRenderJob(job) {
           outcome: result.source,
         });
       } else if (frame.useRevealEffect && frame.isBeforeAfter && frame.beforeLocalPath) {
-        // CHANGE (found during before/after-pair conversation): this used
-        // to fire off isBeforeAfter alone — meaning ANY Ken Burns room
-        // with a real pair on file got this more elaborate reveal treatment
-        // automatically, whether the user wanted it or not (isBeforeAfter
-        // is auto-detected from real gallery data, not a deliberate
-        // choice). Now requires the separate, explicit useRevealEffect
-        // opt-in too — a user who just wants plain single-image Ken Burns
-        // on a room that happens to have a pair on file gets exactly that.
-        // Flagship feature: vacant room holds, then wipes into staged version.
-        // Build each side's motion clip first, then composite the wipe.
-        // Before/After clips don't participate in cross-room zoom continuity —
-        // they're a self-contained reveal, so always start at a fresh zoom.
-        const vacantResult = await applyMotionPreset(
-          { ...frame, localPath: frame.beforeLocalPath, motionPreset: "pull_back", durationSeconds: 3 },
+        // CHANGE (July 17, 2026 — Reveal Presets architecture replaces the
+        // old hardcoded pull_back(vacant)/push_in(staged) pairing). Same
+        // gating as before (explicit useRevealEffect opt-in, not just a
+        // known pair) — see the original comment this replaces for why
+        // that gate exists. What changed: the vacant side's motion, the
+        // wipe transition, and the staged side's motion are now all
+        // driven by REVEAL_PRESETS[frame.revealPreset] + frame.endMotion
+        // instead of two fixed constants. Durations are also no longer
+        // 3s/4s — they're the fixed REVEAL_OPENER_DURATION (1.5s) /
+        // REVEAL_CONTINUATION_DURATION (4.0s) phase lengths locked for
+        // this architecture (see assemble.js's buildRevealClip header
+        // comment for the full 3-phase timing math).
+        //
+        // Before/After clips don't participate in cross-room zoom
+        // continuity — they're a self-contained reveal, so always start
+        // at a fresh zoom (1.0) on both phases.
+        const presetKey = REVEAL_PRESETS[frame.revealPreset] ? frame.revealPreset : "classic_reveal";
+        const preset = REVEAL_PRESETS[presetKey];
+
+        // Server-side clamp — frame.endMotion arrives from the client
+        // (build-video-demo.html), which already filters its End Motion
+        // dropdown to preset.allowedEndMotions, but this is the
+        // authoritative backend and shouldn't trust that filtering held
+        // (stale client build, direct API call, etc.). Falls back to the
+        // preset's first allowed option, same default logic the frontend
+        // uses in defaultEndMotionFor().
+        const endMotion = preset.allowedEndMotions.includes(frame.endMotion)
+          ? frame.endMotion
+          : preset.allowedEndMotions[0];
+
+        const openerResult = await applyMotionPreset(
+          { ...frame, localPath: frame.beforeLocalPath, motionPreset: preset.openerMotion, durationSeconds: REVEAL_OPENER_DURATION },
           workDir,
           1.0
         );
-        const stagedResult = await applyMotionPreset(
-          { ...frame, motionPreset: "push_in", durationSeconds: 4 },
+        const continuationResult = await applyMotionPreset(
+          { ...frame, motionPreset: endMotion, durationSeconds: REVEAL_CONTINUATION_DURATION },
           workDir,
           1.0
         );
-        clipPath = await buildBeforeAfterClip(
-          vacantResult.path,
-          stagedResult.path,
+        clipPath = await buildRevealClip(
+          openerResult.path,
+          continuationResult.path,
+          presetKey,
           workDir,
-          `beforeafter_${path.basename(frame.localPath, path.extname(frame.localPath))}.mp4`
+          `reveal_${path.basename(frame.localPath, path.extname(frame.localPath))}.mp4`
         );
-        carryZoom = 1.0; // reset after a before/after beat
+        carryZoom = 1.0; // reset after a reveal beat
       } else {
         const result = await applyMotionPreset(frame, workDir, carryZoom);
         clipPath = result.path;
