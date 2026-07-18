@@ -116,6 +116,35 @@ async function processRenderJob(job) {
       console.log(`[${job.jobId}] Narration on — padded clip 1${localFrames.length > 1 ? " and last clip" : ""} by ${NARRATION_INTRO_OUTRO_PADDING_SECONDS}s for future intro/outro room.`);
     }
 
+    // NEW (Sam's request, July 18, 2026 — real render, CTA still cut off
+    // even after the reveal-padding fix above: "Come see it in person,
+    // and make this home..." got truncated mid-sentence, and the opening
+    // clip had time to spare while others were squeezed). Sam's call:
+    // stop trying to shave narration to fit ever-tighter windows via
+    // ElevenLabs speed correction, and instead give EVERY clip — not
+    // just the padded first/last — flat extra breathing room. Stacks on
+    // top of the +5s intro/outro padding above (so first/last end up
+    // with +5.8s total, everything else +0.8s). In a 20-frame video that's
+    // 20 * 0.8 = 16s of added total runtime — an explicit, deliberate
+    // tradeoff Sam chose, not something to re-optimize away later without
+    // asking him first.
+    //
+    // Runs AFTER the intro/outro block on purpose: resolveDuration(frame)
+    // returns frame.durationSeconds if already set (motionPresets.js),
+    // so first/last correctly stack on top of their existing +5s instead
+    // of this loop overwriting it.
+    const NARRATION_CLIP_PADDING_SECONDS = 0.8;
+    if (job.wantsNarration) {
+      for (const frame of localFrames) {
+        frame.durationSeconds = resolveDuration(frame) + NARRATION_CLIP_PADDING_SECONDS;
+        // Separate field (mirrors introOutroPaddingSeconds) so the Reveal
+        // Presets branch — which never reads frame.durationSeconds — can
+        // still add this to its continuation phase.
+        frame.narrationClipPaddingSeconds = NARRATION_CLIP_PADDING_SECONDS;
+      }
+      console.log(`[${job.jobId}] Narration breathing-room padding: +${NARRATION_CLIP_PADDING_SECONDS}s applied to all ${localFrames.length} clips.`);
+    }
+
     // ── Step 2: Apply motion preset to each frame → individual clips ─────
     // Runs while music generates in parallel (Step 3 kicks off immediately).
     const totalDuration = localFrames.reduce((sum, f) => sum + resolveDuration(f), 0);
@@ -259,8 +288,12 @@ async function processRenderJob(job) {
         // time — the opener is a brief vacant hold, stretching THAT for
         // outro narration room would make no visual sense; the
         // continuation (staged room, real motion) is the phase an intro/
-        // outro narration beat should actually play over.
-        const continuationDuration = REVEAL_CONTINUATION_DURATION + (frame.introOutroPaddingSeconds || 0);
+        // outro narration beat should actually play over. Stacks both
+        // padding sources: introOutroPaddingSeconds (first/last only,
+        // +5s) and narrationClipPaddingSeconds (every clip, +0.8s).
+        const continuationDuration = REVEAL_CONTINUATION_DURATION
+          + (frame.introOutroPaddingSeconds || 0)
+          + (frame.narrationClipPaddingSeconds || 0);
 
         const openerResult = await applyMotionPreset(
           { ...frame, localPath: frame.beforeLocalPath, motionPreset: preset.openerMotion, durationSeconds: REVEAL_OPENER_DURATION },
