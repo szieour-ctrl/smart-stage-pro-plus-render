@@ -78,6 +78,23 @@ async function processRenderJob(job) {
     if (job.wantsNarration && localFrames.length > 0) {
       const first = localFrames[0];
       first.durationSeconds = resolveDuration(first) + NARRATION_INTRO_OUTRO_PADDING_SECONDS;
+      // FIX (July 18, 2026 — real render, narration cut off ~2-3s before
+      // the video's true end): frame.durationSeconds is only read by the
+      // standard (non-reveal) branch of the frame loop below. The Reveal
+      // Presets branch ALWAYS renders at the fixed REVEAL_OPENER_DURATION/
+      // REVEAL_CONTINUATION_DURATION phase lengths and never looked at
+      // frame.durationSeconds at all — so when the padded clip landed on
+      // a Room Reveal frame, the padding was silently discarded and the
+      // clip rendered at its bare ~5.1s length instead of the intended
+      // ~10-11s. Confirmed from a real render log: the outro segment got
+      // only a 2.62s narration window (5.12s bare clip minus crossfade/
+      // end-buffer overhead) instead of the ~7.6s a properly-padded clip
+      // would have given it — a 20-word closing line needed 7.39s even at
+      // max speed correction, so most of it played past the video's end.
+      // introOutroPaddingSeconds is a separate field specifically so the
+      // reveal branch can add it to REVEAL_CONTINUATION_DURATION without
+      // needing to reverse-engineer it back out of durationSeconds.
+      first.introOutroPaddingSeconds = NARRATION_INTRO_OUTRO_PADDING_SECONDS;
       // Guard against localFrames.length === 1: first and last would be
       // the SAME object reference, so padding both would silently double
       // it on a single-clip video. Only pad the last clip separately when
@@ -85,11 +102,15 @@ async function processRenderJob(job) {
       if (localFrames.length > 1) {
         const last = localFrames[localFrames.length - 1];
         last.durationSeconds = resolveDuration(last) + NARRATION_INTRO_OUTRO_PADDING_SECONDS;
+        last.introOutroPaddingSeconds = NARRATION_INTRO_OUTRO_PADDING_SECONDS;
         // NEW (Sam's request — outro end motion): flags the last clip for
         // resolvePreset() in motionPresets.js, which defaults it to the
         // calm "float" preset instead of whatever directional preset its
         // room type would normally get — only takes effect if the user
-        // left it on "auto"; an explicit user choice still wins.
+        // left it on "auto"; an explicit user choice still wins. Note:
+        // this doesn't apply when the last clip is a Reveal Preset frame,
+        // since the reveal branch always passes an explicit endMotion,
+        // never "auto" — isOutro's float fallback is a non-issue there.
         last.isOutro = true;
       }
       console.log(`[${job.jobId}] Narration on — padded clip 1${localFrames.length > 1 ? " and last clip" : ""} by ${NARRATION_INTRO_OUTRO_PADDING_SECONDS}s for future intro/outro room.`);
@@ -233,13 +254,21 @@ async function processRenderJob(job) {
           ? frame.endMotion
           : preset.allowedEndMotions[0];
 
+        // FIX (July 18, 2026) — see the padding block's comment above for
+        // the full story. Only the continuation phase gets the extra
+        // time — the opener is a brief vacant hold, stretching THAT for
+        // outro narration room would make no visual sense; the
+        // continuation (staged room, real motion) is the phase an intro/
+        // outro narration beat should actually play over.
+        const continuationDuration = REVEAL_CONTINUATION_DURATION + (frame.introOutroPaddingSeconds || 0);
+
         const openerResult = await applyMotionPreset(
           { ...frame, localPath: frame.beforeLocalPath, motionPreset: preset.openerMotion, durationSeconds: REVEAL_OPENER_DURATION },
           workDir,
           1.0
         );
         const continuationResult = await applyMotionPreset(
-          { ...frame, motionPreset: endMotion, durationSeconds: REVEAL_CONTINUATION_DURATION },
+          { ...frame, motionPreset: endMotion, durationSeconds: continuationDuration },
           workDir,
           1.0
         );
@@ -248,7 +277,8 @@ async function processRenderJob(job) {
           continuationResult.path,
           presetKey,
           workDir,
-          `reveal_${path.basename(frame.localPath, path.extname(frame.localPath))}.mp4`
+          `reveal_${path.basename(frame.localPath, path.extname(frame.localPath))}.mp4`,
+          continuationDuration
         );
         carryZoom = 1.0; // reset after a reveal beat
       } else {
