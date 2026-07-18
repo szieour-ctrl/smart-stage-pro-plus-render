@@ -107,10 +107,36 @@ async function processRenderJob(job) {
     // — so net real extra room for the outro was only 3-2=1s at the old
     // padding value, too thin for a full closing line. 5s padding now
     // nets ~3s of real usable extra time after that subtraction.
-    const NARRATION_INTRO_OUTRO_PADDING_SECONDS = 5;
+    // RAISED from 5 to 7 (July 18, 2026 — same reasoning as the outro
+    // bump below: Sam's call that the opening and closing frames are the
+    // two that matter most and need real margin, not technically-
+    // sufficient math). At the observed pace FLOOR (~110 wpm), the
+    // intro's content (one room/exterior detail + a brief location
+    // welcome, ~17 words) needs ~9.3s of actual speech. The old 5s
+    // padding left almost no margin above that for a shorter room type
+    // (e.g. dining's 4.7s base) — technically enough on an average read,
+    // not genuinely safe on a slow one. 7s gives real headroom across
+    // every room type's base duration, not just the longer ones.
+    const NARRATION_INTRO_PADDING_SECONDS = 7;
+    // RAISED to 15 (July 18, 2026 — Sam's call: stop budgeting the two
+    // frames that matter most — the user's chosen opening and closing
+    // shots — against average-case timing math, and give them enough
+    // slack to work even in the worst case). 12s was technically enough
+    // against the AVERAGE measured natural pace (~150 wpm across all
+    // renders so far), but the real range has been 111-174 wpm depending
+    // on sentence content — budgeting against the average left almost no
+    // margin on a naturally slower read. At the observed FLOOR (~110
+    // wpm), the outro's real content (one room/exterior detail + the
+    // full address + an original CTA, ~28 words) needs ~15.3s of actual
+    // speech. 15s of padding gives real margin above that, not just
+    // technical sufficiency — the goal is this segment fitting at
+    // NATURAL pace (speed=1.0) without ever needing speed correction to
+    // bail it out, since correction has already been observed to
+    // silently fail to shorten anything in at least one real case.
+    const NARRATION_OUTRO_PADDING_SECONDS = 15;
     if (job.wantsNarration && localFrames.length > 0) {
       const first = localFrames[0];
-      first.durationSeconds = resolveDuration(first) + NARRATION_INTRO_OUTRO_PADDING_SECONDS;
+      first.durationSeconds = resolveDuration(first) + NARRATION_INTRO_PADDING_SECONDS;
       // FIX (July 18, 2026 — real render, narration cut off ~2-3s before
       // the video's true end): frame.durationSeconds is only read by the
       // standard (non-reveal) branch of the frame loop below. The Reveal
@@ -127,15 +153,15 @@ async function processRenderJob(job) {
       // introOutroPaddingSeconds is a separate field specifically so the
       // reveal branch can add it to REVEAL_CONTINUATION_DURATION without
       // needing to reverse-engineer it back out of durationSeconds.
-      first.introOutroPaddingSeconds = NARRATION_INTRO_OUTRO_PADDING_SECONDS;
+      first.introOutroPaddingSeconds = NARRATION_INTRO_PADDING_SECONDS;
       // Guard against localFrames.length === 1: first and last would be
       // the SAME object reference, so padding both would silently double
       // it on a single-clip video. Only pad the last clip separately when
       // there's genuinely more than one.
       if (localFrames.length > 1) {
         const last = localFrames[localFrames.length - 1];
-        last.durationSeconds = resolveDuration(last) + NARRATION_INTRO_OUTRO_PADDING_SECONDS;
-        last.introOutroPaddingSeconds = NARRATION_INTRO_OUTRO_PADDING_SECONDS;
+        last.durationSeconds = resolveDuration(last) + NARRATION_OUTRO_PADDING_SECONDS;
+        last.introOutroPaddingSeconds = NARRATION_OUTRO_PADDING_SECONDS;
         // NEW (Sam's request — outro end motion): flags the last clip for
         // resolvePreset() in motionPresets.js, which defaults it to the
         // calm "float" preset instead of whatever directional preset its
@@ -146,7 +172,7 @@ async function processRenderJob(job) {
         // never "auto" — isOutro's float fallback is a non-issue there.
         last.isOutro = true;
       }
-      console.log(`[${job.jobId}] Narration on — padded clip 1${localFrames.length > 1 ? " and last clip" : ""} by ${NARRATION_INTRO_OUTRO_PADDING_SECONDS}s for future intro/outro room.`);
+      console.log(`[${job.jobId}] Narration on — padded clip 1 by ${NARRATION_INTRO_PADDING_SECONDS}s (intro)${localFrames.length > 1 ? ` and last clip by ${NARRATION_OUTRO_PADDING_SECONDS}s (outro — room+address+CTA needs real room)` : ""}.`);
     }
 
     // NEW (Sam's request, July 18, 2026 — real render, CTA still cut off
