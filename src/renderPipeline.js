@@ -1,648 +1,365 @@
-// assemble.js — Concatenates motion clips with crossfade transitions,
-// mixes in background music, and renders final output formats.
+// renderPipeline.js — Orchestrates the full video render process
+//
+// Pipeline: download frames → apply motion → generate music (parallel)
+//           → assemble clips → mix audio → render formats → upload → notify
+//
+// Each step is its own module so they can be built and tested independently.
+// Right now, applyMotion, generateMusic, and assembleVideo are stubs that
+// return placeholder data — replace each stub once the corresponding
+// dependency (FFmpeg test, Mubert API key) is ready.
 
 const path = require("path");
 const fs = require("fs");
-const ffmpeg = require("fluent-ffmpeg");
+const os = require("os");
+const axios = require("axios");
 
-const CROSSFADE_DURATION = 0.6; // seconds between clips
+const { downloadFrames } = require("./lib/downloadFrames");
+const { applyMotionPreset, resolveDuration } = require("./lib/motionPresets");
+const { applyKlingMotion } = require("./lib/klingMotion");
+const { generateMusic } = require("./lib/musicGen");
+const { assembleVideo, buildBeforeAfterClip, computeClipTimeline, extractMidpointFrame, probeDuration, mapWithConcurrencyLimit, FFMPEG_CONCURRENCY_LIMIT } = require("./lib/assemble");
+const { generateNarration, groupContiguousByRoom } = require("./lib/narrationGen");
+const { uploadToCloudinary } = require("./lib/cloudinaryUpload");
+const { notifyWebhook } = require("./lib/notify");
 
-// ── CONCURRENCY-LIMITED MAP (July 14, 2026 — real test failure) ────────
-// Two separate real failures in the same render (a narration frame
-// extraction and a clip normalization) both threw resource-exhaustion-
-// flavored ffmpeg errors ("Resource temporarily unavailable", "Error
-// while opening encoder" on a clip with perfectly clean, even
-// dimensions — ruling out the odd-dimension theory from the prior fix).
-// Both call sites were launching one ffmpeg process PER CLIP, all at
-// once, via unbounded Promise.all — up to 9 simultaneous ffmpeg encodes
-// for a 9-frame job. That's a real, plausible cause of exactly this
-// class of intermittent failure on a resource-constrained container,
-// regardless of which specific resource (CPU, memory, file descriptors)
-// is actually the bottleneck. This caps how many run at once instead of
-// firing all of them simultaneously — processes the rest as slots free
-// up, rather than requiring every clip to fit in memory/CPU at the same
-// instant.
-async function mapWithConcurrencyLimit(items, limit, fn) {
-  const results = new Array(items.length);
-  let cursor = 0;
-  async function worker() {
-    while (cursor < items.length) {
-      const i = cursor++;
-      results[i] = await fn(items[i], i);
-    }
-  }
-  const workers = Array.from({ length: Math.min(limit, items.length) }, worker);
-  await Promise.all(workers);
-  return results;
-}
-const FFMPEG_CONCURRENCY_LIMIT = 3; // conservative default — revisit if Railway's plan tier is confirmed to have more headroom
+// ── NARRATION VOICE LIBRARY ───────────────────────────────────────────
+// MUST stay in sync with NARRATION_VOICES in build-video-demo.html.
+// Real voice_ids, already confirmed working (Male — Audiobook Narrator,
+// Female — Adeline/Conversational — see the July 13 voice-selection
+// conversation). Not "Default" category voices, which expire Dec 31,
+// 2026 — these are permanent Voice Library picks.
+const NARRATION_VOICE_LIBRARY = {
+  "voice_male_1":   "pVYHFs8oaIDPWJxvmXWW",
+  "voice_female_1": "5l5f8iK3YPeGga21rQIX",
+};
 
-// NEW (July 14, 2026 — real test failure) — mirrors
-// NARRATION_END_BUFFER_SECONDS in generate-narration-background.js. That
-// file sizes the SCRIPT to roughly fit before this buffer; this constant
-// is the hard enforcement backstop at mix time, against the real, exact
-// video duration rather than an estimate.
-const NARRATION_END_BUFFER_SECONDS = 2;
+async function processRenderJob(job) {
+  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), `job-${job.jobId}-`));
 
-// ── NORMALIZE CLIP (fixes the real root cause of the xfade crash) ────────
-// CONFIRMED ROOT CAUSE of "Error reinitializing filters! / Failed to
-// inject frame into filter network: Invalid argument" — a real crash from
-// a real test job with 4 clips, 2 sourced from Kling (fal.ai's own output
-// resolution/fps/codec) and 2 from the local Ken Burns fallback (OpenCV/
-// FFmpeg, whatever this codebase already renders at). xfade requires every
-// pair of inputs it chains together to share resolution, frame rate, and
-// pixel format — concatenateClips() never enforced this, so any mix of
-// Kling + Ken Burns clips (or even two Kling clips at different durations/
-// fal.ai output settings) was one mismatch away from crashing the whole
-// render.
-//
-// FIX: normalize every clip to identical parameters BEFORE it ever reaches
-// the xfade chain, regardless of source. This is deliberately a fixed
-// target (1920x1080/30fps/yuv420p) rather than "whatever Kling outputs" —
-// Ken Burns clips would still need separate normalization to MATCH
-// whatever Kling's native spec is, so pinning both to one target this
-// codebase controls is no more work and is robust to fal.ai ever changing
-// Kling's default output spec in the future. 1920x1080 matches the final
-// 16:9 output exactly, so this adds no redundant scaling at renderFormat()
-// time for the common case.
-// CHANGE: fps corrected from an initial 30 to 20, to match the EXISTING
-// normalization convention already established in klingMotion.js's own
-// concatTwoClips() (used for the Before/After continuation feature) —
-// confirmed by direct inspection: OUTPUT_W=1920, OUTPUT_H=1080, fps=20,
-// format=yuv420p. Using a different fps here would have meant a
-// continuation-combined clip (already normalized once, at 20fps, inside
-// klingMotion.js) gets silently re-normalized to a SECOND, different fps
-// the moment it reaches assemble.js — wasted re-encoding at best, and a
-// new source of inconsistency at worst if other clips in the same job
-// were normalized to yet a third value. One target, matched across both
-// files, is the actual fix — not just "pick a fixed number and move on."
-const NORMALIZE_WIDTH  = 1920;
-const NORMALIZE_HEIGHT = 1080;
-const NORMALIZE_FPS    = 20;
+  // NEW (bug 2g — refund logic): declared here, not inside the try block,
+  // so it's still readable in the catch block below if a failure happens
+  // partway through the frame loop — informational on the failure path
+  // (the failure refund is a full-charge refund regardless, per the locked
+  // design: no usable video means no charge is defensible either way), but
+  // useful for diagnosing exactly which frames had already rendered via
+  // Kling (real cost already incurred) before the failure occurred.
+  let klingFrameOutcomes = [];
 
-function normalizeClip(clipPath, workDir, index) {
-  return new Promise(async (resolve, reject) => {
-    const outputPath = path.join(workDir, `normalized_${index}.mp4`);
+  try {
+    console.log(`[${job.jobId}] Starting render. ${job.frames.length} frames.`);
 
-    // NEW (July 14, 2026 — real test failure) — a real render failed here
-    // with "Error while opening encoder for output stream #0:0 - maybe
-    // incorrect parameters such as bit_rate, rate, width or height" on
-    // clip index 6, with no further detail on WHY. That error message is
-    // FFmpeg's generic catch-all for the encoder rejecting the stream —
-    // it doesn't say what was actually wrong with the source. Rather than
-    // guess, probe the source clip FIRST and log its real properties, so
-    // if this happens again the log states the actual cause (corrupt
-    // file, zero duration, unusual dimensions) instead of a mystery.
-    try {
-      const meta = await new Promise((res, rej) => {
-        ffmpeg.ffprobe(clipPath, (err, data) => err ? rej(err) : res(data));
-      });
-      const videoStream = meta.streams?.find(s => s.codec_type === "video");
-      console.log(`[normalizeClip] clip ${index} (${clipPath}): ${videoStream?.width}x${videoStream?.height}, duration=${meta.format?.duration}, codec=${videoStream?.codec_name}`);
-    } catch (probeErr) {
-      // The clip is likely corrupt/unreadable if even ffprobe can't read
-      // it — this IS useful diagnostic information, log it and continue
-      // to the real normalization attempt below (which will then fail
-      // with its own, now-better-understood error).
-      console.error(`[normalizeClip] clip ${index} (${clipPath}) failed to probe — likely corrupt or incomplete: ${probeErr.message}`);
+    // ── Step 1: Download all frame images to local disk ──────────────────
+    const localFrames = await downloadFrames(job.frames, workDir);
+    console.log(`[${job.jobId}] Downloaded ${localFrames.length} frames.`);
+
+    // NEW (narration grouping + intro/outro build): when narration is on,
+    // clip 1 and the last clip in the queue get extra duration so there's
+    // real room for an intro/outro narration beat later, instead of that
+    // narration being crammed into whatever the room's normal hold time
+    // happens to be. Duration-only mechanic for now — actual intro
+    // (address/location) and outro (CTA/sign-off) SCRIPT CONTENT is
+    // separate, not-yet-built work; Sam's call was best-practices help
+    // content for photo ordering, not an auto-generated title card. This
+    // just reserves the time so that future work has somewhere to land.
+    //
+    // Whole-second padding, not a fractional value — Kling's API only
+    // accepts whole-second durations (3-15, see klingMotion.js's
+    // buildKlingRequest), and while it does round fractional requests
+    // itself, staying whole here avoids an unnecessary round-trip through
+    // that rounding logic for the common case.
+    // RAISED from 3 to 5 (Sam's feedback, real render — outro cut off
+    // mid-sentence): mixAudio's NARRATION_END_BUFFER_SECONDS (2s) is now
+    // subtracted from the last group's usable duration when its word
+    // budget is calculated (see groupContiguousByRoom in narrationGen.js)
+    // — so net real extra room for the outro was only 3-2=1s at the old
+    // padding value, too thin for a full closing line. 5s padding now
+    // nets ~3s of real usable extra time after that subtraction.
+    const NARRATION_INTRO_OUTRO_PADDING_SECONDS = 5;
+    if (job.wantsNarration && localFrames.length > 0) {
+      const first = localFrames[0];
+      first.durationSeconds = resolveDuration(first) + NARRATION_INTRO_OUTRO_PADDING_SECONDS;
+      // Guard against localFrames.length === 1: first and last would be
+      // the SAME object reference, so padding both would silently double
+      // it on a single-clip video. Only pad the last clip separately when
+      // there's genuinely more than one.
+      if (localFrames.length > 1) {
+        const last = localFrames[localFrames.length - 1];
+        last.durationSeconds = resolveDuration(last) + NARRATION_INTRO_OUTRO_PADDING_SECONDS;
+        // NEW (Sam's request — outro end motion): flags the last clip for
+        // resolvePreset() in motionPresets.js, which defaults it to the
+        // calm "float" preset instead of whatever directional preset its
+        // room type would normally get — only takes effect if the user
+        // left it on "auto"; an explicit user choice still wins.
+        last.isOutro = true;
+      }
+      console.log(`[${job.jobId}] Narration on — padded clip 1${localFrames.length > 1 ? " and last clip" : ""} by ${NARRATION_INTRO_OUTRO_PADDING_SECONDS}s for future intro/outro room.`);
     }
 
-    ffmpeg(clipPath)
-      .videoFilters([
-        // Scale to fit within target dimensions preserving aspect ratio,
-        // then pad to exactly the target size — same safe-default pattern
-        // already used in renderFormat() below, applied here instead at
-        // the per-clip stage so xfade never sees a size mismatch.
-        //
-        // FIX (July 14, 2026 — real test failure): added
-        // force_divisible_by=2. Without it, an unusual source aspect
-        // ratio can make force_original_aspect_ratio=decrease compute an
-        // intermediate ODD dimension (e.g. 1919 instead of 1920) —
-        // libx264's yuv420p output requires both dimensions even, and an
-        // odd intermediate size is a well-documented cause of exactly
-        // this "Error while opening encoder" failure. This forces the
-        // scale step itself to only ever produce even numbers, closing
-        // off that failure mode regardless of the source clip's own
-        // aspect ratio.
-        `scale=${NORMALIZE_WIDTH}:${NORMALIZE_HEIGHT}:force_original_aspect_ratio=decrease:force_divisible_by=2`,
-        `pad=${NORMALIZE_WIDTH}:${NORMALIZE_HEIGHT}:(ow-iw)/2:(oh-ih)/2`,
-        `fps=${NORMALIZE_FPS}`,
-      ])
-      .outputOptions(["-pix_fmt", "yuv420p", "-c:v", "libx264", "-preset", "fast"])
-      // Audio is dropped here deliberately — concatenateClips' xfade only
-      // ever operates on [x:v] video streams (see lastLabel/nextLabel
-      // below), and mixAudio() adds the real soundtrack afterward across
-      // the whole concatenated video. Carrying per-clip audio through this
-      // step would be discarded work and a second source of format
-      // mismatches (Kling clips may have audio tracks with different
-      // sample rates than Ken Burns clips, which have none at all).
-      .noAudio()
-      .output(outputPath)
-      .on("end", () => resolve(outputPath))
-      .on("error", (err) => reject(new Error(`Clip normalization failed for ${clipPath} (index ${index}): ${err.message}`)))
-      .run();
-  });
-}
+    // ── Step 2: Apply motion preset to each frame → individual clips ─────
+    // Runs while music generates in parallel (Step 3 kicks off immediately).
+    const totalDuration = localFrames.reduce((sum, f) => sum + resolveDuration(f), 0);
 
-// ── PROBE ACTUAL CLIP DURATION ───────────────────────────────────────────
-// The previous version assumed every clip was exactly 4.5s when calculating
-// crossfade offsets. That assumption was wrong as soon as duration varied
-// even slightly, and caused xfade offsets to be miscalculated — visually
-// "swallowing" earlier clips in the sequence (only the last clip appeared
-// in testing with 2 frames). Probing real duration fixes this at the root.
-
-function probeDuration(clipPath) {
-  return new Promise((resolve, reject) => {
-    ffmpeg.ffprobe(clipPath, (err, metadata) => {
-      if (err) return reject(new Error(`ffprobe failed for ${clipPath}: ${err.message}`));
-      resolve(metadata.format.duration);
+    const musicPromise = generateMusic({
+      durationSeconds: Math.ceil(totalDuration),
+      musicStyle: job.musicStyle || "default",
+      workDir,
     });
-  });
-}
 
-// ── COMPUTE CLIP TIMELINE (July 2026 — footage-grounded narration) ──────
-// Extracted from concatenateClips' own offset math below — previously
-// that math only existed inline, computed and discarded per-transition,
-// with no way for anything outside this function to know where a given
-// clip actually lands in the final timeline. Narration generation needs
-// exactly that: a real start time per clip, to extract a representative
-// frame from and to place a narration segment at. Single source of
-// truth — concatenateClips now calls this instead of recomputing the
-// same math a second time in a way that could drift out of sync with it.
-function computeClipTimeline(durations) {
-  const timeline = [];
-  let cumulativeStart = 0;
-  for (let i = 0; i < durations.length; i++) {
-    timeline.push({ startTime: Math.max(0, cumulativeStart), duration: durations[i] });
-    cumulativeStart += durations[i] - CROSSFADE_DURATION;
-  }
-  return timeline;
-}
+    const clipPaths = [];
+    let carryZoom = 1.0; // tracks ending zoom of the previous clip for continuity
 
-// Extracts one representative frame from a clip — its own local midpoint,
-// independent of where it lands in the crossfaded final timeline (a
-// crossfade blends the very start/end of adjacent clips, but the middle
-// of any clip is always a clean, representative frame of that room).
-function extractMidpointFrame(clipPath, duration, workDir, index) {
-  return new Promise((resolve, reject) => {
-    const outputPath = path.join(workDir, `narration_frame_${index}.jpg`);
-    const midpoint = Math.max(0.1, duration / 2);
-    ffmpeg(clipPath)
-      .inputOptions([`-ss`, `${midpoint.toFixed(2)}`])
-      .outputOptions(["-vframes", "1", "-q:v", "3"])
-      .output(outputPath)
-      .on("end", () => resolve(outputPath))
-      .on("error", (err) => reject(new Error(`extractMidpointFrame failed for clip ${index}: ${err.message}`)))
-      .run();
-  });
-}
+    // Tracks, per Kling-requested frame, whether it actually rendered via
+    // Kling or silently fell back to Ken Burns. sequenceOrder is passed
+    // through from video-job.js's dispatch payload — falls back to array
+    // index if a frame is somehow missing it, so this never throws, it just
+    // degrades to position-based matching.
 
-// ── CONCATENATE CLIPS WITH CROSSFADE ─────────────────────────────────────
-// Chains xfade filters across all clips in sequence using REAL probed
-// durations for offset calculation, not an assumed fixed length.
+    for (let i = 0; i < localFrames.length; i++) {
+      const frame = localFrames[i];
+      let clipPath;
 
-// ── SINGLE XFADE CHAIN ────────────────────────────────────────────────
-// The actual crossfade-chaining logic, extracted so it can run both on a
-// full clip set (small jobs) and on individual batches (large jobs) — see
-// concatenateClips below for why batching exists. Behavior is identical
-// either way: same CROSSFADE_DURATION overlap, same offset math, so
-// total transition count and total overlap time stays consistent
-// regardless of how many ffmpeg invocations it takes to get there —
-// which matters because computeClipTimeline() (used separately, for
-// narration placement in renderPipeline.js) assumes that consistency.
-function xfadeChain(paths, durations, workDir, outputName) {
-  if (paths.length === 1) return Promise.resolve(paths[0]);
-
-  return new Promise((resolve, reject) => {
-    const outputPath = path.join(workDir, outputName);
-    const command = ffmpeg();
-    paths.forEach((clip) => command.input(clip));
-
-    let filterParts = [];
-    let lastLabel = "0:v";
-    let cumulativeOffset = durations[0] - CROSSFADE_DURATION;
-
-    for (let i = 1; i < paths.length; i++) {
-      const nextLabel = `${i}:v`;
-      const outLabel = i === paths.length - 1 ? "outv" : `v${i}`;
-      filterParts.push(
-        `[${lastLabel}][${nextLabel}]xfade=transition=fade:duration=${CROSSFADE_DURATION}:offset=${Math.max(0, cumulativeOffset).toFixed(2)}[${outLabel}]`
-      );
-      lastLabel = outLabel;
-      cumulativeOffset += durations[i] - CROSSFADE_DURATION;
-    }
-
-    // NEW (July 15, 2026 — real render hang, 32+ minutes of total
-    // silence with the process itself still healthy per the memory
-    // logger): nothing previously bounded how long a single xfadeChain
-    // ffmpeg call could run. If the process spawns and then genuinely
-    // never emits 'end' OR 'error' — a real ffmpeg hang, not a crash —
-    // this used to wait forever with zero recourse. XFADE_TIMEOUT_MS
-    // gives it a generous window (this file's own batches are small,
-    // ≤3 clips each) before force-killing the process and failing
-    // cleanly instead of silently consuming Railway resources forever.
-    const XFADE_TIMEOUT_MS = 120000; // 2 minutes — generous for a ≤3-clip batch
-    let settled = false;
-    const timeoutHandle = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      console.error(`[xfadeChain] TIMEOUT after ${XFADE_TIMEOUT_MS}ms — killing hung ffmpeg process for ${outputPath}.`);
-      try { command.kill("SIGKILL"); } catch (err) { /* best-effort */ }
-      reject(new Error(`xfadeChain timed out after ${XFADE_TIMEOUT_MS}ms for ${outputPath} — ffmpeg process spawned but never completed or errored.`));
-    }, XFADE_TIMEOUT_MS);
-
-    command
-      .complexFilter(filterParts)
-      .outputOptions(["-map", "[outv]", "-pix_fmt", "yuv420p"])
-      .output(outputPath)
-      .on("end", async () => {
-        if (settled) return;
-        // FIX (July 15, 2026 — real render failure): ffmpeg's 'end' event
-        // firing means the PROCESS reported success, but on a container
-        // filesystem under I/O load (which a render with several
-        // sequential batch xfadeChain calls definitely has), that can
-        // fire microseconds before the output file is actually durably
-        // visible on disk. Confirmed real: a genuine 2-clip batch's
-        // output (concat_r0_6.mp4) resolved successfully here, then
-        // probeDuration's ffprobe call moments later got "No such file
-        // or directory" on that exact path. This almost certainly
-        // explains the prior silent deaths too — those likely hit this
-        // same race, just before the process-level crash handlers
-        // existed to catch and log the resulting unhandled rejection
-        // instead of the process dying with zero trace.
+      if (frame.useAiMotion) {
+        // Premium AI motion via Kling — interior requires both vacant+staged
+        // URLs (enforced inside klingMotion.js), exterior allows single or
+        // paired images. Falls back to standard Ken Burns on any failure.
         //
-        // Polling a few times with a short delay before giving up gives
-        // the filesystem a moment to catch up rather than trusting the
-        // event's timing blindly.
-        for (let attempt = 0; attempt < 5; attempt++) {
-          if (fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0) {
-            settled = true;
-            clearTimeout(timeoutHandle);
-            resolve(outputPath);
-            return;
-          }
-          await new Promise((r) => setTimeout(r, 200));
+        // IMPORTANT: Kling fetches images itself from a public URL — it
+        // needs the original Cloudinary URLs (frame.remoteImageUrl /
+        // frame.remoteBeforeUrl), not the local disk paths downloadFrames.js
+        // already pulled down for the Ken Burns/FFmpeg path.
+        //
+        // localPath is also passed through — it's the staged image already
+        // downloaded locally, used by the optional continuation-motion step
+        // (Ken Burns push-in/parallax that plays after Kling's transformation
+        // settles), so we never need to extract a frame from Kling's own
+        // video output.
+        // FIX (July 14, 2026 — real test failure): this used to gate on
+        // frame.isBeforeAfter alone — the ORIGINAL flag from the dispatch
+        // payload, set before any download was even attempted. When the
+        // before image 404'd, downloadFrames.js correctly nulled
+        // beforeLocalPath (the LOCAL file our own Ken Burns/continuation
+        // path reads), but isBeforeAfter and remoteBeforeUrl were never
+        // touched — so THIS code, independently, still told Kling to
+        // fetch the same broken URL directly (Kling fetches images
+        // itself, from the public URL, not from our local disk). Kling
+        // correctly rejected it: "Unprocessable Entity." Two different
+        // consumers of "is there really a usable before image" fell out
+        // of sync — downloadFrames.js's local check got fixed, this
+        // remote one didn't. Now gated on beforeLocalPath specifically,
+        // the one field that reflects whether the download ACTUALLY
+        // succeeded, not just whether one was originally expected.
+        const hasRealBeforeImage = frame.isBeforeAfter && !!frame.beforeLocalPath;
+        const result = await applyKlingMotion(
+          {
+            imageUrl: hasRealBeforeImage ? frame.remoteBeforeUrl : frame.remoteImageUrl,
+            endImageUrl: hasRealBeforeImage ? frame.remoteImageUrl : undefined,
+            roomType: frame.roomType,
+            // BUG FIX (July 2026): this object never included the preset
+            // field at all, in any prior version of this file — confirmed
+            // via a real test job where every frame was rejected with
+            // "(none — generic default)" despite video-job.js correctly
+            // sending klingMotionPreset in the dispatch payload (bug 2e's
+            // fix). That fix was necessary but not sufficient: this object
+            // construction, independently, dropped the field before it ever
+            // reached klingMotion.js's enforceScopeRules()/buildPrompt(),
+            // both of which read frame.klingMotionPreset specifically. This
+            // means NO custom Kling preset has ever actually been honored in
+            // production until this fix — every Kling-bound frame without a
+            // known pair silently hit the generic-default rejection and fell
+            // back to Ken Burns, regardless of what preset the user selected.
+            klingMotionPreset: frame.klingMotionPreset,
+            durationSeconds: resolveDuration(frame),
+            customPrompt: frame.customPrompt,
+            localPath: frame.localPath,
+            addContinuationMotion: !!frame.addContinuationMotion,
+            continuationPreset: frame.continuationPreset,
+            continuationDurationSeconds: frame.continuationDurationSeconds,
+          },
+          workDir,
+          // FIX (July 14, 2026 — real test failure): was passing the
+          // original `frame` straight through, unchanged — meaning
+          // frame.motionPreset still held whatever KLING preset was
+          // selected (e.g. "cinematic_push" for Hero Transformation).
+          // Ken Burns has its own, entirely different preset vocabulary
+          // and doesn't recognize Kling preset names — motionPresets.js
+          // correctly caught this and fell back to "auto" anyway, but
+          // logged a confusing "Unknown preset" warning every time,
+          // making a real, intentional fallback look like a bug. Now
+          // explicit: a Kling failure always means Ken Burns renders
+          // with auto, stated directly instead of arrived at via a
+          // failed lookup.
+          () => applyMotionPreset({ ...frame, motionPreset: "auto" }, workDir, carryZoom)
+        );
+        clipPath = result.path;
+        carryZoom = result.endingZoom;
+
+        // result.source is "kling" (real Kling output) or
+        // "ken_burns_fallback" (applyKlingMotion() caught a failure and
+        // fell back) — set in klingMotion.js's applyKlingMotion(). This is
+        // exactly the distinction video-notify.js needs to know which
+        // billed frames to refund.
+        klingFrameOutcomes.push({
+          sequenceOrder: frame.sequenceOrder !== undefined ? frame.sequenceOrder : i,
+          outcome: result.source,
+        });
+      } else if (frame.useRevealEffect && frame.isBeforeAfter && frame.beforeLocalPath) {
+        // CHANGE (found during before/after-pair conversation): this used
+        // to fire off isBeforeAfter alone — meaning ANY Ken Burns room
+        // with a real pair on file got this more elaborate reveal treatment
+        // automatically, whether the user wanted it or not (isBeforeAfter
+        // is auto-detected from real gallery data, not a deliberate
+        // choice). Now requires the separate, explicit useRevealEffect
+        // opt-in too — a user who just wants plain single-image Ken Burns
+        // on a room that happens to have a pair on file gets exactly that.
+        // Flagship feature: vacant room holds, then wipes into staged version.
+        // Build each side's motion clip first, then composite the wipe.
+        // Before/After clips don't participate in cross-room zoom continuity —
+        // they're a self-contained reveal, so always start at a fresh zoom.
+        const vacantResult = await applyMotionPreset(
+          { ...frame, localPath: frame.beforeLocalPath, motionPreset: "pull_back", durationSeconds: 3 },
+          workDir,
+          1.0
+        );
+        const stagedResult = await applyMotionPreset(
+          { ...frame, motionPreset: "push_in", durationSeconds: 4 },
+          workDir,
+          1.0
+        );
+        clipPath = await buildBeforeAfterClip(
+          vacantResult.path,
+          stagedResult.path,
+          workDir,
+          `beforeafter_${path.basename(frame.localPath, path.extname(frame.localPath))}.mp4`
+        );
+        carryZoom = 1.0; // reset after a before/after beat
+      } else {
+        const result = await applyMotionPreset(frame, workDir, carryZoom);
+        clipPath = result.path;
+        carryZoom = result.endingZoom;
+      }
+      clipPaths.push(clipPath);
+    }
+    console.log(`[${job.jobId}] Motion applied to ${clipPaths.length} clips.`);
+
+    // ── Step 2.5: Generate footage-grounded narration (July 14, 2026) ────
+    // Runs HERE, not before rendering — see narrationGen.js's header
+    // comment for the full reasoning. Needs the REAL rendered clips
+    // (their real durations, which can differ from what was requested —
+    // Kling has returned 5s when 4.5s was asked for in real logs) to
+    // compute accurate timeline positions and extract real footage to
+    // ground the script in. Wrapped in its own try/catch: a narration
+    // failure should never take down a video that otherwise rendered
+    // fine, same principle as Kling falling back to Ken Burns rather
+    // than failing the whole job.
+    let narrationSegments = [];
+    let narrationFullScript = null;
+    if (job.wantsNarration) {
+      try {
+        const realDurations = await Promise.all(clipPaths.map(probeDuration));
+        const timeline = computeClipTimeline(realDurations);
+
+        // FIX (July 14, 2026 — real test failure): was Promise.all,
+        // unbounded — see assemble.js's mapWithConcurrencyLimit header
+        // comment for the full reasoning (a real test job threw a
+        // resource-exhaustion-flavored ffmpeg error here, "Resource
+        // temporarily unavailable," extracting frames for all 9 clips
+        // simultaneously).
+        const framePaths = await mapWithConcurrencyLimit(
+          clipPaths, FFMPEG_CONCURRENCY_LIMIT, (clip, i) => extractMidpointFrame(clip, realDurations[i], workDir, i)
+        );
+
+        // CHANGE (narration coherence fix, per July 14 handoff + Sam's
+        // direct feedback on real output): was strict 1:1 — one segment
+        // per clip, one frame per segment. Replaced with contiguous
+        // room-based grouping (groupContiguousByRoom in narrationGen.js)
+        // — multiple angles/crops of the same room, ordered back-to-back
+        // by the user, now become ONE longer narration segment spanning
+        // all of them, with up to 4 representative frames sent to the
+        // same vision call instead of one call per clip. This is what
+        // actually fixes the ~10-word-per-segment cramping: a 3-angle
+        // bedroom run at ~4s/clip now gets ~12s of real word budget
+        // instead of 3 separate 4s budgets that each cut off mid-thought.
+        const timelineSegments = groupContiguousByRoom(localFrames, framePaths, timeline);
+
+        const voiceId = NARRATION_VOICE_LIBRARY[job.voiceKey];
+        if (!voiceId) {
+          throw new Error(`Voice "${job.voiceKey}" is not configured with a real ElevenLabs voice_id.`);
         }
-        if (settled) return;
-        settled = true;
-        clearTimeout(timeoutHandle);
-        reject(new Error(`xfadeChain reported success but ${outputPath} never became visible on disk after 1s of polling.`));
-      })
-      .on("error", (err) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timeoutHandle);
-        reject(new Error(`Concatenation failed: ${err.message}`));
-      })
-      .run();
-  });
-}
 
-// Keeps any single xfadeChain() call's simultaneous open-input count
-// bounded. CONFIRMED CAUSE (July 15, 2026 — real render failure, 17
-// clips): "Error reinitializing filters! Failed to inject frame into
-// filter network: Resource temporarily unavailable" on the LAST stream
-// of a 17-input complex filter graph — the exact same resource-
-// exhaustion error signature already root-caused once before in this
-// file (see mapWithConcurrencyLimit's header comment), but that earlier
-// fix only covered too many concurrent ffmpeg PROCESSES (normalizeClip,
-// extractMidpointFrame). It never covered this: one single process with
-// 17 simultaneous input STREAMS chained through 16 xfade filters in one
-// complex filter graph. An 11-clip job rendered fine; 17 didn't — a real
-// scaling ceiling, not a one-off.
-//
-// LOWERED to 3 (July 15, 2026 — same exact death, second time in a row,
-// now with even longer clips than the first failure — 11.2s padded vs
-// 9.52s last time, same silent cutoff right after the last clip
-// normalizes, right at the transition into concatenation's heaviest
-// phase). Memory graph data was inconclusive on the first failure, but
-// two consecutive identical deaths at growing clip sizes is a strong
-// enough pattern to act on rather than wait for cleaner metrics.
-const XFADE_BATCH_SIZE = 3;
-
-// ── CONCATENATE CLIPS (batched) ───────────────────────────────────────
-async function concatenateClips(clipPaths, workDir) {
-  // NEW — normalize every clip BEFORE the single-clip early-return check
-  // too. A single Kling clip still needs to end up at a known, consistent
-  // resolution/fps/pixel format for mixAudio()/renderFormat() downstream,
-  // even though there's no xfade chain to crash with only one clip.
-  //
-  // FIX (July 14, 2026 — real test failure): was Promise.all, unbounded —
-  // see mapWithConcurrencyLimit's header comment for the full reasoning.
-  const normalizedPaths = await mapWithConcurrencyLimit(
-    clipPaths, FFMPEG_CONCURRENCY_LIMIT, (clip, i) => normalizeClip(clip, workDir, i)
-  );
-
-  if (normalizedPaths.length === 1) {
-    return normalizedPaths[0];
-  }
-
-  const durations = await Promise.all(normalizedPaths.map(probeDuration));
-
-  // Small jobs: one chain, same as before, no behavior change.
-  if (normalizedPaths.length <= XFADE_BATCH_SIZE) {
-    return xfadeChain(normalizedPaths, durations, workDir, "concatenated.mp4");
-  }
-
-  // Large jobs: divide-and-conquer. Chain each batch of XFADE_BATCH_SIZE
-  // clips into an intermediate file (bounded input count per ffmpeg
-  // call), probe each intermediate's REAL resulting duration (crossfade
-  // overlap means it's shorter than a naive sum of its inputs), then
-  // repeat on the intermediates. Keeps going until one file remains.
-  //
-  // FIX (July 15, 2026 — real render still failed after the first
-  // batching attempt): batches were being run through
-  // mapWithConcurrencyLimit at FFMPEG_CONCURRENCY_LIMIT=3 — the same
-  // pool used for normalizeClip. That was the wrong reuse. normalizeClip
-  // is one input per process, so 3 concurrent calls = 3 total open
-  // streams, trivial. Each xfadeChain batch call is itself a heavy
-  // multi-stream ffmpeg operation — running 3 of THOSE concurrently
-  // meant up to 3 processes × 6 inputs ≈ 18 simultaneous streams on the
-  // container at once, barely less aggregate load than the original
-  // 20-in-one-process failure this was supposed to fix. Confirmed by a
-  // real render crashing on batch 1 alone (stream #5:0) — under
-  // contention from the other batches starting alongside it. Batches now
-  // run strictly sequentially — one xfadeChain call at a time, nothing
-  // else competing with it. Costs some wall-clock time; that's the right
-  // trade for a step that's failed twice in production.
-  let currentPaths = normalizedPaths;
-  let currentDurations = durations;
-  let round = 0;
-
-  while (currentPaths.length > 1) {
-    const batches = [];
-    for (let i = 0; i < currentPaths.length; i += XFADE_BATCH_SIZE) {
-      batches.push({
-        paths: currentPaths.slice(i, i + XFADE_BATCH_SIZE),
-        durations: currentDurations.slice(i, i + XFADE_BATCH_SIZE),
-      });
-    }
-
-    const batchOutputs = [];
-    for (let i = 0; i < batches.length; i++) {
-      console.log(`[concatenateClips] Round ${round}, batch ${i}/${batches.length - 1} starting (${batches[i].paths.length} clips)...`);
-      const out = await xfadeChain(batches[i].paths, batches[i].durations, workDir, `concat_r${round}_${i}.mp4`);
-      console.log(`[concatenateClips] Round ${round}, batch ${i}/${batches.length - 1} done.`);
-      batchOutputs.push(out);
-    }
-
-    // NEW (July 15, 2026 — same crash, second time in a row, at growing
-    // clip sizes): every normalized clip and every prior round's
-    // intermediate files were sitting on disk for the ENTIRE render with
-    // zero cleanup — a real, growing footprint as clip durations
-    // increased this session (padded clips went from 7.52s to 9.52s to
-    // 11.2s across three consecutive test rounds). currentPaths here are
-    // exactly what THIS round just consumed as input and will never be
-    // read again — safe to delete now that their outputs exist on disk.
-    // Best-effort: a failed cleanup should never crash the render over
-    // something that was only ever a disk-space optimization.
-    // NEW (July 15, 2026 — found while tracing the missing-file bug
-    // above): a batch with a single leftover clip (odd clip counts)
-    // passes that file through unchanged in xfadeChain rather than
-    // creating a new one — so it ends up in BOTH currentPaths (about to
-    // be deleted below) AND batchOutputs (what the NEXT round needs).
-    // Excluding anything that's also a batch output from deletion, so a
-    // passthrough file doesn't get deleted out from under the round that
-    // still needs it.
-    const outputSet = new Set(batchOutputs);
-    for (const consumedPath of currentPaths) {
-      if (outputSet.has(consumedPath)) continue;
-      try { fs.unlinkSync(consumedPath); } catch (err) { /* non-fatal */ }
-    }
-
-    currentDurations = await Promise.all(batchOutputs.map(probeDuration));
-    currentPaths = batchOutputs;
-    round++;
-  }
-
-  // Final result needs to land at the canonical path the rest of the
-  // pipeline (mixAudio, renderFormat) already expects.
-  const finalPath = path.join(workDir, "concatenated.mp4");
-  if (currentPaths[0] !== finalPath) {
-    fs.copyFileSync(currentPaths[0], finalPath);
-  }
-  return finalPath;
-}
-
-// ── BEFORE/AFTER WIPE TRANSITION ─────────────────────────────────────────
-// Vacant room (pull_back) holds briefly, then wipes left-to-right into
-// the staged version (push_in). This is the flagship PRO Plus feature —
-// no general video tool can do this because it requires the paired
-// vacant/staged Cloudinary URLs that only exist because PRO staged it.
-
-function buildBeforeAfterClip(beforeClipPath, afterClipPath, workDir, outputName) {
-  return new Promise((resolve, reject) => {
-    const outputPath = path.join(workDir, outputName);
-
-    ffmpeg()
-      .input(beforeClipPath)
-      .input(afterClipPath)
-      .complexFilter([
-        `[0:v]trim=duration=3,setpts=PTS-STARTPTS[vacant]`,
-        `[1:v]trim=duration=4,setpts=PTS-STARTPTS[staged]`,
-        `[vacant][staged]xfade=transition=wipeleft:duration=0.8:offset=2.5[out]`,
-      ])
-      .outputOptions(["-map", "[out]", "-pix_fmt", "yuv420p"])
-      .output(outputPath)
-      .on("end", () => resolve(outputPath))
-      .on("error", (err) => reject(new Error(`Before/After wipe failed: ${err.message}`)))
-      .run();
-  });
-}
-
-// ── MIX AUDIO — music + optional narration segments ────────────────────
-//
-// CHANGE (July 14, 2026 — footage-grounded narration rebuild): REPLACES
-// the single continuous narrationPath model. Narration is now generated
-// as separate segments, one per room/clip, each with its own real start
-// time in the final timeline (computed via computeClipTimeline — see its
-// header comment). Each segment gets adelay'd to its real position, all
-// segments are mixed together into one combined narration stream, THEN
-// that combined stream goes through the same sidechain-ducking-against-
-// music approach as before. narrationSegments is an array of
-// { audioPath, startTime } — empty/absent means music-only, same as the
-// old narrationPath being absent.
-
-function mixAudio(videoPath, musicPath, workDir, narrationSegments) {
-  return new Promise(async (resolve, reject) => {
-    try {
-      const outputPath = path.join(workDir, "with_music.mp4");
-      const videoDuration = await probeDuration(videoPath);
-      // RAISED (Sam's request — "music... not an abrupt cut"): was
-      // videoDuration-1.5 with a 1.5s fade — since narration's own
-      // NARRATION_END_BUFFER_SECONDS (2s) meant narration finished only
-      // ~0.5s before the fade even started, there was barely any clean,
-      // full-volume music between "narration done" and "fade begins,"
-      // which reads as abrupt rather than a wind-down. Starting the fade
-      // earlier (4s out) and extending it to match gives a real graceful
-      // close: narration ends, music breathes on its own for a couple
-      // seconds, then eases out over a genuine 4-second fade rather than
-      // a rushed 1.5s one.
-      const fadeOutStart = Math.max(0, videoDuration - 4);
-      const hasNarration = narrationSegments && narrationSegments.length > 0;
-
-      const command = ffmpeg().input(videoPath).input(musicPath);
-      let filterParts;
-
-      if (hasNarration) {
-        narrationSegments.forEach((seg) => command.input(seg.audioPath));
-
-        filterParts = [
-          // FIX #2 (Sam's feedback, real render — still too loud): 0.35
-          // wasn't enough headroom. Dropping further to 0.2, and
-          // tightening the sidechain ducking itself (lower threshold =
-          // engages more easily, higher ratio = ducks harder once
-          // engaged) so music is genuinely a soft bed under narration,
-          // not competing with it.
-          `[1:a]afade=t=in:st=0:d=1,afade=t=out:st=${fadeOutStart.toFixed(2)}:d=4,volume=0.35[music_faded]`,
-        ];
-
-        // Each segment: fade in/out on its OWN local timeline (0..its own
-        // duration), THEN adelay shifts the whole faded clip to its real
-        // position in the final video. Order matters — afade's st= values
-        // are relative to the stream's own start, so they have to be
-        // applied before the stream gets shifted forward.
-        //
-        // NEW (July 14, 2026 — Sam's speed-correction suggestion): each
-        // segment is ALSO hard-capped (atrim) at the real gap before the
-        // next segment starts. narrationGen.js already corrects for this
-        // by regenerating a too-long segment at a faster ElevenLabs
-        // `speed` — but that correction is clamped to ElevenLabs' real
-        // 0.7–1.2 range, so a segment whose natural length wildly exceeds
-        // its window even at max speed could still theoretically overrun.
-        // This is the backstop that guarantees no audible overlap between
-        // adjacent room narrations regardless — defense in depth, not the
-        // primary fix.
-        const delayedLabels = [];
-        narrationSegments.forEach((seg, i) => {
-          const inputIndex = i + 2; // 0=video, 1=music, 2+=narration segments
-          const delayMs = Math.round(seg.startTime * 1000);
-          const label = `narr_${i}`;
-          const nextSeg = narrationSegments[i + 1];
-          const capDuration = nextSeg ? Math.max(0.1, nextSeg.startTime - seg.startTime) : seg.duration;
-          const fadeOutAt = Math.max(0, Math.min(seg.duration, capDuration) - 0.4);
-          filterParts.push(
-            `[${inputIndex}:a]afade=t=in:st=0:d=0.3,atrim=end=${capDuration.toFixed(2)},afade=t=out:st=${fadeOutAt.toFixed(2)}:d=0.4,adelay=${delayMs}|${delayMs}[${label}]`
-          );
-          delayedLabels.push(`[${label}]`);
+        const narrationResult = await generateNarration({
+          address: job.address || null,
+          timelineSegments,
+          voiceId,
+          workDir,
+          anthropicKey: process.env.ANTHROPIC_API_KEY,
+          elevenLabsKey: process.env.ELEVENLABS_API_KEY,
         });
 
-        // Combine all per-room segments onto the shared timeline into one
-        // narration stream — each already sits at its correct offset via
-        // adelay above, so amix here is just summing them, not blending
-        // overlapping speech (segments shouldn't overlap in practice,
-        // since they're spaced by real, non-overlapping clip positions).
-        filterParts.push(
-          `${delayedLabels.join("")}amix=inputs=${narrationSegments.length}:duration=longest:dropout_transition=0[narration_mixed]`
-        );
-
-        // FIX #4 (Sam's feedback, real render — "narration is barely
-        // heard" after the loudnorm-removal fix): removing loudnorm from
-        // the COMBINED mix was correct — it was undoing the music
-        // balance work. But that also removed the only thing that was
-        // guaranteeing narration ITSELF sat at a strong, consistent
-        // level regardless of what ElevenLabs happened to output raw.
-        // With nothing boosting narration up, the whole mix could end up
-        // too quiet overall even with music correctly balanced under it.
-        // Normalizing HERE — narration alone, before it ever touches
-        // music — fixes that without reintroducing the original bug:
-        // this loudnorm only ever sees narration, so it has no way to
-        // rebalance music back up the way normalizing the combined mix
-        // did.
-        filterParts.push(`[narration_mixed]loudnorm=I=-16:TP=-1.5:LRA=11[narration_all]`);
-
-        // Defensive cap — same reasoning as the single-track version this
-        // replaces: even with real per-clip timestamps, guarantee nothing
-        // plays into the final buffer before the video ends.
-        const narrationEndCap = Math.max(0, videoDuration - NARRATION_END_BUFFER_SECONDS);
-        filterParts.push(`[narration_all]atrim=end=${narrationEndCap.toFixed(2)},asplit=2[narration_for_sidechain][narration_for_mix]`);
-
-        filterParts.push(
-          `[music_faded][narration_for_sidechain]sidechaincompress=threshold=0.03:ratio=10:attack=5:release=300[music_ducked]`,
-          `[music_ducked][narration_for_mix]amix=inputs=2:duration=longest:dropout_transition=2[premix]`,
-          // FIX #3 (Sam's feedback, real render — still no noticeable
-          // volume change despite two real upstream fixes): loudnorm
-          // here was normalizing the COMBINED mix's overall integrated
-          // loudness to -16 LUFS, with zero awareness of the internal
-          // music/narration balance everything upstream was carefully
-          // tuning. If hitting that target meant boosting music's
-          // relative contribution back up, loudnorm would do exactly
-          // that — silently undoing the volume=0.2 + sidechain ducking
-          // work above. Replaced with alimiter, which only prevents
-          // clipping (a safety ceiling) and does nothing to re-balance
-          // the mix — so the upstream tuning actually survives to the
-          // final output now.
-          `[premix]alimiter=limit=0.95[audio_out]`,
-        );
-      } else {
-        filterParts = [
-          `[1:a]afade=t=in:st=0:d=1,afade=t=out:st=${fadeOutStart.toFixed(2)}:d=4,volume=0.6[music_faded]`,
-          `[music_faded]loudnorm=I=-16:TP=-1.5:LRA=11[audio_out]`,
-        ];
+        narrationSegments = narrationResult.segments;
+        narrationFullScript = narrationResult.fullScript;
+        console.log(`[${job.jobId}] Narration generated: ${narrationSegments.length} segments.`);
+      } catch (err) {
+        console.error(`[${job.jobId}] Narration generation failed (non-fatal to the video itself): ${err.message}`);
+        narrationSegments = [];
+        narrationFullScript = null;
       }
-
-      command
-        .complexFilter(filterParts)
-        .outputOptions(["-map", "0:v", "-map", "[audio_out]", "-c:v", "copy", "-c:a", "aac", "-shortest"])
-        .output(outputPath)
-        .on("end", () => resolve(outputPath))
-        .on("error", (err) => reject(new Error(`Audio mix failed: ${err.message}`)))
-        .run();
-    } catch (err) {
-      reject(err);
     }
-  });
-}
 
-// ── RENDER FORMAT (16:9 master, 9:16 reframe) ────────────────────────────
+    // ── Step 3: Wait for music ─────────────────────────────────────────
+    const musicPath = await musicPromise;
+    console.log(`[${job.jobId}] Music ready: ${musicPath}`);
 
-function renderFormat(inputPath, dimensions, workDir, outputName) {
-  return new Promise((resolve, reject) => {
-    const outputPath = path.join(workDir, outputName);
-    const [w, h] = dimensions.split("x");
+    // ── Step 4: Assemble clips + music (+ optional narration) into final formats
+    // NOTE (July 16, 2026): the automated closing-card feature (live
+    // ffmpeg overlay/append) has been removed entirely — it caused 4
+    // separate real bugs across this session (hangs, an fps mismatch)
+    // despite repeated targeted fixes. Superseded by a standalone
+    // downloadable closing-card image (generate-closing-card.js, Netlify
+    // side) the user generates once and adds as their own last photo —
+    // no special-casing needed here at all, it's just an ordinary frame.
+    const outputs = await assembleVideo({
+      clipPaths,
+      musicPath,
+      narrationSegments,
+      formats: job.formats || ["16x9", "9x16"],
+      workDir,
+    });
+    console.log(`[${job.jobId}] Assembled ${Object.keys(outputs).length} formats.`);
 
-    // 9:16 reframe crops to center — smart subject-aware cropping is a
-    // Phase 2B refinement; center crop is the correct safe default for v1.
-    const filter =
-      dimensions === "1080x1920"
-        ? `crop=ih*9/16:ih,scale=${w}:${h}`
-        : `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2`;
+    // ── Step 5: Upload finished videos to Cloudinary ──────────────────────
+    const urls = await uploadToCloudinary(outputs, job.projectId);
+    console.log(`[${job.jobId}] Uploaded to Cloudinary.`);
 
-    ffmpeg(inputPath)
-      .videoFilters(filter)
-      .outputOptions(["-c:a", "copy", "-movflags", "+faststart"])
-      .output(outputPath)
-      .on("end", () => resolve(outputPath))
-      .on("error", (err) => reject(new Error(`Format render failed (${dimensions}): ${err.message}`)))
-      .run();
-  });
-}
+    // ── Step 6: Notify Netlify the job is complete ───────────────────────
+    await notifyWebhook({
+      jobId: job.jobId,
+      status: "complete",
+      urls,
+      klingFrameOutcomes,
+      // NEW (July 14, 2026) — the actual generated script, so Netlify can
+      // store it and show it alongside the finished video (see Sam's
+      // idea: display the script at the result screen, since it was
+      // never shown anywhere before this rebuild either).
+      narrationScript: narrationFullScript,
+    });
 
-// ── ENTRY POINT ────────────────────────────────────────────────────────
-
-async function assembleVideo({ clipPaths, musicPath, narrationSegments, formats, workDir }) {
-  const concatenated = await concatenateClips(clipPaths, workDir);
-
-  // CHANGE (July 14, 2026 — footage-grounded narration rebuild):
-  // narrationSegments now arrives pre-generated (audio already downloaded
-  // to local disk, real start times already computed) — renderPipeline.js
-  // does the generation itself, since it's the one place that knows real
-  // clip durations/positions. This function no longer downloads anything;
-  // it just passes the segments through to mixAudio. Absent/empty for any
-  // job that didn't request narration, or where generation failed
-  // upstream (a failed narration should never block the video itself).
-  const withMusic = await mixAudio(concatenated, musicPath, workDir, narrationSegments || []);
-
-  const outputs = {};
-
-  if (formats.includes("16x9")) {
-    outputs["16x9"] = await renderFormat(withMusic, "1920x1080", workDir, "output_16x9.mp4");
+    console.log(`[${job.jobId}] Done.`);
+  } catch (err) {
+    console.error(`[${job.jobId}] Render failed:`, err);
+    await notifyWebhook({
+      jobId: job.jobId,
+      status: "failed",
+      error: err.message,
+      klingFrameOutcomes,
+    });
+    throw err;
+  } finally {
+    // Always clean up temp files, even on failure
+    fs.rm(workDir, { recursive: true, force: true }, (err) => {
+      if (err) console.error(`Cleanup failed for ${workDir}:`, err.message);
+    });
   }
-  if (formats.includes("9x16")) {
-    outputs["9x16"] = await renderFormat(withMusic, "1080x1920", workDir, "output_9x16.mp4");
-  }
-
-  return outputs;
 }
 
-module.exports = { assembleVideo, buildBeforeAfterClip, concatenateClips, mixAudio, renderFormat, computeClipTimeline, extractMidpointFrame, probeDuration, mapWithConcurrencyLimit, FFMPEG_CONCURRENCY_LIMIT, NARRATION_END_BUFFER_SECONDS };
+module.exports = { processRenderJob };
+
