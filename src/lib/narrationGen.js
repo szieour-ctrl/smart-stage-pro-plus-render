@@ -24,10 +24,28 @@ const fs = require("fs");
 const path = require("path");
 const { probeDuration, NARRATION_END_BUFFER_SECONDS } = require("./assemble");
 
-const SPEAKING_RATE_WORDS_PER_MINUTE = 135; // LOWERED from 150 (Sam's feedback, real render — narration almost universally hit MAX_SPEED and still ran over): extra safety margin on top of the content-ambition fix below, which is the primary cause.
+// LOWERED to 115 (July 18, 2026 — confirmed via ElevenLabs' own docs:
+// "Speed is not available for the Eleven v3 model." Every "regenerating
+// at speed=X" call this codebase has ever made on eleven_v3 has silently
+// done nothing — confirmed against a real log where speed=1.20 produced
+// the EXACT SAME duration as the uncorrected take. Sam's call, correctly:
+// keep eleven_v3 for its expressiveness, which means speed correction can
+// never be a real safety net on this model. The word budget is now the
+// ONLY defense against overrun — no fallback if it's wrong. 115 wpm is
+// close to the true floor observed across every real render this session
+// (111-174 wpm depending on sentence content) rather than the middle of
+// that range, on purpose: budgeting toward the average left plenty of
+// individual segments over their window even when the math looked fine
+// on paper. This applies to every segment now, not just the bookend
+// clips that got their own extra padding — a mid-video room segment
+// running long is just as much an "amateur cutoff" as the CTA is.
+const SPEAKING_RATE_WORDS_PER_MINUTE = 115;
 const MIN_SEGMENT_WORDS = 6; // even a 3-second bathroom shot gets a real sentence, not one word
-const MIN_SPEED = 0.7;
-const MAX_SPEED = 1.2; // ElevenLabs' real supported range — confirmed via voice_settings.speed
+// MIN_SPEED/MAX_SPEED removed (July 18, 2026) — were only ever used by
+// the now-removed speed-correction call, confirmed permanently inert on
+// eleven_v3. generateSegmentAudio() below still accepts an optional
+// `speed` param, unused for now, in case a future model swap actually
+// supports it — but nothing in this file passes one anymore.
 const MAX_FRAMES_PER_GROUP = 4; // cap on how many representative stills go to one vision call per group
 // NEW (Sam's feedback — "there is never a breath between clips"): segments
 // were timed to fit right up to the instant the NEXT one starts, with zero
@@ -182,7 +200,12 @@ function groupContiguousByRoom(localFrames, framePaths, timeline) {
 function generateSegmentedScript(address, segments, apiKey) {
   return new Promise((resolve, reject) => {
     const segmentDescriptions = segments
-      .map((s, i) => `Group ${i + 1}: "${s.roomLabel}" — ${s.framePaths.length} frame(s) shown for this group — target ${wordBudgetForSegment(s.availableWindow)} words max (this group has about ${s.availableWindow.toFixed(1)}s of real speaking room before the next group starts).`)
+      .map((s, i) => {
+        const marker = segments.length === 1
+          ? " — THIS IS BOTH THE OPENING AND CLOSING GROUP (the only group in this video)"
+          : i === 0 ? " — THIS IS THE OPENING GROUP" : (i === segments.length - 1 ? " — THIS IS THE CLOSING GROUP" : "");
+        return `Group ${i + 1}: "${s.roomLabel}"${marker} — ${s.framePaths.length} frame(s) shown for this group — target ${wordBudgetForSegment(s.availableWindow)} words max (this group has about ${s.availableWindow.toFixed(1)}s of real speaking room before the next group starts).`;
+      })
       .join("\n");
 
     const promptText = `You are writing narration for a real estate video tour. You are shown one or more still frames per group, grouped in the order they appear in the video.
@@ -205,10 +228,12 @@ Rules:
 - Third person only (never "I" or "my listing").
 - Never invent square footage, bedroom/bathroom counts, or amenities not visible in the photos.
 - ONE sentence per group. Two only if both are short. This is the single most important constraint — a segment that tries to name the room, list what's in it, AND editorialize about value will not fit its window and will get cut off mid-sentence. Pick the one detail that matters most and say only that.
-- Respect each group's word target — it's timed to that group's real length; going over means it gets cut off mid-sentence.
+- Each group's word target is a HARD CEILING, not a suggestion. There is no correction step after this — whatever you write plays at natural pace in exactly the time given. Going even slightly over means the audio gets cut off mid-word, which sounds like a broken, amateur edit. When in doubt, write UNDER the target, never over it — a slightly short segment just means a beat of natural silence, which is fine; an over-budget one is a real, audible defect.
 - Vary how each segment opens. Do NOT start consecutive (or most) segments with the same phrase (e.g. "Here we have," "This room features") — that reads as a stutter when segments play back to back. Vary sentence structure across the whole script the way a real person naturally would, not a template being refilled per room.
-- The FINAL group's segment should end with a brief, natural closing line inviting a showing — still one sentence, still within that group's own word limit, not stacked on top of a full room description.
-- If the FINAL group's image looks like a branded closing card rather than an ordinary room photo — visible overlaid text (an address, a tagline), a darkened or gradient-scrimmed background rather than a naturally-lit room — do NOT describe it as if it were a normal room, and do NOT read the on-screen text aloud verbatim like you're narrating a sign. Instead, say a natural, warm spoken sign-off that complements what's already shown on screen (the viewer can already see the address and the invitation in the image itself) — something a real person would say as a genuine closing thought, not a repetition of text they can already read.
+- THE OPENING GROUP IS DIFFERENT FROM AN ORDINARY GROUP: a video needs a strong opening. It must (1) give one real, grounded observation about the room or exterior actually shown — same as any other group — combined naturally with (2) a brief, warm welcome that references the property's LOCATION (street and/or city — e.g. "Welcome to 123 Main Street in Roseville," or more informally "This beautiful Roseville home..."). Keep the location reference informal and brief here — do NOT recite the complete formal address (street, city, state, zip) as if reading a mailing label; that full, precise address belongs at the close, not here, so don't be redundant with it.
+- THE FINAL GROUP IS DIFFERENT FROM EVERY OTHER GROUP — it has more to say and more time to say it in (check its word target above; it's deliberately given a much larger budget than an ordinary room, specifically so it can carry all of this): it must (1) give one real, grounded observation about the room or exterior actually shown — same as any other group, don't skip this — then (2) naturally state the complete property address (given above), then (3) close with a strong, original call to action inviting a showing. All three, as one flowing close — not three stiff, disconnected sentences bolted together, but a real person's closing thought that happens to cover all three. This replaces the "one sentence only" constraint for this group specifically; the other groups' one-or-two-sentence rule still applies to them.
+- For the CTA specifically: do NOT write the literal phrase "schedule your private showing" (or close variants like "schedule your private tour/viewing") — that exact instruction already appears as on-screen text on the closing card that follows this segment, so saying it verbatim here is pure repetition. Write something that earns the invitation instead — a genuine, warm reason to come see it in person, in your own words, not the boilerplate line the viewer is about to read anyway.
+- If the FINAL group's image looks like a branded closing card rather than an ordinary room/exterior photo — visible overlaid text (an address, a tagline), a darkened or gradient-scrimmed background rather than a naturally-lit room — do NOT describe it as if it were a normal room, and do NOT read the on-screen text aloud verbatim like you're narrating a sign. Instead, cover the same three things (a real observation about the property, the address, an original CTA) as a natural, warm spoken close that complements what's already shown on screen, rather than reading text the viewer can already see.
 - Return ONLY a JSON array, nothing else — no markdown fences, no prose before or after. Exact shape: [{"index": 0, "text": "..."}, {"index": 1, "text": "..."}, ...] with exactly ${segments.length} entries, one per group, in the order shown.`;
 
     const content = [{ type: "text", text: promptText }];
@@ -335,21 +360,28 @@ async function generateNarration({ address, timelineSegments, voiceId, workDir, 
     let audioPath = path.join(workDir, `narration_seg_${seg.index}.mp3`);
     fs.writeFileSync(audioPath, audioBuffer);
     let realDuration = await probeDuration(audioPath);
-    let appliedSpeed = 1.0; // NEW — tracked outside the if-block below so the wpm log after it can always reference it safely, whether or not correction actually ran
 
-    // Only correct when the real read is actually TOO LONG for its
-    // window — a segment that finishes early is never a problem (silence
-    // after it is fine; the next segment still starts exactly on time via
-    // adelay in assemble.js). Clamped to ElevenLabs' real supported
-    // range; if even MAX_SPEED can't make it fit, accept the overrun
-    // rather than distort the voice further — assemble.js's per-segment
-    // cap (see mixAudio) is the final backstop for that rare case.
-    if (realDuration > availableWindow) {
-      appliedSpeed = Math.min(MAX_SPEED, Math.max(MIN_SPEED, realDuration / availableWindow));
-      console.warn(`Narration segment ${seg.index}: ${realDuration.toFixed(2)}s ran over its ${availableWindow.toFixed(2)}s window — regenerating at speed=${appliedSpeed.toFixed(2)}.`);
-      audioBuffer = await generateSegmentAudio(scriptEntry.text, voiceId, elevenLabsKey, appliedSpeed);
-      fs.writeFileSync(audioPath, audioBuffer);
-      realDuration = await probeDuration(audioPath);
+    // REMOVED (July 18, 2026) — this used to regenerate at a corrected
+    // ElevenLabs `speed` value when a segment ran over its window.
+    // Confirmed via ElevenLabs' own docs ("Speed is not available for the
+    // Eleven v3 model.") plus a real log showing speed=1.20 producing the
+    // EXACT SAME duration as the uncorrected take: this call has never
+    // once actually shortened anything on eleven_v3, the model this
+    // codebase uses and Sam has explicitly chosen to keep for its
+    // expressiveness. It was burning a second ElevenLabs API call and
+    // real latency per overrun segment for zero effect. There is now NO
+    // correction step — SPEAKING_RATE_WORDS_PER_MINUTE (lowered to the
+    // observed pace floor for exactly this reason) and the per-segment
+    // padding are the entire defense against overrun. This log line is
+    // what's left: an honest signal that the budget itself needs
+    // attention if it ever fires, not a claim that anything was fixed.
+    if (realDuration > seg.availableWindow) {
+      console.error(
+        `[NARRATION OVERRUN — NO CORRECTION AVAILABLE] segment ${seg.index}: ${realDuration.toFixed(2)}s ` +
+        `ran over its ${seg.availableWindow.toFixed(2)}s window. eleven_v3 does not support speed correction, ` +
+        `so this segment will play past its window uncorrected. If this fires often, the word budget ` +
+        `(SPEAKING_RATE_WORDS_PER_MINUTE) is still too generous for this voice/content, not a one-off.`
+      );
     }
 
     // NEW (Sam's question — is one voice's pace better matched than the
@@ -363,7 +395,7 @@ async function generateNarration({ address, timelineSegments, voiceId, workDir, 
     // across renders instead of a one-off estimate.
     const wordCount = scriptEntry.text.trim().split(/\s+/).length;
     const measuredWpm = (wordCount / realDuration) * 60;
-    console.log(`[narration wpm] segment ${seg.index}: voiceId=${voiceId} words=${wordCount} duration=${realDuration.toFixed(2)}s speed=${appliedSpeed.toFixed(2)} → ${measuredWpm.toFixed(0)} wpm`);
+    console.log(`[narration wpm] segment ${seg.index}: voiceId=${voiceId} words=${wordCount} duration=${realDuration.toFixed(2)}s → ${measuredWpm.toFixed(0)} wpm`);
 
     results.push({ audioPath, startTime: seg.startTime, duration: realDuration, availableWindow, text: scriptEntry.text });
   }
