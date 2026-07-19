@@ -58,6 +58,48 @@ async function downloadFrames(frames, workDir) {
       // below (already fixed once in this exact file) — an explicit
       // property picklist silently drops anything not named in it.
       useRevealEffect: !!frame.useRevealEffect,
+      // FIX (July 19, 2026 — real bug, found while chasing a "revealEngine
+      // is undefined" mystery that survived a full trace through the
+      // frontend, video-job.js's insert, the database itself, and
+      // dispatchToRailway — all confirmed correct. This file was the
+      // actual, final culprit: the SAME "explicit picklist silently drops
+      // anything not named" failure mode already fixed 3 separate times
+      // in this exact file (see useRevealEffect/klingMotionPreset/
+      // addContinuationMotion's own fix comments), just never caught for
+      // these 5 fields specifically. Every one of them was arriving
+      // correctly in the real HTTP payload this file receives and being
+      // silently dropped right here, before renderPipeline.js ever got a
+      // chance to see them.
+      //
+      // Real, confirmed consequence: renderPipeline.js's reveal branch
+      // does `REVEAL_PRESETS[frame.revealPreset] ? frame.revealPreset :
+      // "classic_reveal"` — with revealPreset always undefined here, that
+      // fallback fired on EVERY reveal render this entire session,
+      // silently forcing Classic Reveal regardless of what was actually
+      // configured (Luxury Drift, Cinematic Reveal, any End Motion choice
+      // other than each preset's first allowed option). Not just today's
+      // AI Motion Reveal test — every Reveal Presets test run before this
+      // fix inherited the same silent override.
+      revealPreset: frame.revealPreset || null,
+      endMotion: frame.endMotion || null,
+      // The actual field this whole investigation started from — without
+      // it, renderPipeline.js's gating clamp always saw undefined and
+      // defaulted to the safe/free side (Ken Burns), exactly matching
+      // today's observed "no fal.ai activity, 0 Images charged" result.
+      revealEngine: frame.revealEngine || null,
+      // Standalone AI Motion's equivalent of klingMotionPreset — same
+      // missing-field bug, would have made every standalone LTX Motion
+      // selection silently fail to reach ltxMotion.js at all (falling
+      // through to the final Ken Burns else-branch in renderPipeline.js's
+      // per-frame dispatch instead).
+      ltxMotionPreset: frame.ltxMotionPreset || null,
+      // ltxMotion.js's enforceLtxScopeRules reads this for the open-plan
+      // gating (both the hard block on ordinary presets and the inverse
+      // openPlanOnly restriction on the 3 hallway-safe micro-movements).
+      // Missing here meant that gate was never actually enforceable
+      // server-side — always read falsy, so the open-plan restriction
+      // silently never triggered regardless of the room's real layout.
+      isOpenPlan: !!frame.isOpenPlan,
       roomType: frame.roomType || "default",
       // NEW (July 14, 2026 — footage-grounded narration) — real display
       // name, not the small backend-coded vocabulary roomType uses.
