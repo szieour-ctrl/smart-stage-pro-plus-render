@@ -480,12 +480,32 @@ const REVEAL_CONTINUATION_DURATION = 4.0;
 // End Motion exclusions per preset, but did not lock an exact ffmpeg
 // transition name per preset — these three are my proposed defaults,
 // not yet confirmed. Easy to change, all in one place.
+// NOTE (July 18, 2026) — allowedEndMotions now mixes two different
+// renderers: Ken Burns presets (motionRenderer.py, unchanged names) and
+// LTX Fast presets (ltxMotion.js's LTX_MOTION_TEMPLATES). The two
+// namespaces don't collide (confirmed: no shared preset names between
+// the two lists), so renderPipeline.js can dispatch to the right
+// renderer with a single lookup: LTX_MOTION_TEMPLATES[endMotion]
+// existing means LTX, otherwise Ken Burns. LTX additions follow each
+// preset's EXISTING characterological restriction, not just "add
+// everything": luxury_drift already excludes push_in/pull_back/tilt_up/
+// tilt_down (a deliberate lateral-only identity) — its LTX additions
+// exclude cinematic_push for the identical reason (it's a push-in
+// motion). water_motion/outdoor_breeze are exterior-only (enforced at
+// runtime by ltxMotion.js's enforceLtxScopeRules, not filtered out of
+// this static list) — the frontend dropdown still needs its own
+// room-type-aware filtering as follow-up UI work, not done in this pass.
+// room_reveal is intentionally NOT included anywhere — Sam's call, "NO
+// Open Plan LTX right now."
 const REVEAL_PRESETS = {
   classic_reveal: {
     label: "Classic Reveal",
     openerMotion: "soft_hold",
     wipeTransition: "wipeleft",
-    allowedEndMotions: ["push_in", "pan_left", "pan_right", "tilt_up", "tilt_down", "drift", "float", "luxury_parallax"],
+    allowedEndMotions: [
+      "push_in", "pan_left", "pan_right", "tilt_up", "tilt_down", "drift", "float", "luxury_parallax",
+      "cinematic_push", "luxury_drift", "floating_camera_drift", "architectural_glide", "corner_to_corner_drift", "living_room_ambient", "fireplace_flicker", "water_motion", "outdoor_breeze",
+    ],
   },
   luxury_drift: {
     label: "Luxury Drift",
@@ -494,7 +514,13 @@ const REVEAL_PRESETS = {
     // wipe — matches the "elegant lateral drift" identity better than a
     // hard-left wipe would.
     wipeTransition: "circleopen",
-    allowedEndMotions: ["drift", "pan_left", "pan_right", "float", "luxury_parallax"],
+    allowedEndMotions: [
+      "drift", "pan_left", "pan_right", "float", "luxury_parallax",
+      // cinematic_push (LTX) deliberately excluded — same reason
+      // push_in/pull_back/tilt_up/tilt_down are excluded above: this
+      // preset's identity is purely lateral, not a push-in feel.
+      "luxury_drift", "floating_camera_drift", "architectural_glide", "corner_to_corner_drift", "living_room_ambient",
+    ],
   },
   cinematic_reveal: {
     label: "Cinematic Reveal",
@@ -503,7 +529,10 @@ const REVEAL_PRESETS = {
     // Classic Reveal's harder wipe, and to match the gentler continuous-
     // push feel of a restrained_push opener.
     wipeTransition: "smoothleft",
-    allowedEndMotions: ["push_in", "pan_left", "pan_right", "tilt_up", "tilt_down", "drift", "float", "luxury_parallax"],
+    allowedEndMotions: [
+      "push_in", "pan_left", "pan_right", "tilt_up", "tilt_down", "drift", "float", "luxury_parallax",
+      "cinematic_push", "luxury_drift", "floating_camera_drift", "architectural_glide", "corner_to_corner_drift", "living_room_ambient", "fireplace_flicker", "water_motion", "outdoor_breeze",
+    ],
   },
 };
 
