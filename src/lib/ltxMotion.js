@@ -24,11 +24,18 @@
 //     result was wrong) with
 //     comparable or better quality.
 //
-//   - room_reveal is EXCLUDED from this build entirely (not just gated —
-//     omitted from LTX_MOTION_TEMPLATES below). Sam's explicit call: "NO
-//     Open Plan LTX right now." klingMotion.js's own room_reveal preset
-//     stays the open-plan option for now; LTX's equivalent isn't wired up
-//     until open-plan LTX continuation gets its own real-render testing.
+//   - room_reveal was EXCLUDED entirely earlier this session — Sam's
+//     original call: "NO Open Plan LTX right now," pending real testing.
+//     REVERSED (July 18, 2026, Cinematic_LTX_-Kling_reference doc): a
+//     specific, curated set of presets — including room_reveal — is now
+//     confirmed safe for open-plan on LTX. The blanket open-plan block
+//     is gone; see OPEN_PLAN_SAFE_LTX_PRESETS below for exactly which
+//     ones qualify. Everything NOT in that set still blocks on open-plan,
+//     including presets that are already fine for single/enclosed rooms
+//     (orbit_arc, rack_focus, crane_up/down, parallax_push,
+//     pan_zoom_reveal) — the reference doc doesn't clear those for
+//     open-plan specifically, so they stay single-room-only until they
+//     get their own real open-plan test.
 //
 // Two use cases, one shared generation function:
 //   1. REVEAL_PRESETS continuation — called from renderPipeline.js's
@@ -229,9 +236,72 @@ const LTX_MOTION_TEMPLATES = {
     safeWhen: "Any room with reasonable width to pan across.",
     gate: null,
   },
+
+  // Batch 3 REVISED (July 18, 2026) — Sam's own real disconnect catch:
+  // the single "room_reveal" guess above (written from the reference
+  // doc's one-line description, never tested) wasn't hallway-safe enough
+  // — a generic "pull back and widen" instruction has no way to guarantee
+  // it won't expose hallway depth or a doorway edge in an open-plan space
+  // that has one nearby. Replaced entirely with 3 purpose-built,
+  // explicitly hallway-constrained movements from LTX_Micro_movement_
+  // prompts.docx — each one names the hallway-exposure risk directly and
+  // constrains against it, rather than relying on a generic "no new
+  // geometry" instruction to cover a specific, known failure mode.
+  // UNTESTED — same flag as before: on paper from the doc, not yet
+  // confirmed against a real render the way the batch-1/2 presets were.
+  micro_zoom_out: {
+    prompt:
+      "A gentle micro zoom-out that slightly breathes outward while keeping all architecture exactly as photographed. The frame subtly expands within the existing boundaries without revealing any new ceiling, flooring, corners, cabinetry, furniture, or hallway entrances. Vertical and horizontal lines remain perfectly straight with no perspective exaggeration. The motion must not expose any additional hallway depth, doorway edges, or side-corridor geometry, even by a few pixels. No widened field of view, no extended space, no added objects, no new reflections, no new geometry, no lens-simulation effects. The entire motion stays strictly inside the photographed space.",
+    confidence: "medium-high",
+    safeWhen: "Open-plan spaces, especially those with a hallway or corridor nearby that must not be exposed.",
+    gate: null,
+    openPlanOnly: true,
+  },
+  micro_dolly_back: {
+    prompt:
+      "A smooth micro dolly-back that moves straight backward by a very small amount while preserving all visible architecture. The camera shifts gently away from the scene without exposing any new areas of the kitchen, dining, living room, or adjacent hallways. All geometry, corners, ceiling lines, and flooring remain exactly as photographed. The backward travel must not reveal hallway entrances, hallway depth, doorway edges, or any new wall planes on either side of the open-plan space. No reveal, no widened view, no new surfaces, no added objects, no perspective change, no diagonal or vertical drift. The motion stays fully inside the original frame.",
+    confidence: "medium-high",
+    safeWhen: "Open-plan spaces, especially those with a hallway or corridor nearby that must not be exposed.",
+    gate: null,
+    openPlanOnly: true,
+  },
+  open_plan_reveal: {
+    prompt:
+      "A subtle open-plan reveal that gently emphasizes already-visible zones without expanding the field of view. The motion enhances the sense of openness by redistributing focus across the kitchen, dining, and living areas, but never widens the frame or exposes new corners, walls, or architectural features. The reveal must not increase visibility of any hallway, doorway, or side-corridor. No new hallway depth, doorway edges, or extended architecture may appear. No new geometry, no extended space, no added reflections, no perspective shift, no lens-based reveal. All motion remains strictly within the photographed boundaries.",
+    confidence: "medium-high",
+    safeWhen: "Open-plan spaces with continuous kitchen-dining-living sightlines.",
+    gate: null,
+    openPlanOnly: true,
+  },
 };
 
 const VALID_LTX_PRESETS = new Set(Object.keys(LTX_MOTION_TEMPLATES));
+
+// NEW (July 18, 2026, Cinematic_LTX_-Kling_reference doc) — replaces the
+// blanket open-plan block that used to reject ALL LTX presets on
+// open-plan frames outright. This is now a curated allowlist: exactly
+// the 7 presets the reference doc marks "✅ Safe for Both Kling + LTX"
+// under its OPEN-PLAN SPACES section. Everything not in this set still
+// blocks on open-plan — including presets already proven fine for
+// single/enclosed rooms (orbit_arc, rack_focus, crane_up/down,
+// parallax_push, pan_zoom_reveal, drone_boom_up) — because the reference
+// doc doesn't clear those for the open-plan case specifically. Being
+// safe in a smaller enclosed room doesn't automatically mean safe across
+// a larger, multi-zone open-plan space with more geometry to hallucinate
+// around; treating "cleared for single-room" as "cleared for open-plan"
+// would be exactly the kind of unearned generalization this whole
+// pack has been careful to avoid everywhere else.
+const OPEN_PLAN_SAFE_LTX_PRESETS = new Set([
+  "cinematic_push",
+  "luxury_drift",
+  "architectural_glide",
+  "corner_to_corner_drift",
+  "living_room_ambient",
+  "fireplace_flicker",
+  "micro_zoom_out",
+  "micro_dolly_back",
+  "open_plan_reveal",
+]);
 
 // Confidence tiers eligible for STANDALONE selection (no Room Reveal
 // pairing required) — Sam's call: "Medium to High confidence movements"
@@ -259,16 +329,28 @@ function enforceLtxScopeRules(frame, presetKey) {
     );
   }
 
-  // NO OPEN PLAN LTX RIGHT NOW (Sam, July 18, 2026) — a blanket
-  // restriction, not per-preset. Real-render testing this session found
-  // LTX reliably drops furniture/detail into ungrouped "pop-in" clusters
-  // on dense, spatially-continuous open-plan layouts even at longer
-  // durations — a real, unresolved quality problem, not yet a case
-  // where LTX is a safe default. Revisit once that's actually fixed and
-  // re-tested, not before.
-  if (frame.isOpenPlan) {
+  // REVERSED (July 18, 2026, Cinematic_LTX_-Kling_reference doc) — this
+  // used to be a blanket rejection of ANY LTX preset on open-plan frames.
+  // The reference doc's real safety analysis clears a specific 7-preset
+  // subset for open-plan (OPEN_PLAN_SAFE_LTX_PRESETS above); everything
+  // else still blocks there, including presets already fine for single
+  // rooms — see that constant's comment for why "safe in a small room"
+  // doesn't imply "safe in a large multi-zone space."
+  if (frame.isOpenPlan && !OPEN_PLAN_SAFE_LTX_PRESETS.has(presetKey)) {
     throw new Error(
-      `LTX motion rejected: open-plan rooms are not yet supported for LTX continuation (frame.isOpenPlan is true). Real testing found LTX drops furniture in as ungrouped clusters on dense open-plan layouts regardless of duration — this is a known, unresolved quality issue, not a conservative default. Use a Ken Burns continuation preset instead, or Kling if AI motion is required on this room.`
+      `LTX motion rejected: preset "${presetKey}" is not cleared for open-plan rooms (frame.isOpenPlan is true). Cleared open-plan presets: ${[...OPEN_PLAN_SAFE_LTX_PRESETS].join(", ")}. Use one of those, a Ken Burns continuation preset, or Kling if this specific motion is required on this room.`
+    );
+  }
+
+  // These 3 are the inverse case — restricted TO open-plan spaces, unsafe
+  // in enclosed single rooms (each one's own hallway-safety constraints
+  // only make sense where there's real open-plan continuity to work
+  // with). Mirrors klingMotion.js's identical OPEN_PLAN_ONLY_PRESETS
+  // restriction on its own room_reveal preset — same underlying risk,
+  // same rule, enforced independently per engine/preset.
+  if (preset.openPlanOnly && !frame.isOpenPlan) {
+    throw new Error(
+      `LTX motion rejected: "${presetKey}" is restricted to open-plan spaces (frame.isOpenPlan must be true) — its hallway-safety constraints assume real open-plan continuity that an enclosed single room doesn't have. Use a different preset for this room, or mark it as Open Plan if that's genuinely accurate.`
     );
   }
 
@@ -441,4 +523,5 @@ module.exports = {
   LTX_MOTION_TEMPLATES,
   VALID_LTX_PRESETS,
   VALID_LTX_DURATIONS,
+  OPEN_PLAN_SAFE_LTX_PRESETS,
 };
