@@ -18,7 +18,7 @@ const { applyMotionPreset, resolveDuration } = require("./lib/motionPresets");
 const { applyKlingMotion } = require("./lib/klingMotion");
 const { generateLtxRevealContinuation, applyLtxMotion, isStandaloneEligible, LTX_MOTION_TEMPLATES } = require("./lib/ltxMotion");
 const { generateMusic } = require("./lib/musicGen");
-const { assembleVideo, buildRevealClip, REVEAL_PRESETS, REVEAL_OPENER_DURATION, REVEAL_WIPE_DURATION, REVEAL_CONTINUATION_DURATION, computeClipTimeline, extractMidpointFrame, probeDuration, mapWithConcurrencyLimit, FFMPEG_CONCURRENCY_LIMIT } = require("./lib/assemble");
+const { assembleVideo, buildRevealClip, REVEAL_PRESETS, REVEAL_OPENER_DURATION, REVEAL_WIPE_DURATION, REVEAL_CONTINUATION_DURATION, resolveAiMotionRevealOpener, computeClipTimeline, extractMidpointFrame, probeDuration, mapWithConcurrencyLimit, FFMPEG_CONCURRENCY_LIMIT } = require("./lib/assemble");
 const { generateNarration, groupContiguousByRoom } = require("./lib/narrationGen");
 const { uploadToCloudinary } = require("./lib/cloudinaryUpload");
 const { notifyWebhook } = require("./lib/notify");
@@ -367,6 +367,17 @@ async function processRenderJob(job) {
           ? frame.endMotion
           : preset.allowedEndMotions[0];
 
+        // NEW (July 19, 2026) — AI Motion Reveal has no fixed opener/wipe
+        // (preset.dynamicOpener === true, see REVEAL_PRESETS' comment on
+        // that entry) — both are resolved from the End Motion choice
+        // itself, so the opener's character matches whatever AI Motion
+        // continuation the user actually picked. The other 3 presets are
+        // unaffected — preset.openerMotion/wipeTransition are used
+        // directly for them, exactly as before.
+        const resolvedOpener = preset.dynamicOpener
+          ? resolveAiMotionRevealOpener(endMotion)
+          : { openerMotion: preset.openerMotion, wipeTransition: preset.wipeTransition };
+
         // FIX (July 18, 2026) — see the padding block's comment above for
         // the full story. Only the continuation phase gets the extra
         // time — the opener is a brief vacant hold, stretching THAT for
@@ -380,7 +391,7 @@ async function processRenderJob(job) {
           + (frame.narrationClipPaddingSeconds || 0);
 
         const openerResult = await applyMotionPreset(
-          { ...frame, localPath: frame.beforeLocalPath, motionPreset: preset.openerMotion, durationSeconds: REVEAL_OPENER_DURATION },
+          { ...frame, localPath: frame.beforeLocalPath, motionPreset: resolvedOpener.openerMotion, durationSeconds: REVEAL_OPENER_DURATION },
           workDir,
           1.0
         );
@@ -444,7 +455,8 @@ async function processRenderJob(job) {
           presetKey,
           workDir,
           `reveal_${path.basename(frame.localPath, path.extname(frame.localPath))}.mp4`,
-          actualContinuationDuration
+          actualContinuationDuration,
+          resolvedOpener.wipeTransition
         );
         carryZoom = 1.0; // reset after a reveal beat
 
