@@ -498,14 +498,20 @@ const REVEAL_CONTINUATION_DURATION = 4.0;
 // room_reveal is intentionally NOT included anywhere — Sam's call, "NO
 // Open Plan LTX right now."
 const REVEAL_PRESETS = {
+  // REVERTED (July 19, 2026) — these 3 go back to pure Ken Burns-only,
+  // exactly as originally spec'd (Session Handoff, July 16, 2026:
+  // "Classic Reveal / Luxury Drift / Cinematic Reveal" listed as one
+  // feature, "Kling Luxury Reveal" as a SEPARATE companion feature).
+  // Mixing LTX presets into these 3's End Motion lists earlier this
+  // session was a real mistake — it collapsed two intentionally distinct
+  // features into one, which is the exact confusion Sam flagged. AI
+  // Motion Reveal below is now the ONLY place an AI Motion continuation
+  // lives; these 3 are Ken Burns end to end, opener through continuation.
   classic_reveal: {
     label: "Classic Reveal",
     openerMotion: "soft_hold",
     wipeTransition: "wipeleft",
-    allowedEndMotions: [
-      "push_in", "pan_left", "pan_right", "tilt_up", "tilt_down", "drift", "float", "luxury_parallax",
-      "cinematic_push", "luxury_drift", "floating_camera_drift", "architectural_glide", "corner_to_corner_drift", "living_room_ambient", "fireplace_flicker", "water_motion", "outdoor_breeze",
-    ],
+    allowedEndMotions: ["push_in", "pan_left", "pan_right", "tilt_up", "tilt_down", "drift", "float", "luxury_parallax"],
   },
   luxury_drift: {
     label: "Luxury Drift",
@@ -514,13 +520,7 @@ const REVEAL_PRESETS = {
     // wipe — matches the "elegant lateral drift" identity better than a
     // hard-left wipe would.
     wipeTransition: "circleopen",
-    allowedEndMotions: [
-      "drift", "pan_left", "pan_right", "float", "luxury_parallax",
-      // cinematic_push (LTX) deliberately excluded — same reason
-      // push_in/pull_back/tilt_up/tilt_down are excluded above: this
-      // preset's identity is purely lateral, not a push-in feel.
-      "luxury_drift", "floating_camera_drift", "architectural_glide", "corner_to_corner_drift", "living_room_ambient",
-    ],
+    allowedEndMotions: ["drift", "pan_left", "pan_right", "float", "luxury_parallax"],
   },
   cinematic_reveal: {
     label: "Cinematic Reveal",
@@ -529,12 +529,93 @@ const REVEAL_PRESETS = {
     // Classic Reveal's harder wipe, and to match the gentler continuous-
     // push feel of a restrained_push opener.
     wipeTransition: "smoothleft",
+    allowedEndMotions: ["push_in", "pan_left", "pan_right", "tilt_up", "tilt_down", "drift", "float", "luxury_parallax"],
+  },
+
+  // NEW (July 19, 2026) — "AI Motion Reveal," finishing what the July 16
+  // handoff logged as "Kling Luxury Reveal": "fully designed and agreed
+  // ... but never actually implemented," explicitly noted as "confirmed
+  // cheaper than Hero Transformation's morph." Original design (from
+  // PRO_Plus_Changes_and_Narration.docx, a few sessions back): Original
+  // still holds with a Ken Burns opener → deterministic wipe → AI Motion
+  // continuation — and critically, the OPENER ISN'T FIXED. It's derived
+  // from whichever AI Motion preset the user picks for the continuation,
+  // via AI_MOTION_TO_KEN_BURNS_OPENER below, so the wipe feels like one
+  // continuous motion instead of two unrelated moves stitched together.
+  //
+  // dynamicOpener:true is the signal to renderPipeline.js's reveal branch
+  // to skip reading a fixed openerMotion/wipeTransition from this object
+  // (there isn't one) and instead resolve both from the chosen End Motion
+  // at render time — see resolveAiMotionRevealOpener() below.
+  //
+  // allowedEndMotions is every LTX preset EXCEPT the 3 open-plan-only
+  // micro-movements (micro_zoom_out/micro_dolly_back/open_plan_reveal) —
+  // those are already gated correctly by ltxMotion.js's own openPlanOnly
+  // restriction, no reason to exclude them here too; they're included
+  // below and will simply not appear in the frontend dropdown on a
+  // non-open-plan room, same as everywhere else.
+  ai_motion_reveal: {
+    label: "AI Motion Reveal",
+    dynamicOpener: true,
     allowedEndMotions: [
-      "push_in", "pan_left", "pan_right", "tilt_up", "tilt_down", "drift", "float", "luxury_parallax",
-      "cinematic_push", "luxury_drift", "floating_camera_drift", "architectural_glide", "corner_to_corner_drift", "living_room_ambient", "fireplace_flicker", "water_motion", "outdoor_breeze",
+      "cinematic_push", "luxury_drift", "floating_camera_drift", "architectural_glide", "corner_to_corner_drift",
+      "orbit_arc", "rack_focus", "drone_boom_up", "crane_up", "crane_down", "parallax_push", "pan_zoom_reveal",
+      "living_room_ambient", "fireplace_flicker", "water_motion", "outdoor_breeze",
+      "micro_zoom_out", "micro_dolly_back", "open_plan_reveal",
     ],
   },
 };
+
+// NEW (July 19, 2026) — the "opener direction matches the AI continuation"
+// mechanism from the original spec, adapted to real motionRenderer.py
+// preset names and this session's 19 LTX presets (the original doc's
+// table was written for 9 Kling presets — the mapping logic is preserved
+// exactly, just re-targeted).
+//
+// HONEST SIMPLIFICATION, flagged deliberately rather than silently
+// dropped: the original spec called for a continuous, per-preset
+// INTENSITY value (0.15 to 0.45) scaling how strong each opener reads —
+// motionRenderer.py has no such parameter today; soft_hold and
+// restrained_push are fixed-amount presets (4% and 10% zoom respectively,
+// see motionRenderer.py's own SOFT_HOLD_AMOUNT/RESTRAINED_PUSH_AMOUNT).
+// Rather than build a new variable-intensity system as a prerequisite to
+// shipping this at all, every mapping below uses one of those two
+// existing fixed openers — soft_hold for anything with a lateral/ambient
+// feel, restrained_push for anything with a push-in feel. The CORE
+// mechanic (opener character matches continuation character, wipe
+// direction matches where applicable) is real and faithful to the
+// original design; only the fine-grained intensity dial is deferred.
+// Worth revisiting if the fixed amounts read as too uniform in practice.
+const AI_MOTION_TO_KEN_BURNS_OPENER = {
+  cinematic_push:         { openerMotion: "restrained_push", wipeTransition: "smoothleft" },
+  parallax_push:          { openerMotion: "restrained_push", wipeTransition: "smoothleft" },
+  rack_focus:             { openerMotion: "restrained_push", wipeTransition: "smoothleft" },
+  luxury_drift:           { openerMotion: "soft_hold",        wipeTransition: "circleopen" },
+  floating_camera_drift:  { openerMotion: "soft_hold",        wipeTransition: "circleopen" },
+  orbit_arc:              { openerMotion: "soft_hold",        wipeTransition: "circleopen" },
+  living_room_ambient:    { openerMotion: "soft_hold",        wipeTransition: "circleopen" },
+  fireplace_flicker:      { openerMotion: "soft_hold",        wipeTransition: "circleopen" },
+  water_motion:           { openerMotion: "soft_hold",        wipeTransition: "circleopen" },
+  outdoor_breeze:         { openerMotion: "soft_hold",        wipeTransition: "circleopen" },
+  open_plan_reveal:       { openerMotion: "soft_hold",        wipeTransition: "circleopen" },
+  architectural_glide:    { openerMotion: "soft_hold",        wipeTransition: "wipeleft" },
+  corner_to_corner_drift: { openerMotion: "soft_hold",        wipeTransition: "wipeleft" },
+  drone_boom_up:          { openerMotion: "soft_hold",        wipeTransition: "wipeleft" },
+  crane_up:               { openerMotion: "soft_hold",        wipeTransition: "wipeleft" },
+  crane_down:             { openerMotion: "soft_hold",        wipeTransition: "wipeleft" },
+  pan_zoom_reveal:        { openerMotion: "soft_hold",        wipeTransition: "wipeleft" },
+  micro_zoom_out:         { openerMotion: "soft_hold",        wipeTransition: "wipeleft" },
+  micro_dolly_back:       { openerMotion: "soft_hold",        wipeTransition: "wipeleft" },
+};
+const DEFAULT_AI_MOTION_REVEAL_OPENER = { openerMotion: "soft_hold", wipeTransition: "wipeleft" };
+
+// Called from renderPipeline.js's reveal branch when presetKey ===
+// "ai_motion_reveal" — resolves what a fixed REVEAL_PRESETS entry would
+// normally provide directly, but derived from the user's End Motion
+// choice instead of a hardcoded preset identity.
+function resolveAiMotionRevealOpener(endMotionKey) {
+  return AI_MOTION_TO_KEN_BURNS_OPENER[endMotionKey] || DEFAULT_AI_MOTION_REVEAL_OPENER;
+}
 
 // beforeClipPath / afterClipPath are pre-rendered motionRenderer.py clips
 // — beforeClipPath at REVEAL_OPENER_DURATION using the preset's
@@ -553,7 +634,7 @@ const REVEAL_PRESETS = {
 // doesn't need to change for this — offset only depends on opener/wipe
 // durations, both still fixed, since it's measured from the start of the
 // FIRST input regardless of how long the second input's trimmed clip is.
-function buildRevealClip(beforeClipPath, afterClipPath, presetKey, workDir, outputName, continuationDurationOverride) {
+function buildRevealClip(beforeClipPath, afterClipPath, presetKey, workDir, outputName, continuationDurationOverride, wipeTransitionOverride) {
   return new Promise((resolve, reject) => {
     const preset = REVEAL_PRESETS[presetKey];
     if (!preset) {
@@ -562,6 +643,14 @@ function buildRevealClip(beforeClipPath, afterClipPath, presetKey, workDir, outp
     }
     const outputPath = path.join(workDir, outputName);
     const continuationDuration = continuationDurationOverride || REVEAL_CONTINUATION_DURATION;
+    // NEW (July 19, 2026) — AI Motion Reveal has no fixed preset.wipeTransition
+    // at all (dynamicOpener:true — see REVEAL_PRESETS' comment on that
+    // entry); renderPipeline.js resolves the real wipe transition via
+    // resolveAiMotionRevealOpener() and passes it in explicitly here,
+    // since that's where the End Motion choice driving the resolution is
+    // already in scope. Falls back to preset.wipeTransition for the
+    // other 3 presets, unchanged from before.
+    const wipeTransition = wipeTransitionOverride || preset.wipeTransition;
 
     // xfade's `offset` is measured from the start of the FIRST input and
     // marks where the crossfade begins — so offset = openerDuration - wipeDuration
@@ -577,7 +666,7 @@ function buildRevealClip(beforeClipPath, afterClipPath, presetKey, workDir, outp
       .complexFilter([
         `[0:v]trim=duration=${REVEAL_OPENER_DURATION},setpts=PTS-STARTPTS[opener]`,
         `[1:v]trim=duration=${continuationDuration},setpts=PTS-STARTPTS[continuation]`,
-        `[opener][continuation]xfade=transition=${preset.wipeTransition}:duration=${REVEAL_WIPE_DURATION}:offset=${offset}[out]`,
+        `[opener][continuation]xfade=transition=${wipeTransition}:duration=${REVEAL_WIPE_DURATION}:offset=${offset}[out]`,
       ])
       .outputOptions(["-map", "[out]", "-pix_fmt", "yuv420p"])
       .output(outputPath)
@@ -1108,4 +1197,4 @@ async function assembleVideo({ clipPaths, musicPath, narrationSegments, formats,
   return outputs;
 }
 
-module.exports = { assembleVideo, buildRevealClip, REVEAL_PRESETS, REVEAL_OPENER_DURATION, REVEAL_WIPE_DURATION, REVEAL_CONTINUATION_DURATION, concatenateClips, mixAudio, renderFormat, computeClipTimeline, extractMidpointFrame, probeDuration, mapWithConcurrencyLimit, FFMPEG_CONCURRENCY_LIMIT, NARRATION_END_BUFFER_SECONDS };
+module.exports = { assembleVideo, buildRevealClip, REVEAL_PRESETS, REVEAL_OPENER_DURATION, REVEAL_WIPE_DURATION, REVEAL_CONTINUATION_DURATION, resolveAiMotionRevealOpener, concatenateClips, mixAudio, renderFormat, computeClipTimeline, extractMidpointFrame, probeDuration, mapWithConcurrencyLimit, FFMPEG_CONCURRENCY_LIMIT, NARRATION_END_BUFFER_SECONDS };
