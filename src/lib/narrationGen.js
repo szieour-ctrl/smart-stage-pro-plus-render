@@ -24,22 +24,22 @@ const fs = require("fs");
 const path = require("path");
 const { probeDuration, NARRATION_END_BUFFER_SECONDS } = require("./assemble");
 
-// LOWERED to 115 (July 18, 2026 — confirmed via ElevenLabs' own docs:
-// "Speed is not available for the Eleven v3 model." Every "regenerating
-// at speed=X" call this codebase has ever made on eleven_v3 has silently
-// done nothing — confirmed against a real log where speed=1.20 produced
-// the EXACT SAME duration as the uncorrected take. Sam's call, correctly:
-// keep eleven_v3 for its expressiveness, which means speed correction can
-// never be a real safety net on this model. The word budget is now the
-// ONLY defense against overrun — no fallback if it's wrong. 115 wpm is
-// close to the true floor observed across every real render this session
-// (111-174 wpm depending on sentence content) rather than the middle of
-// that range, on purpose: budgeting toward the average left plenty of
-// individual segments over their window even when the math looked fine
-// on paper. This applies to every segment now, not just the bookend
-// clips that got their own extra padding — a mid-video room segment
-// running long is just as much an "amateur cutoff" as the CTA is.
-const SPEAKING_RATE_WORDS_PER_MINUTE = 115;
+// CORRECTED to 130 (July 18, 2026 — Sam caught a real reasoning error:
+// budgeting off the pace FLOOR (115) was the wrong fix. Removing speed
+// correction means duration padding and the word ceiling both need to
+// agree with EACH OTHER, not each separately hedge against worst case —
+// stacking two conservative assumptions doesn't add safety, it just
+// creates large unintended dead air. Verified against a real script:
+// segment 5 (14 words, base duration only, no extra padding) landed
+// almost exactly on target — proof the base per-room durations were
+// already reasonably calibrated. The problem was specifically the
+// intro/outro EXTRA padding (see renderPipeline.js), sized off 115 wpm
+// instead of something close to real observed average pace (~150 wpm
+// this session). 130 is a deliberate middle: a little under true average
+// (so a script at the ceiling still tends to finish with a small natural
+// margin, since real delivery usually runs faster than 130), but not the
+// pessimistic floor that was manufacturing multi-second gaps.
+const SPEAKING_RATE_WORDS_PER_MINUTE = 130;
 const MIN_SEGMENT_WORDS = 6; // even a 3-second bathroom shot gets a real sentence, not one word
 // MIN_SPEED/MAX_SPEED removed (July 18, 2026) — were only ever used by
 // the now-removed speed-correction call, confirmed permanently inert on
