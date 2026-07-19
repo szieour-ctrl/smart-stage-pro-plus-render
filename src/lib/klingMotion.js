@@ -103,30 +103,27 @@ function ensureConfigured() {
 //     invent furniture/layout wholesale rather than animate or extend an
 //     already-disclosed scene. Use a real vacant+staged pair, or Ken Burns.
 
+// SUPERSEDED (July 18, 2026) — orbit_arc, rack_focus, drone_boom_up,
+// crane_up, crane_down, parallax_push, and pan_zoom_reveal have all been
+// removed from this allowlist. Each now has a tested, confirmed-working
+// LTX-safe rewrite in ltxMotion.js's LTX_MOTION_TEMPLATES (see that
+// file's "batch 2" section) at lower cost ($0.06/s LTX Fast vs $0.084/s
+// Kling O3). These 7 KLING_MOTION_TEMPLATES entries above are left in
+// place as historical reference, not deleted — they're simply no longer
+// reachable via this allowlist, and the frontend (build-video-demo.html)
+// no longer offers them as Kling choices at all, only as LTX ones. This
+// also corrects the July 17, 2026 decision doc, which had listed
+// Orbit Arc as one of three presets staying Kling-reserved — that call
+// is superseded by this real test result.
 const SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS = new Set([
-  "orbit_arc",
-  "rack_focus",
   "fireplace_flicker",
-  // New Motion Library (July 2026) — camera-move-only, same category as the
-  // 3 above: motion through/around a scene that's already fully visible, no
-  // invented room content.
   "cinematic_push",
   "luxury_drift",
   "floating_camera_drift",
-  "parallax_push",
   "architectural_glide",
-  "crane_up",
-  "crane_down",
-  // Cleared (July 9, 2026) — Sam confirmed via his own fal.ai Playground
-  // testing that these three do not invent unphotographed content
-  // (fireplace, water, wall/floor area) on real source photos. Moved out
-  // of the "deliberately not included yet" group above into the allowlist.
   "room_reveal",
   "living_room_ambient",
   "corner_to_corner_drift",
-  // pan_zoom_reveal — combined pan+zoom, same camera-move-only category as
-  // the presets above, no new content risk (see KLING_MOTION_TEMPLATES).
-  "pan_zoom_reveal",
 ]);
 
 // Presets that are only safe on genuinely open-concept/great-room spaces —
@@ -203,6 +200,15 @@ const KLING_MOTION_TEMPLATES = {
   orbit_arc:
     "Slow cinematic orbit camera movement arcing around the central feature — a kitchen island, dining table, or pool — sweeping laterally while keeping it centered in frame, photorealistic, no distortion, stable architecture, surrounding cabinetry and furniture remain fixed and undistorted throughout the movement",
 
+  // NOTE (July 18, 2026): unlike the other 6 superseded presets above,
+  // this one was NEVER gated by SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS —
+  // it's reachable via enforceScopeRules' broader isExterior check, which
+  // grants access to ANY preset name on exterior frames (needed for the
+  // day/twilight family, which genuinely stays Kling-reserved). So this
+  // template is still technically callable from the backend if directly
+  // requested; the real defense is that build-video-demo.html no longer
+  // offers it as a Kling choice at all — same "frontend is the real gate"
+  // situation as any deprecated-but-not-deleted option.
   drone_boom_up:
     "Smooth cinematic drone boom-up camera movement, rising upward and slightly forward to reveal the full exterior and surrounding landscaping from an elevated angle, photorealistic, no distortion, house structure and architecture remain completely fixed and unchanged",
 
@@ -404,6 +410,13 @@ async function extractLastFrame(videoPath, workDir) {
 // composition by the time its clip ended. Extracting the real last frame
 // makes the cut pixel-seamless.
 
+// NOW EXPORTED (July 18, 2026) — ltxMotion.js reuses this exact same
+// normalize-then-hard-cut-concat logic for stitching a Ken Burns wipe
+// clip to an LTX continuation clip. Same underlying problem (two clips
+// from different renderers, not guaranteed to share resolution/fps/pixel
+// format) — no reason to duplicate ~40 lines of ffmpeg normalization
+// logic in a second file when this one is a proven, working solution to
+// the identical problem.
 function concatTwoClips(firstPath, secondPath, workDir, outputName) {
   return new Promise((resolve, reject) => {
     const outputPath = path.join(workDir, outputName);
@@ -670,6 +683,7 @@ module.exports = {
   enforceScopeRules,
   buildPrompt,
   extractLastFrame,
+  concatTwoClips,
   KLING_MOTION_TEMPLATES,
   VALID_KLING_PRESETS,
   SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS,
