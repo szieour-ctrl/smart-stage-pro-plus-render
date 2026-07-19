@@ -18,7 +18,7 @@ const { applyMotionPreset, resolveDuration } = require("./lib/motionPresets");
 const { applyKlingMotion } = require("./lib/klingMotion");
 const { generateLtxRevealContinuation, applyLtxMotion, isStandaloneEligible, LTX_MOTION_TEMPLATES } = require("./lib/ltxMotion");
 const { generateMusic } = require("./lib/musicGen");
-const { assembleVideo, buildRevealClip, REVEAL_PRESETS, REVEAL_OPENER_DURATION, REVEAL_WIPE_DURATION, REVEAL_CONTINUATION_DURATION, resolveAiMotionRevealOpener, computeClipTimeline, extractMidpointFrame, probeDuration, mapWithConcurrencyLimit, FFMPEG_CONCURRENCY_LIMIT } = require("./lib/assemble");
+const { assembleVideo, buildRevealClip, REVEAL_PRESETS, REVEAL_OPENER_DURATION, REVEAL_WIPE_DURATION, REVEAL_CONTINUATION_DURATION, computeClipTimeline, extractMidpointFrame, probeDuration, mapWithConcurrencyLimit, FFMPEG_CONCURRENCY_LIMIT } = require("./lib/assemble");
 const { generateNarration, groupContiguousByRoom } = require("./lib/narrationGen");
 const { uploadToCloudinary } = require("./lib/cloudinaryUpload");
 const { notifyWebhook } = require("./lib/notify");
@@ -356,27 +356,68 @@ async function processRenderJob(job) {
         const presetKey = REVEAL_PRESETS[frame.revealPreset] ? frame.revealPreset : "classic_reveal";
         const preset = REVEAL_PRESETS[presetKey];
 
-        // Server-side clamp — frame.endMotion arrives from the client
-        // (build-video-demo.html), which already filters its End Motion
-        // dropdown to preset.allowedEndMotions, but this is the
+        // Server-side clamp, step 1 — frame.endMotion arrives from the
+        // client (build-video-demo.html), which already filters its End
+        // Motion dropdown to preset.allowedEndMotions, but this is the
         // authoritative backend and shouldn't trust that filtering held
-        // (stale client build, direct API call, etc.). Falls back to the
-        // preset's first allowed option, same default logic the frontend
-        // uses in defaultEndMotionFor().
-        const endMotion = preset.allowedEndMotions.includes(frame.endMotion)
+        // (stale client build, direct API call, etc.).
+        let endMotion = preset.allowedEndMotions.includes(frame.endMotion)
           ? frame.endMotion
           : preset.allowedEndMotions[0];
 
-        // NEW (July 19, 2026) — AI Motion Reveal has no fixed opener/wipe
-        // (preset.dynamicOpener === true, see REVEAL_PRESETS' comment on
-        // that entry) — both are resolved from the End Motion choice
-        // itself, so the opener's character matches whatever AI Motion
-        // continuation the user actually picked. The other 3 presets are
-        // unaffected — preset.openerMotion/wipeTransition are used
-        // directly for them, exactly as before.
-        const resolvedOpener = preset.dynamicOpener
-          ? resolveAiMotionRevealOpener(endMotion)
-          : { openerMotion: preset.openerMotion, wipeTransition: preset.wipeTransition };
+        // Server-side clamp, step 2 — THE REAL GATING RULE (Sam, July 19,
+        // 2026, after two wrong attempts at this same feature): "if the
+        // user selects Ken Burns (engine) ALL AI is gated/locked... If the
+        // user wants a PREMIUM AI Movement they select the AI Motion
+        // (Engine), all Ken Burns Standard movements are gated/Locked."
+        // This is a hard, unconditional rule — which engine is active
+        // decides the ENTIRE category of continuation available, not just
+        // a preference. preset.allowedEndMotions above lists BOTH
+        // namespaces (every continuation this preset identity supports
+        // across either engine); this second clamp is what actually
+        // enforces "only ONE namespace is reachable for this frame,"
+        // matching frame.revealEngine — this is also the real billing
+        // enforcement point, not just a UI nicety, since a Ken-Burns-
+        // engine frame that somehow ended up with an LTX endMotion would
+        // render real paid AI motion on a clip the user was told was free.
+        //
+        // frame.revealEngine (not frame.motion directly) — a purpose-built
+        // field sent specifically for reveal frames, "ken_burns" or "ltx".
+        // Using frame.motion directly here would have been a real bug:
+        // that raw string is never persisted through video-job.js's
+        // frameRows/Railway-dispatch layer at all (confirmed by grep —
+        // only motionPreset-family fields survive that round trip), so
+        // it would always read undefined on the real backend object.
+        const isLtxNamespace = (key) => !!LTX_MOTION_TEMPLATES[key];
+        // DIAGNOSTIC (July 19, 2026 — confirmed real bug from Sam's first
+        // real render: frame.revealEngine arrived as null/undefined,
+        // silently forcing this reveal to Ken Burns with ZERO trace
+        // anywhere in the logs — no error, no [LTX] line, nothing. The
+        // fal.ai dashboard showed no activity and the video still
+        // rendered successfully, which is exactly what made it invisible.
+        // Loud now, matching the [PADDING MISMATCH] pattern elsewhere in
+        // this file — a missing/invalid revealEngine on a reveal frame is
+        // always worth knowing about immediately, not discovering by
+        // noticing an empty fal.ai dashboard after the fact.
+        if (frame.revealEngine !== "ltx" && frame.revealEngine !== "ken_burns") {
+          console.error(
+            `  [REVEAL ENGINE MISSING] frame ${i}: revealEngine is "${frame.revealEngine}" (expected "ltx" or "ken_burns"). ` +
+            `Defaulting to Ken Burns (the safe/free side) — this frame will NOT call LTX even if the user selected AI Motion. ` +
+            `Check that video-job.js's reveal_engine column exists and the frameRows insert/read-back is wired correctly.`
+          );
+        }
+        if (frame.revealEngine === "ltx") {
+          if (!isLtxNamespace(endMotion)) {
+            const firstLtx = preset.allowedEndMotions.find(isLtxNamespace);
+            endMotion = firstLtx || endMotion; // no LTX option exists for this preset+room combo — rare, but don't crash
+          }
+        } else {
+          // Ken Burns engine (or anything else — default to the safe,
+          // free side of the gate) — AI Motion is locked out entirely.
+          if (isLtxNamespace(endMotion)) {
+            endMotion = preset.allowedEndMotions.find((key) => !isLtxNamespace(key)) || "push_in";
+          }
+        }
 
         // FIX (July 18, 2026) — see the padding block's comment above for
         // the full story. Only the continuation phase gets the extra
@@ -391,7 +432,7 @@ async function processRenderJob(job) {
           + (frame.narrationClipPaddingSeconds || 0);
 
         const openerResult = await applyMotionPreset(
-          { ...frame, localPath: frame.beforeLocalPath, motionPreset: resolvedOpener.openerMotion, durationSeconds: REVEAL_OPENER_DURATION },
+          { ...frame, localPath: frame.beforeLocalPath, motionPreset: preset.openerMotion, durationSeconds: REVEAL_OPENER_DURATION },
           workDir,
           1.0
         );
@@ -455,8 +496,7 @@ async function processRenderJob(job) {
           presetKey,
           workDir,
           `reveal_${path.basename(frame.localPath, path.extname(frame.localPath))}.mp4`,
-          actualContinuationDuration,
-          resolvedOpener.wipeTransition
+          actualContinuationDuration
         );
         carryZoom = 1.0; // reset after a reveal beat
 
