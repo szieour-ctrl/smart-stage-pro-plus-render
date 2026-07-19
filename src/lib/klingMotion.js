@@ -103,38 +103,40 @@ function ensureConfigured() {
 //     invent furniture/layout wholesale rather than animate or extend an
 //     already-disclosed scene. Use a real vacant+staged pair, or Ken Burns.
 
-// SUPERSEDED (July 18, 2026) — orbit_arc, rack_focus, drone_boom_up,
-// crane_up, crane_down, parallax_push, and pan_zoom_reveal have all been
-// removed from this allowlist. Each now has a tested, confirmed-working
-// LTX-safe rewrite in ltxMotion.js's LTX_MOTION_TEMPLATES (see that
-// file's "batch 2" section) at lower cost ($0.06/s LTX Fast vs $0.084/s
-// Kling O3). These 7 KLING_MOTION_TEMPLATES entries above are left in
-// place as historical reference, not deleted — they're simply no longer
-// reachable via this allowlist, and the frontend (build-video-demo.html)
-// no longer offers them as Kling choices at all, only as LTX ones. This
-// also corrects the July 17, 2026 decision doc, which had listed
-// Orbit Arc as one of three presets staying Kling-reserved — that call
-// is superseded by this real test result.
-const SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS = new Set([
-  "fireplace_flicker",
-  "cinematic_push",
-  "luxury_drift",
-  "floating_camera_drift",
-  "architectural_glide",
-  "room_reveal",
-  "living_room_ambient",
-  "corner_to_corner_drift",
-]);
+// SUPERSEDED then EMPTIED (July 18, 2026, same day, two steps):
+// orbit_arc/rack_focus/drone_boom_up/crane_up/crane_down/parallax_push/
+// pan_zoom_reveal were removed from this allowlist first (each got a
+// tested LTX-safe rewrite — see ltxMotion.js's batch 2). Then, later the
+// same day, Sam's explicit scope call went further: "LTX should be used
+// Exclusively on all Medium to High confidence AI Motions. Kling is now
+// only to be used on the limited movements that we discussed" (the 7
+// genuine two-image transformations: Hero Transformation, Exterior
+// Landscape Transformation, and the 5 day/twilight timelapse variants).
+// The remaining preset names (fireplace_flicker, cinematic_push,
+// luxury_drift, floating_camera_drift, architectural_glide, room_reveal,
+// living_room_ambient, corner_to_corner_drift) came out too — every
+// single-image camera-motion preset now has an LTX equivalent (19 total
+// across all 3 batches in ltxMotion.js's LTX_MOTION_TEMPLATES). All 15
+// KLING_MOTION_TEMPLATES entries above are left in place as historical
+// reference, not deleted — simply unreachable via this now-empty
+// allowlist. This Set stays declared rather than removed outright so
+// enforceScopeRules' isAllowedSingleImageInteriorPreset check below
+// still works correctly as "always false" — Kling's remaining 7 presets
+// all qualify via hasKnownPair (Hero Transformation, Exterior Landscape
+// Transformation) or isExterior (the day/twilight family) instead,
+// neither of which this Set gates, so emptying it doesn't affect
+// anything Kling still needs to do. Also corrects the July 17, 2026
+// decision doc, which had listed Orbit Arc as staying Kling-reserved —
+// long since superseded.
+const SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS = new Set([]);
 
-// Presets that are only safe on genuinely open-concept/great-room spaces —
-// the "widen the frame" motion has been observed inventing a doorway/
-// opening on a small enclosed room (flagged by Sam July 9, 2026, real
-// Playground test on room_reveal). Gated on frame.isOpenPlan, which
-// already exists as real data on every room object in index.html
-// (SESSION.rooms[].isOpenPlan, set at the "Open Plan / Single Room /
-// Exterior" mapping step) — not a new field, just a new check on data
-// that was already being captured but never enforced against Kling scope.
-const OPEN_PLAN_ONLY_PRESETS = new Set(["room_reveal"]);
+// EMPTIED (July 18, 2026) — same reasoning as above. Kling's own
+// room_reveal preset (a camera-motion-only pull-back, not a
+// transformation) is no longer offered at all — LTX's 3-preset
+// hallway-safe replacement (micro_zoom_out, micro_dolly_back,
+// open_plan_reveal — see ltxMotion.js) covers this use case now. Left
+// declared and empty rather than removed, matching the pattern above.
+const OPEN_PLAN_ONLY_PRESETS = new Set([]);
 
 function enforceScopeRules(frame) {
   const hasKnownPair = !!frame.endImageUrl;
