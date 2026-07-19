@@ -16,6 +16,7 @@ const axios = require("axios");
 const { downloadFrames } = require("./lib/downloadFrames");
 const { applyMotionPreset, resolveDuration } = require("./lib/motionPresets");
 const { applyKlingMotion } = require("./lib/klingMotion");
+const { generateLtxRevealContinuation, applyLtxMotion, isStandaloneEligible, LTX_MOTION_TEMPLATES } = require("./lib/ltxMotion");
 const { generateMusic } = require("./lib/musicGen");
 const { assembleVideo, buildRevealClip, REVEAL_PRESETS, REVEAL_OPENER_DURATION, REVEAL_WIPE_DURATION, REVEAL_CONTINUATION_DURATION, computeClipTimeline, extractMidpointFrame, probeDuration, mapWithConcurrencyLimit, FFMPEG_CONCURRENCY_LIMIT } = require("./lib/assemble");
 const { generateNarration, groupContiguousByRoom } = require("./lib/narrationGen");
@@ -77,6 +78,10 @@ async function processRenderJob(job) {
   // useful for diagnosing exactly which frames had already rendered via
   // Kling (real cost already incurred) before the failure occurred.
   let klingFrameOutcomes = [];
+  // Mirrors klingFrameOutcomes above — same reasoning: distinguishes
+  // real LTX renders from ken_burns_fallback outcomes, for the same
+  // refund/diagnostic purposes.
+  let ltxFrameOutcomes = [];
 
   try {
     console.log(`[${job.jobId}] Starting render. ${job.frames.length} frames.`);
@@ -117,7 +122,16 @@ async function processRenderJob(job) {
     // (e.g. dining's 4.7s base) — technically enough on an average read,
     // not genuinely safe on a slow one. 7s gives real headroom across
     // every room type's base duration, not just the longer ones.
-    const NARRATION_INTRO_PADDING_SECONDS = 7;
+    // CORRECTED to 9 (July 18, 2026 — my first correction, 6s, was still
+    // wrong: it assumed the opening room gets an ordinary ~10-14 word
+    // description like a typical mid-video room. Checking against Sam's
+    // actual real script showed the opener ran 25 words on its own —
+    // exterior/establishing shots legitimately warrant a fuller
+    // description than a single interior room does. Add the welcome
+    // phrase (~7 words) on top of a real 25-word opener and the intro
+    // needs to cover ~32 words, not meaningfully less than the outro's
+    // load — hence landing at the same order of magnitude.
+    const NARRATION_INTRO_PADDING_SECONDS = 9;
     // RAISED to 15 (July 18, 2026 — Sam's call: stop budgeting the two
     // frames that matter most — the user's chosen opening and closing
     // shots — against average-case timing math, and give them enough
@@ -133,7 +147,18 @@ async function processRenderJob(job) {
     // NATURAL pace (speed=1.0) without ever needing speed correction to
     // bail it out, since correction has already been observed to
     // silently fail to shorten anything in at least one real case.
-    const NARRATION_OUTRO_PADDING_SECONDS = 15;
+    // CORRECTED to 9 (July 18, 2026 — Sam's real math check: 15s was
+    // wrong, derived from the pace FLOOR the same way the old global
+    // rate was, and it showed up as ~7.6s of unintended dead air on a
+    // real script). Base room durations already fit an ordinary one-
+    // sentence description reasonably (confirmed: a segment with NO
+    // extra padding landed almost exactly on target on a real script).
+    // This padding should only cover the EXTRA content beyond that — an
+    // address (~7 words) plus an original CTA (~10 words) ≈ 17 extra
+    // words. At SPEAKING_RATE_WORDS_PER_MINUTE (130), that's ~7.8s of
+    // real extra speech, plus a small margin — not a full re-derivation
+    // of the whole segment's duration from zero.
+    const NARRATION_OUTRO_PADDING_SECONDS = 9;
     if (job.wantsNarration && localFrames.length > 0) {
       const first = localFrames[0];
       first.durationSeconds = resolveDuration(first) + NARRATION_INTRO_PADDING_SECONDS;
@@ -359,24 +384,104 @@ async function processRenderJob(job) {
           workDir,
           1.0
         );
-        const continuationResult = await applyMotionPreset(
-          { ...frame, motionPreset: endMotion, durationSeconds: continuationDuration },
-          workDir,
-          1.0
-        );
+
+        // NEW (July 18, 2026) — LTX Fast continuation option. endMotion
+        // now comes from one of TWO namespaces (Ken Burns preset names in
+        // motionRenderer.py, or LTX preset names in LTX_MOTION_TEMPLATES —
+        // confirmed no name collisions between the two lists). Dispatch on
+        // which one it belongs to.
+        //
+        // continuationDuration above is the DESIRED/padded value (a
+        // flexible float). Ken Burns respects it exactly. LTX Fast cannot
+        // — its duration is a fixed enum (6/8/10.../20s) — so LTX snaps
+        // UP to the nearest valid value internally and returns what it
+        // ACTUALLY rendered at. That real value, not the original
+        // request, is what has to flow into buildRevealClip's trim below
+        // — using the pre-snap number would silently discard whatever
+        // extra seconds LTX actually generated (and were actually paid
+        // for), and would also make verifyClipDuration fire a false
+        // [PADDING MISMATCH] on every single LTX reveal clip.
+        let continuationResult;
+        let actualContinuationDuration = continuationDuration;
+        const isLtxEndMotion = !!LTX_MOTION_TEMPLATES[endMotion];
+
+        if (isLtxEndMotion) {
+          try {
+            const ltxResult = await generateLtxRevealContinuation(
+              { ...frame, continuationDurationSeconds: continuationDuration },
+              endMotion,
+              workDir
+            );
+            continuationResult = ltxResult;
+            actualContinuationDuration = ltxResult.ltxDuration;
+          } catch (err) {
+            // No LTX-preset-to-Ken-Burns-preset mapping exists (the two
+            // libraries' names don't correspond 1:1), so this can't fall
+            // back to "the same motion via Ken Burns" the way Kling's own
+            // fallback does. Falls back to push_in — a safe, always-
+            // available default — same "premium enhancement, never a hard
+            // dependency" principle as every other AI motion fallback in
+            // this file.
+            console.error(`  [Reveal] LTX continuation "${endMotion}" failed, falling back to Ken Burns push_in: ${err.message}`);
+            continuationResult = await applyMotionPreset(
+              { ...frame, motionPreset: "push_in", durationSeconds: continuationDuration },
+              workDir,
+              1.0
+            );
+            actualContinuationDuration = continuationDuration;
+          }
+        } else {
+          continuationResult = await applyMotionPreset(
+            { ...frame, motionPreset: endMotion, durationSeconds: continuationDuration },
+            workDir,
+            1.0
+          );
+        }
+
         clipPath = await buildRevealClip(
           openerResult.path,
           continuationResult.path,
           presetKey,
           workDir,
           `reveal_${path.basename(frame.localPath, path.extname(frame.localPath))}.mp4`,
-          continuationDuration
+          actualContinuationDuration
         );
         carryZoom = 1.0; // reset after a reveal beat
 
         if (job.wantsNarration) {
-          const expectedRevealDuration = REVEAL_OPENER_DURATION + continuationDuration - REVEAL_WIPE_DURATION;
-          await verifyClipDuration(job.jobId, `frame ${i} (reveal, ${presetKey})`, clipPath, expectedRevealDuration);
+          const expectedRevealDuration = REVEAL_OPENER_DURATION + actualContinuationDuration - REVEAL_WIPE_DURATION;
+          await verifyClipDuration(job.jobId, `frame ${i} (reveal, ${presetKey}${isLtxEndMotion ? ", LTX" : ""})`, clipPath, expectedRevealDuration);
+        }
+      } else if (frame.ltxMotionPreset && LTX_MOTION_TEMPLATES[frame.ltxMotionPreset]) {
+        // NEW (July 18, 2026) — standalone LTX AI Motion, no Room Reveal
+        // pairing required. Same category as klingMotion.js's
+        // SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS: pure camera/ambient
+        // motion on an already-real, already-staged single image. Only
+        // Medium-High/High confidence presets from the Cinematic LTX
+        // Prompt Pack are exposed here at all (Sam's explicit scope call)
+        // — ltxMotion.js's isStandaloneEligible() is the enforcement
+        // point the frontend dropdown is expected to match, but this is
+        // still checked server-side too, same "don't trust the client
+        // alone" principle as the Reveal Presets' endMotion clamp.
+        if (!isStandaloneEligible(frame.ltxMotionPreset)) {
+          console.error(`  [LTX] Rejected standalone use of "${frame.ltxMotionPreset}" — below the Medium-High confidence floor for standalone selection. Falling back to Ken Burns auto.`);
+          const result = await applyMotionPreset({ ...frame, motionPreset: "auto" }, workDir, carryZoom);
+          clipPath = result.path;
+          carryZoom = result.endingZoom;
+        } else {
+          const result = await applyLtxMotion(
+            frame,
+            frame.ltxMotionPreset,
+            workDir,
+            () => applyMotionPreset({ ...frame, motionPreset: "auto" }, workDir, carryZoom)
+          );
+          clipPath = result.path;
+          carryZoom = result.endingZoom;
+
+          ltxFrameOutcomes.push({
+            sequenceOrder: frame.sequenceOrder !== undefined ? frame.sequenceOrder : i,
+            outcome: result.source,
+          });
         }
       } else {
         const result = await applyMotionPreset(frame, workDir, carryZoom);
@@ -492,6 +597,7 @@ async function processRenderJob(job) {
       status: "complete",
       urls,
       klingFrameOutcomes,
+      ltxFrameOutcomes,
       // NEW (July 14, 2026) — the actual generated script, so Netlify can
       // store it and show it alongside the finished video (see Sam's
       // idea: display the script at the result screen, since it was
@@ -507,6 +613,7 @@ async function processRenderJob(job) {
       status: "failed",
       error: err.message,
       klingFrameOutcomes,
+      ltxFrameOutcomes,
     });
     throw err;
   } finally {
