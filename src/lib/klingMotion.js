@@ -1,692 +1,1124 @@
-// klingMotion.js — AI-generated camera motion via Kling (through fal.ai),
-// using the official @fal-ai/client SDK rather than raw HTTP requests.
-//
-// IMPORTANT — SCOPE RESTRICTION (read before modifying):
-// The real safety boundary is NOT "interior vs exterior" and NOT "known
-// pair vs single image" on its own — it's whether the alteration is a
-// disclosed, enumerated-category change (anything AB 723 §10140.8(b)(1)
-// already covers: furniture, fixtures, walls, flooring, hardscape,
-// landscape, facade, floor plans) vs. content with no photographic ground
-// truth at all and no disclosed framing. See enforceScopeRules() below,
-// which is a hard runtime check, not just a comment.
-//
-// Validated known-pair use cases (both endpoints are real, disclosed
-// images — Kling interpolates, doesn't invent):
-//   1. Interior vacant→staged interpolation (start/end frame, same room)
-//   2. Exterior day/twilight transitions (start/end frame) — see
-//      KLING_MOTION_TEMPLATES for the day_to_twilight / twilight_to_day /
-//      timelapse variants
-//
-// Exterior also permits single-image motion (no end frame) — drone_boom_up,
-// water_motion, and the generic exterior default.
-//
-// RESOLVED — single-image INTERIOR presets (orbit_arc, rack_focus,
-// fireplace_flicker) are also permitted, via
-// SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS below. Worked through with Sam
-// against the actual AB 723 text and MetroList's MLS Rules (11.6.1,
-// 12.10(f)): these are the same kind of disclosed, enumerated-category
-// alteration as a virtual pool, a wall removal, or added landscaping —
-// not a different risk just because the invented content shows up via a
-// camera move instead of a static add-on. A virtual pool isn't internally
-// marked "this part is fake" inside the photo either — the only mechanism
-// either case has is the same one: a watermark/label, the AB 723
-// compliance page, and (per MLS Rule 12.10(f)) identification in Public
-// Remarks. If that mechanism is sufficient for a pool, it's sufficient for
-// a camera move that reveals an unphotographed cabinet run or animates an
-// existing fireplace's flame. Same compliance path, same conclusion.
-// (curtain_sway was tested and dropped — not a compliance issue, just no
-// real use case in real estate photography, and the motion read as
-// exaggerated/windy rather than subtle. Removed entirely below.)
-//
-// What STAYS blocked for single-image interior: the GENERIC default case
-// (no klingMotionPreset set, or any preset not in the allowlist) — i.e.
-// converting an empty room into a furnished one directly via Kling, with
-// no staged counterpart image at all. That's a categorically different
-// case: it bypasses the platform's actual staging pipeline (and its
-// review/Generate-Final step) entirely, inventing a full furnished room
-// from nothing rather than animating or revealing more of a scene that's
-// already been staged, photographed, and disclosed through the normal
-// flow. Use a real vacant+staged pair for that, or Ken Burns.
-//
-// Falls back to Ken Burns (motionPresets.js) on any failure — AI motion
-// is a premium enhancement, not a dependency the pipeline requires.
+// assemble.js — Concatenates motion clips with crossfade transitions,
+// mixes in background music, and renders final output formats.
 
-const fs = require("fs");
 const path = require("path");
-const axios = require("axios");
+const fs = require("fs");
 const ffmpeg = require("fluent-ffmpeg");
-const { fal } = require("@fal-ai/client");
-const { applyMotionPreset } = require("./motionPresets");
 
-// Must match the output dimensions used in motionPresets.js — kept as a
-// separate local constant rather than importing it, since these two
-// modules normalize to a shared OUTPUT spec but aren't otherwise coupled.
-// If motionPresets.js's OUTPUT_W/OUTPUT_H ever change, update here too.
-const OUTPUT_W = 1920;
-const OUTPUT_H = 1080;
+const CROSSFADE_DURATION = 0.6; // seconds between clips
 
-let configured = false;
-
-function ensureConfigured() {
-  if (configured) return;
-  if (!process.env.FAL_KEY) {
-    throw new Error("FAL_KEY not set — cannot use Kling AI motion");
-  }
-  fal.config({ credentials: process.env.FAL_KEY });
-  configured = true;
-}
-
-// ── SCOPE ENFORCEMENT ─────────────────────────────────────────────────
-// The real safety boundary isn't "interior vs exterior" — it's whether
-// Kling has two REAL, KNOWN endpoints to interpolate between, an exterior
-// scene (more tolerant of invented sky/landscape detail), or a single
-// interior preset from the allowlist below (disclosed via the same
-// mechanism as any other altered image — see file header for the full
-// reasoning).
-//
-//   - Vacant + Staged pair (from Smart Stage PRO staging) → both endpoints
-//     are real, disclosed images. Kling fills in the transition between
-//     two known states. Low risk, AI Motion freely available here.
-//
-//   - A single photo with no pair, exterior → permitted. Landscaping/sky
-//     have more tolerance for invented detail than interior architecture.
-//
-//   - A single photo with no pair, interior, named preset in
-//     SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS → permitted. These animate
-//     camera movement or a dynamic element (flame) within a scene that's
-//     already fully visible and disclosed — same compliance category as
-//     a virtual pool or a wall removal, not a different risk.
-//
-//   - A single photo with no pair, interior, NO named preset (or one not
-//     in the allowlist) → rejected. This is the generic vacant→furnished
-//     case: no staged counterpart exists at all, so Kling would have to
-//     invent furniture/layout wholesale rather than animate or extend an
-//     already-disclosed scene. Use a real vacant+staged pair, or Ken Burns.
-
-// SUPERSEDED then EMPTIED (July 18, 2026, same day, two steps):
-// orbit_arc/rack_focus/drone_boom_up/crane_up/crane_down/parallax_push/
-// pan_zoom_reveal were removed from this allowlist first (each got a
-// tested LTX-safe rewrite — see ltxMotion.js's batch 2). Then, later the
-// same day, Sam's explicit scope call went further: "LTX should be used
-// Exclusively on all Medium to High confidence AI Motions. Kling is now
-// only to be used on the limited movements that we discussed" (the 7
-// genuine two-image transformations: Hero Transformation, Exterior
-// Landscape Transformation, and the 5 day/twilight timelapse variants).
-// The remaining preset names (fireplace_flicker, cinematic_push,
-// luxury_drift, floating_camera_drift, architectural_glide, room_reveal,
-// living_room_ambient, corner_to_corner_drift) came out too — every
-// single-image camera-motion preset now has an LTX equivalent (19 total
-// across all 3 batches in ltxMotion.js's LTX_MOTION_TEMPLATES). All 15
-// KLING_MOTION_TEMPLATES entries above are left in place as historical
-// reference, not deleted — simply unreachable via this now-empty
-// allowlist. This Set stays declared rather than removed outright so
-// enforceScopeRules' isAllowedSingleImageInteriorPreset check below
-// still works correctly as "always false" — Kling's remaining 7 presets
-// all qualify via hasKnownPair (Hero Transformation, Exterior Landscape
-// Transformation) or isExterior (the day/twilight family) instead,
-// neither of which this Set gates, so emptying it doesn't affect
-// anything Kling still needs to do. Also corrects the July 17, 2026
-// decision doc, which had listed Orbit Arc as staying Kling-reserved —
-// long since superseded.
-const SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS = new Set([]);
-
-// EMPTIED (July 18, 2026) — same reasoning as above. Kling's own
-// room_reveal preset (a camera-motion-only pull-back, not a
-// transformation) is no longer offered at all — LTX's 3-preset
-// hallway-safe replacement (micro_zoom_out, micro_dolly_back,
-// open_plan_reveal — see ltxMotion.js) covers this use case now. Left
-// declared and empty rather than removed, matching the pattern above.
-const OPEN_PLAN_ONLY_PRESETS = new Set([]);
-
-function enforceScopeRules(frame) {
-  const hasKnownPair = !!frame.endImageUrl;
-  const isExterior = frame.roomType === "exterior";
-  const isAllowedSingleImageInteriorPreset =
-    !!frame.klingMotionPreset &&
-    SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS.has(frame.klingMotionPreset);
-
-  if (hasKnownPair || isExterior || isAllowedSingleImageInteriorPreset) {
-    if (
-      !hasKnownPair &&
-      !isExterior &&
-      OPEN_PLAN_ONLY_PRESETS.has(frame.klingMotionPreset) &&
-      !frame.isOpenPlan
-    ) {
-      throw new Error(
-        `Kling AI motion rejected: preset "${frame.klingMotionPreset}" is restricted to open-concept/great-room spaces (frame.isOpenPlan must be true) when used single-image without a known pair. On a small, enclosed room this preset has been observed inventing a doorway/opening that doesn't exist in the source photo — the "widen the frame" motion can't be satisfied honestly in a tight space. Mark the room as Open Plan, provide a real vacant+staged pair instead, or choose a different preset (orbit_arc, cinematic_push, crane_up, crane_down, etc. all move the camera without needing more room to reveal).`
-      );
+// ── CONCURRENCY-LIMITED MAP (July 14, 2026 — real test failure) ────────
+// Two separate real failures in the same render (a narration frame
+// extraction and a clip normalization) both threw resource-exhaustion-
+// flavored ffmpeg errors ("Resource temporarily unavailable", "Error
+// while opening encoder" on a clip with perfectly clean, even
+// dimensions — ruling out the odd-dimension theory from the prior fix).
+// Both call sites were launching one ffmpeg process PER CLIP, all at
+// once, via unbounded Promise.all — up to 9 simultaneous ffmpeg encodes
+// for a 9-frame job. That's a real, plausible cause of exactly this
+// class of intermittent failure on a resource-constrained container,
+// regardless of which specific resource (CPU, memory, file descriptors)
+// is actually the bottleneck. This caps how many run at once instead of
+// firing all of them simultaneously — processes the rest as slots free
+// up, rather than requiring every clip to fit in memory/CPU at the same
+// instant.
+async function mapWithConcurrencyLimit(items, limit, fn) {
+  const results = new Array(items.length);
+  let cursor = 0;
+  async function worker() {
+    while (cursor < items.length) {
+      const i = cursor++;
+      results[i] = await fn(items[i], i);
     }
-    return;
   }
-
-  throw new Error(
-    `Kling AI motion rejected: no end image provided for room type "${frame.roomType}", and preset "${frame.klingMotionPreset || "(none — generic default)"}" is not in the single-image interior allowlist (orbit_arc, rack_focus, fireplace_flicker, cinematic_push, luxury_drift, floating_camera_drift, parallax_push, architectural_glide, crane_up, crane_down). The generic interior default requires Kling to invent furniture/layout wholesale rather than interpolate between two known images or animate an already-disclosed scene — this is disabled by design. Use a vacant+staged pair, select one of the allowed single-image presets, or use Ken Burns for single-image interior shots outside that list. See AB 723 scope restriction in klingMotion.js.`
-  );
+  const workers = Array.from({ length: Math.min(limit, items.length) }, worker);
+  await Promise.all(workers);
+  return results;
 }
+const FFMPEG_CONCURRENCY_LIMIT = 3; // conservative default — revisit if Railway's plan tier is confirmed to have more headroom
 
-// ── INPUT ASPECT RATIO NORMALIZATION ──────────────────────────────────
-// Kling infers its output aspect ratio from the input image (confirmed on
-// fal.ai's v3/pro docs: "Aspect ratio is inferred from the start image. The
-// aspect_ratio field in the UI is ignored by the model" — O3 Standard
-// exposes no aspect_ratio parameter either, consistent with the same
-// inference behavior). Real estate photos are commonly shot at 3:2
-// (e.g. 1176x784), not 16:9 — so without this, Kling faithfully returns a
-// 3:2 clip, which then needs scaling/cropping to fit our 1920x1080 canvas
-// and visually mismatches the full-frame Ken Burns continuation.
+// NEW (July 14, 2026 — real test failure) — mirrors
+// NARRATION_END_BUFFER_SECONDS in generate-narration-background.js. That
+// file sizes the SCRIPT to roughly fit before this buffer; this constant
+// is the hard enforcement backstop at mix time, against the real, exact
+// video duration rather than an estimate.
+const NARRATION_END_BUFFER_SECONDS = 2;
+
+// ── NORMALIZE CLIP (fixes the real root cause of the xfade crash) ────────
+// CONFIRMED ROOT CAUSE of "Error reinitializing filters! / Failed to
+// inject frame into filter network: Invalid argument" — a real crash from
+// a real test job with 4 clips, 2 sourced from Kling (fal.ai's own output
+// resolution/fps/codec) and 2 from the local Ken Burns fallback (OpenCV/
+// FFmpeg, whatever this codebase already renders at). xfade requires every
+// pair of inputs it chains together to share resolution, frame rate, and
+// pixel format — concatenateClips() never enforced this, so any mix of
+// Kling + Ken Burns clips (or even two Kling clips at different durations/
+// fal.ai output settings) was one mismatch away from crashing the whole
+// render.
 //
-// Fixing it here, at the source, means Kling never produces a mismatched
-// clip in the first place — same principle as the existing "center-crop
-// source to 16:9 before any motion is applied" fix already used for the
-// Ken Burns engine, just applied one step earlier in the Kling pipeline.
-// Cloudinary applies this transformation on the fly when Kling fetches the
-// URL — no extra processing or re-upload needed on our end.
+// FIX: normalize every clip to identical parameters BEFORE it ever reaches
+// the xfade chain, regardless of source. This is deliberately a fixed
+// target (1920x1080/30fps/yuv420p) rather than "whatever Kling outputs" —
+// Ken Burns clips would still need separate normalization to MATCH
+// whatever Kling's native spec is, so pinning both to one target this
+// codebase controls is no more work and is robust to fal.ai ever changing
+// Kling's default output spec in the future. 1920x1080 matches the final
+// 16:9 output exactly, so this adds no redundant scaling at renderFormat()
+// time for the common case.
+// CHANGE: fps corrected from an initial 30 to 20, to match the EXISTING
+// normalization convention already established in klingMotion.js's own
+// concatTwoClips() (used for the Before/After continuation feature) —
+// confirmed by direct inspection: OUTPUT_W=1920, OUTPUT_H=1080, fps=20,
+// format=yuv420p. Using a different fps here would have meant a
+// continuation-combined clip (already normalized once, at 20fps, inside
+// klingMotion.js) gets silently re-normalized to a SECOND, different fps
+// the moment it reaches assemble.js — wasted re-encoding at best, and a
+// new source of inconsistency at worst if other clips in the same job
+// were normalized to yet a third value. One target, matched across both
+// files, is the actual fix — not just "pick a fixed number and move on."
+const NORMALIZE_WIDTH  = 1920;
+const NORMALIZE_HEIGHT = 1080;
+const NORMALIZE_FPS    = 20;
 
-function forceCloudinary16x9(url) {
-  if (!url || !url.includes("/upload/")) return url; // not a Cloudinary delivery URL — leave untouched
-  return url.replace("/upload/", "/upload/c_fill,ar_16:9,g_auto/");
-}
+function normalizeClip(clipPath, workDir, index) {
+  return new Promise(async (resolve, reject) => {
+    const outputPath = path.join(workDir, `normalized_${index}.mp4`);
 
-// ── KLING MOTION PRESET TEMPLATES ─────────────────────────────────────
-// Named, tested prompt templates beyond the two generic defaults below.
-// Selected via frame.klingMotionPreset; falls back to the generic
-// interior/exterior prompt when unset or unrecognized — same fallback
-// pattern as resolvePreset() in motionPresets.js. Each of these was
-// iterated on and verified in the fal.ai Playground before being added
-// here (see handoff for testing notes and image-pair requirements).
-// Scope/compliance reasoning for which presets are usable on a single
-// interior image is in the file header and SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS
-// above — resolved, not an open question.
-
-const KLING_MOTION_TEMPLATES = {
-  // ── Kling-exclusive moves — impossible to fake with Ken Burns ────────
-  orbit_arc:
-    "Slow cinematic orbit camera movement arcing around the central feature — a kitchen island, dining table, or pool — sweeping laterally while keeping it centered in frame, photorealistic, no distortion, stable architecture, surrounding cabinetry and furniture remain fixed and undistorted throughout the movement",
-
-  // NOTE (July 18, 2026): unlike the other 6 superseded presets above,
-  // this one was NEVER gated by SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS —
-  // it's reachable via enforceScopeRules' broader isExterior check, which
-  // grants access to ANY preset name on exterior frames (needed for the
-  // day/twilight family, which genuinely stays Kling-reserved). So this
-  // template is still technically callable from the backend if directly
-  // requested; the real defense is that build-video-demo.html no longer
-  // offers it as a Kling choice at all — same "frontend is the real gate"
-  // situation as any deprecated-but-not-deleted option.
-  drone_boom_up:
-    "Smooth cinematic drone boom-up camera movement, rising upward and slightly forward to reveal the full exterior and surrounding landscaping from an elevated angle, photorealistic, no distortion, house structure and architecture remain completely fixed and unchanged",
-
-  rack_focus:
-    "Cinematic rack focus shot, starting with sharp focus on a foreground detail (faucet hardware, fixture, or vignette), then smoothly shifting focus to reveal the room behind it coming into sharp clarity, soft natural depth of field transition, photorealistic, no distortion, structure and cabinetry remain fixed and unchanged",
-
-  fireplace_flicker:
-    "Static cinematic shot, camera locked off, with the fireplace flame flickering naturally and realistically, gentle ambient light flicker on surrounding walls, photorealistic, no distortion, room and architecture remain completely fixed and unchanged",
-
-  water_motion:
-    "Static cinematic shot, camera locked off, with gentle natural water movement and subtle ripples across the pool surface, photorealistic, no distortion, landscaping and structure remain completely fixed and unchanged",
-
-  // ── Exterior day/twilight transitions — known-pair, like vacant→staged ─
-  day_to_twilight:
-    "Smooth cinematic camera movement across the exterior as the bright daytime sky gradually deepens into a dusk blue-hour sky with soft pink and purple sunset color near the horizon, interior window lights gradually turning on and glowing warm amber, exterior porch and garage lights turning on, landscape lighting along the walkway and garden beds gradually illuminating, photorealistic, no distortion, house structure, architecture, and landscaping remain completely fixed and unchanged — only sky color, light quality, and lighting fixtures transform",
-
-  twilight_to_day:
-    "Smooth cinematic camera movement across the exterior as the dusk blue-hour sky with soft pink and purple sunset color gradually brightens into a clear daytime blue sky, interior window lights gradually turning off, exterior porch and garage lights turning off, landscape lighting along the walkway and garden beds gradually dimming and turning off, photorealistic, no distortion, house structure, architecture, and landscaping remain completely fixed and unchanged — only light quality and color temperature transform",
-
-  day_to_twilight_timelapse:
-    "Time-lapse style video, static locked-off camera, exterior daytime sky rapidly transitioning into a dusk blue-hour sky, clouds streaking past, sky color rapidly deepening from bright blue to deep blue with a pink and purple sunset glow near the horizon, interior window lights and exterior porch, garage, and landscape lighting rapidly turning on in sequence as if hours are passing in seconds, photorealistic, no distortion, house structure, architecture, and landscaping remain completely fixed and unchanged — only the sky, light, and time of day transform",
-
-  twilight_to_day_timelapse:
-    "Time-lapse style video, static locked-off camera, exterior dusk blue-hour sky with a pink and purple sunset glow rapidly brightening into a clear daytime blue sky, clouds streaking past, interior window lights and exterior porch, garage, and landscape lighting rapidly turning off in sequence as if hours are passing in seconds, photorealistic, no distortion, house structure, architecture, and landscaping remain completely fixed and unchanged — only the sky, light, and time of day transform",
-
-  // Three-phase, 6s, known-pair (twilight start / day end). Lighting timing
-  // confirmed against real test footage: interior lights go dark well
-  // before full night (people go to bed), while exterior/landscape
-  // lighting stays on through the night on timers, then cuts at dawn —
-  // two independent lighting timelines in the same clip.
-  twilight_night_day_timelapse:
-    "Time-lapse style video, static locked-off camera, exterior sky transitioning through three phases: starting at dusk blue-hour with a pink and purple sunset glow near the horizon, deepening into full night with a dark navy-to-black sky, then rapidly brightening into clear daytime blue sky, clouds streaking past throughout. Interior window lights are on at the start during dusk, then turn off at around the 2.5 second mark, leaving only exterior porch, garage, and landscape lighting on for the remainder of the night phase, which then turns off as daylight returns at dawn. Photorealistic, no distortion, house structure, architecture, and landscaping remain completely fixed and unchanged — only the sky, light, and time of day transform",
-
-  // ── New Motion Library (July 2026) — 5 additional camera-move-only presets,
-  // same compliance category as orbit_arc/rack_focus/fireplace_flicker above:
-  // pure camera movement through/around a scene that's already fully visible
-  // and disclosed, no invented furniture, fixtures, or room content. Added to
-  // SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS below on that basis.
-
-  cinematic_push:
-    "Slow, smooth cinematic push-in camera movement toward the center of the room, gently tightening the framing on the space already shown, photorealistic, no distortion, stable architecture, all visible furniture, fixtures, walls, and windows remain fixed and unchanged throughout the movement",
-
-  luxury_drift:
-    "Slow, elegant lateral drift camera movement gliding gently across the room from one side toward the other, refined luxury cinematic feel, photorealistic, no distortion, stable architecture, all visible furniture, fixtures, and architecture remain fixed and undistorted throughout the movement",
-
-  floating_camera_drift:
-    "Gentle floating camera movement with subtle drift and micro-sway, as if suspended weightlessly within the room, soft breathing motion, photorealistic, no distortion, stable architecture, all visible furniture, fixtures, and architecture remain fixed and undistorted throughout",
-
-  parallax_push:
-    "Cinematic push-in camera movement with layered parallax depth, foreground elements shifting slightly faster than background elements as the camera moves forward to create a sense of dimensional depth, photorealistic, no distortion, stable architecture, all visible furniture, fixtures, and architecture remain fixed and undistorted throughout",
-
-  architectural_glide:
-    "Smooth lateral glide camera movement tracking along the sightline, hallway, or open-plan sequence already visible in the photo, emphasizing architectural flow, photorealistic, no distortion, stable architecture, all visible walls, ceilings, fixtures, and furniture remain fixed and undistorted throughout",
-
-  // ── crane_up / crane_down — Kling-quality vertical crane pair, filling a
-  // real gap: Ken Burns already has tilt_up/tilt_down (pure FFmpeg vertical
-  // pan, no AI generation), and drone_boom_up is Kling's vertical move but
-  // exterior-only. There was no AI-generated vertical camera move for
-  // single-image interior until now. Same category as cinematic_push/
-  // architectural_glide above — camera moves through content already
-  // visible in the photo, no invented room content.
-  crane_up:
-    "Smooth cinematic crane camera movement, rising vertically while tilting slightly upward to bring the upper portion of the room already visible in the photo into clearer view — ceiling details, chandelier, ceiling fan, or high windows — photorealistic, no distortion, stable architecture, all visible fixtures, furniture, and architecture remain fixed and unchanged throughout the movement, do not reveal room area beyond what is visible in the source photo",
-
-  crane_down:
-    "Smooth cinematic crane camera movement, descending vertically while tilting slightly downward to bring the lower portion of the room already visible in the photo into clearer view — flooring, tilework, or a rug — photorealistic, no distortion, stable architecture, all visible fixtures, furniture, and architecture remain fixed and unchanged throughout the movement, do not reveal room area beyond what is visible in the source photo",
-
-  // ── room_reveal — Cleared (July 9, 2026) via Sam's fal.ai Playground
-  // testing and now included in SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS
-  // below. This preset's own name implies widening what's visible beyond
-  // the original photo's framing, not just moving the camera through/
-  // around content already shown — a materially different claim than
-  // orbit_arc's "stays centered on one feature" — which is why it needed
-  // explicit verification before enabling for single-image interior use.
-  //
-  // KNOWN FAILURE MODE (flagged by Sam, July 9, 2026): on a small, enclosed
-  // room, Kling interpreted "pulling back" as needing more physical space
-  // to pull back INTO, and invented a doorway/opening in a wall that
-  // doesn't exist in the source photo — a real hallucination, not a
-  // one-off. Root cause: the reveal move is spatially harder to satisfy
-  // in a tight room than in an open-concept one where a wider view is
-  // often already implied by adjacent visible space. WARNING — best
-  // suited to open-concept / great-room spaces where widening the frame
-  // doesn't require inventing new architecture. Strongly discourage (or,
-  // once an isOpenPlan-type field exists on the frame schema, hard-gate)
-  // use on small/enclosed rooms until further tested.
-  //
-  // Prompt strengthened same day with explicit anti-hallucination
-  // constraints — the O3 endpoint has no negative_prompt parameter (only
-  // legacy Kling v1/v1.6/v2/v2.1/v3-pro/v3-standard support it), so this
-  // is the only lever available; the constraint has to live in the main
-  // prompt text itself.
-  room_reveal:
-    "Slow cinematic reveal movement, camera gently pulling back and widening to bring more of the ALREADY-VISIBLE room into frame, staying fully within the room's existing walls and boundaries as shown in the source photo, photorealistic, no distortion, stable architecture, all furniture and fixtures remain fixed and unchanged. This preset is intended ONLY for large, open-concept spaces where a wide pull-back reveals more of a great room, kitchen, or living area that genuinely extends beyond the current frame — it is NOT intended for small, enclosed, single-purpose rooms (bedroom, bathroom, small dining room, small office) where there is no additional real space to reveal. Strictly forbidden, under all circumstances: do not create, invent, generate, open, or reveal any doorway, archway, opening, hallway, window, wall gap, or adjoining room that is not already fully and unambiguously visible in the source photo. Do not remove, extend, thin, or alter any wall in any way. Do not add floor area, ceiling area, or any architectural element beyond the room's existing, already-photographed boundaries. If the room is small, fully enclosed, or has no visible opening to another space, the camera must stop pulling back at the point where the existing walls fill the frame — it is far better to produce a smaller, more conservative pull-back than to invent any new space, opening, or architectural feature. When in doubt about whether additional revealed area is genuinely present in the source photo, do not reveal it.",
-
-  // ── living_room_ambient and corner_to_corner_drift — Cleared (July 9,
-  // 2026) via Sam's fal.ai Playground testing and now included in
-  // SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS below.
-  // outdoor_breeze needs no allowlist entry — exterior single-image is
-  // already permitted for any preset under enforceScopeRules' isExterior
-  // check — was covered by the same round of Playground verification.
-  living_room_ambient:
-    "Subtle ambient cinematic motion within the living room — if a lit fireplace is visible, gentle flame flicker; if curtains are visible, a light natural sway; if plants are visible, subtle organic movement — only animating elements already present in the photo, photorealistic, no distortion, stable architecture, all furniture, fixtures, and architecture remain fixed and unchanged, do not add a fireplace, curtains, or plants that are not already visible",
-
-  outdoor_breeze:
-    "Gentle outdoor ambient motion — if trees, plants, or landscaping are visible, a subtle natural breeze moving through them; if water features are visible, gentle ripples — only animating elements already present in the photo, photorealistic, no distortion, structure and landscaping remain fixed and unchanged, do not add trees, plants, water features, or landscaping that are not already visible",
-
-  corner_to_corner_drift:
-    "Slow diagonal cinematic drift from one corner of the room toward the opposite corner, staying within the room as already framed in the photo, photorealistic, no distortion, stable architecture, all visible furniture, fixtures, and architecture remain fixed and undistorted throughout, do not reveal room area beyond what is visible in the source photo",
-
-  // ── pan_zoom_reveal — classic combined pan+zoom camera move (July 9,
-  // 2026), the Kling-quality counterpart to Ken Burns' new pan_zoom preset.
-  // Same category as cinematic_push/architectural_glide above: pure camera
-  // movement across content already visible in the photo, no invented room
-  // content, so it goes straight into SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS
-  // below without needing separate Playground verification — it's a
-  // combination of two already-verified motion types (a lateral track and
-  // a push-in), not a new content category.
-  pan_zoom_reveal:
-    "Smooth cinematic camera movement combining a steady lateral pan across the room with a simultaneous gentle push-in, revealing more of the space already shown while gliding sideways, photorealistic, no distortion, stable architecture, all visible furniture, fixtures, and architecture remain fixed and unchanged throughout the movement, do not reveal room area beyond what is visible in the source photo",
-};
-
-const VALID_KLING_PRESETS = new Set(Object.keys(KLING_MOTION_TEMPLATES));
-
-// ── PROMPT TEMPLATES ──────────────────────────────────────────────────
-// Kept separate per use case since the framing differs meaningfully —
-// interior is about furniture appearing, exterior is about lighting/
-// landscape transformation with the structure held fixed.
-//
-// Precedence: customPrompt always wins (full caller override) → named
-// klingMotionPreset from the table above → generic room-type default.
-
-function buildPrompt(frame) {
-  if (frame.customPrompt) return frame.customPrompt;
-
-  if (frame.klingMotionPreset) {
-    if (KLING_MOTION_TEMPLATES[frame.klingMotionPreset]) {
-      return KLING_MOTION_TEMPLATES[frame.klingMotionPreset];
+    // NEW (July 14, 2026 — real test failure) — a real render failed here
+    // with "Error while opening encoder for output stream #0:0 - maybe
+    // incorrect parameters such as bit_rate, rate, width or height" on
+    // clip index 6, with no further detail on WHY. That error message is
+    // FFmpeg's generic catch-all for the encoder rejecting the stream —
+    // it doesn't say what was actually wrong with the source. Rather than
+    // guess, probe the source clip FIRST and log its real properties, so
+    // if this happens again the log states the actual cause (corrupt
+    // file, zero duration, unusual dimensions) instead of a mystery.
+    try {
+      const meta = await new Promise((res, rej) => {
+        ffmpeg.ffprobe(clipPath, (err, data) => err ? rej(err) : res(data));
+      });
+      const videoStream = meta.streams?.find(s => s.codec_type === "video");
+      console.log(`[normalizeClip] clip ${index} (${clipPath}): ${videoStream?.width}x${videoStream?.height}, duration=${meta.format?.duration}, codec=${videoStream?.codec_name}`);
+    } catch (probeErr) {
+      // The clip is likely corrupt/unreadable if even ffprobe can't read
+      // it — this IS useful diagnostic information, log it and continue
+      // to the real normalization attempt below (which will then fail
+      // with its own, now-better-understood error).
+      console.error(`[normalizeClip] clip ${index} (${clipPath}) failed to probe — likely corrupt or incomplete: ${probeErr.message}`);
     }
-    console.warn(
-      `[klingMotion] Unknown klingMotionPreset "${frame.klingMotionPreset}", falling back to room-type default`
-    );
-  }
 
-  const isInterior = !["exterior"].includes(frame.roomType);
-
-  if (isInterior) {
-    return "Smooth cinematic push-in camera movement through an empty room as furniture and decor gradually appear, room becomes fully furnished and staged, photorealistic, no distortion, stable architecture, walls and windows remain fixed";
-  }
-
-  return "Smooth cinematic camera movement across the exterior as lighting and landscaping gradually transform and improve, photorealistic, no distortion, house structure and architecture remain completely fixed and unchanged";
-}
-
-// ── LAST-FRAME EXTRACTION ─────────────────────────────────────────────
-// Extracts the actual last frame of Kling's output video as a PNG, so the
-// continuation Ken Burns clip can start from the pixel-exact state Kling
-// ended on, instead of from the original (pre-transformation) staged image.
-
-/**
- * Extracts the last frame of a video clip as a PNG.
- * Used to seed the Ken Burns continuation clip from Kling's exact end state,
- * so the first frame of Ken Burns is pixel-identical to Kling's last frame.
- *
- * @param {string} videoPath  - Path to the Kling output video on disk.
- * @param {string} workDir    - Temp directory for this job.
- * @returns {Promise<string>} - Path to the extracted PNG.
- */
-async function extractLastFrame(videoPath, workDir) {
-  const outputPath = path.join(workDir, `lastframe_${path.basename(videoPath, ".mp4")}.png`);
-  return new Promise((resolve, reject) => {
-    ffmpeg(videoPath)
-      .inputOptions([
-        "-sseof", "-0.1", // seek to 0.1s before end of file — this is an INPUT-side seek
-        // option (it affects how ffmpeg reads the source), not an output option. Confirmed via
-        // a real "Option sseof cannot be applied to output url" ffmpeg error when this was
-        // bundled into outputOptions() instead — ffmpeg parses options positionally, and an
-        // input option placed after -i gets misread as belonging to the output file.
+    ffmpeg(clipPath)
+      .videoFilters([
+        // Scale to fit within target dimensions preserving aspect ratio,
+        // then pad to exactly the target size — same safe-default pattern
+        // already used in renderFormat() below, applied here instead at
+        // the per-clip stage so xfade never sees a size mismatch.
+        //
+        // FIX (July 14, 2026 — real test failure): added
+        // force_divisible_by=2. Without it, an unusual source aspect
+        // ratio can make force_original_aspect_ratio=decrease compute an
+        // intermediate ODD dimension (e.g. 1919 instead of 1920) —
+        // libx264's yuv420p output requires both dimensions even, and an
+        // odd intermediate size is a well-documented cause of exactly
+        // this "Error while opening encoder" failure. This forces the
+        // scale step itself to only ever produce even numbers, closing
+        // off that failure mode regardless of the source clip's own
+        // aspect ratio.
+        `scale=${NORMALIZE_WIDTH}:${NORMALIZE_HEIGHT}:force_original_aspect_ratio=decrease:force_divisible_by=2`,
+        `pad=${NORMALIZE_WIDTH}:${NORMALIZE_HEIGHT}:(ow-iw)/2:(oh-ih)/2`,
+        `fps=${NORMALIZE_FPS}`,
       ])
-      .outputOptions([
-        "-vframes", "1",  // grab exactly one frame
-        "-q:v", "2",      // near-lossless quality (PNG ignores this, but safe)
-      ])
+      .outputOptions(["-pix_fmt", "yuv420p", "-c:v", "libx264", "-preset", "fast"])
+      // Audio is dropped here deliberately — concatenateClips' xfade only
+      // ever operates on [x:v] video streams (see lastLabel/nextLabel
+      // below), and mixAudio() adds the real soundtrack afterward across
+      // the whole concatenated video. Carrying per-clip audio through this
+      // step would be discarded work and a second source of format
+      // mismatches (Kling clips may have audio tracks with different
+      // sample rates than Ken Burns clips, which have none at all).
+      .noAudio()
       .output(outputPath)
-      .on("start", (cmd) => console.log(`  [Kling] extractLastFrame ffmpeg command: ${cmd}`))
       .on("end", () => resolve(outputPath))
-      .on("error", (err) => reject(new Error(`extractLastFrame failed: ${err.message}`)))
+      .on("error", (err) => reject(new Error(`Clip normalization failed for ${clipPath} (index ${index}): ${err.message}`)))
       .run();
   });
 }
 
-// ── CONTINUATION MOTION ──────────────────────────────────────────────
-// After Kling's transformation finishes (vacant becomes staged), the
-// clip ends on a static-feeling final frame. This stitches on a few
-// extra seconds of Ken Burns motion (push-in, pull-back, float, pan)
-// starting from the ACTUAL LAST FRAME of Kling's clip — not the original
-// staged image, which is Kling's *starting* frame, not its ending one.
-// Using the starting image caused a visible zoom/position jump at the
-// stitch point, since Kling's own camera move had already changed the
-// composition by the time its clip ended. Extracting the real last frame
-// makes the cut pixel-seamless.
+// ── PROBE ACTUAL CLIP DURATION ───────────────────────────────────────────
+// The previous version assumed every clip was exactly 4.5s when calculating
+// crossfade offsets. That assumption was wrong as soon as duration varied
+// even slightly, and caused xfade offsets to be miscalculated — visually
+// "swallowing" earlier clips in the sequence (only the last clip appeared
+// in testing with 2 frames). Probing real duration fixes this at the root.
 
-// NOW EXPORTED (July 18, 2026) — ltxMotion.js reuses this exact same
-// normalize-then-hard-cut-concat logic for stitching a Ken Burns wipe
-// clip to an LTX continuation clip. Same underlying problem (two clips
-// from different renderers, not guaranteed to share resolution/fps/pixel
-// format) — no reason to duplicate ~40 lines of ffmpeg normalization
-// logic in a second file when this one is a proven, working solution to
-// the identical problem.
-function concatTwoClips(firstPath, secondPath, workDir, outputName) {
+function probeDuration(clipPath) {
+  return new Promise((resolve, reject) => {
+    ffmpeg.ffprobe(clipPath, (err, metadata) => {
+      if (err) return reject(new Error(`ffprobe failed for ${clipPath}: ${err.message}`));
+      resolve(metadata.format.duration);
+    });
+  });
+}
+
+// NEW (July 16, 2026 — real render error: closing-card append failed with
+// "Error reinitializing filters! ... Invalid argument" on stream #1:0 —
+// a genuine format mismatch, not the old resource-exhaustion signature.
+// No fps was ever explicitly enforced anywhere in this pipeline; the main
+// concatenated video's effective fps just drifts from whatever the
+// original clips + several rounds of xfadeChain re-encoding happen to
+// produce, while a fresh -loop 1 single-image render defaults to
+// whatever ffmpeg's own default is — those two don't reliably match.
+// Probing the real value and forcing the closing card to it explicitly
+// closes that gap instead of assuming a hardcoded number.
+function probeFps(clipPath) {
+  return new Promise((resolve, reject) => {
+    ffmpeg.ffprobe(clipPath, (err, metadata) => {
+      if (err) return reject(new Error(`ffprobe (fps) failed for ${clipPath}: ${err.message}`));
+      const videoStream = (metadata.streams || []).find(s => s.codec_type === "video");
+      const rateStr = videoStream?.r_frame_rate || "30/1";
+      const [num, den] = rateStr.split("/").map(Number);
+      resolve(den ? num / den : 30);
+    });
+  });
+}
+
+// ── COMPUTE CLIP TIMELINE (July 2026 — footage-grounded narration) ──────
+// Extracted from concatenateClips' own offset math below — previously
+// that math only existed inline, computed and discarded per-transition,
+// with no way for anything outside this function to know where a given
+// clip actually lands in the final timeline. Narration generation needs
+// exactly that: a real start time per clip, to extract a representative
+// frame from and to place a narration segment at. Single source of
+// truth — concatenateClips now calls this instead of recomputing the
+// same math a second time in a way that could drift out of sync with it.
+function computeClipTimeline(durations) {
+  const timeline = [];
+  let cumulativeStart = 0;
+  for (let i = 0; i < durations.length; i++) {
+    timeline.push({ startTime: Math.max(0, cumulativeStart), duration: durations[i] });
+    cumulativeStart += durations[i] - CROSSFADE_DURATION;
+  }
+  return timeline;
+}
+
+// Extracts one representative frame from a clip — its own local midpoint,
+// independent of where it lands in the crossfaded final timeline (a
+// crossfade blends the very start/end of adjacent clips, but the middle
+// of any clip is always a clean, representative frame of that room).
+function extractMidpointFrame(clipPath, duration, workDir, index) {
+  return new Promise((resolve, reject) => {
+    const outputPath = path.join(workDir, `narration_frame_${index}.jpg`);
+    const midpoint = Math.max(0.1, duration / 2);
+    ffmpeg(clipPath)
+      .inputOptions([`-ss`, `${midpoint.toFixed(2)}`])
+      .outputOptions(["-vframes", "1", "-q:v", "3"])
+      .output(outputPath)
+      .on("end", () => resolve(outputPath))
+      .on("error", (err) => reject(new Error(`extractMidpointFrame failed for clip ${index}: ${err.message}`)))
+      .run();
+  });
+}
+
+// ── CONCATENATE CLIPS WITH CROSSFADE ─────────────────────────────────────
+// Chains xfade filters across all clips in sequence using REAL probed
+// durations for offset calculation, not an assumed fixed length.
+
+// ── SINGLE XFADE CHAIN ────────────────────────────────────────────────
+// The actual crossfade-chaining logic, extracted so it can run both on a
+// full clip set (small jobs) and on individual batches (large jobs) — see
+// concatenateClips below for why batching exists. Behavior is identical
+// either way: same CROSSFADE_DURATION overlap, same offset math, so
+// total transition count and total overlap time stays consistent
+// regardless of how many ffmpeg invocations it takes to get there —
+// which matters because computeClipTimeline() (used separately, for
+// narration placement in renderPipeline.js) assumes that consistency.
+function xfadeChain(paths, durations, workDir, outputName) {
+  if (paths.length === 1) return Promise.resolve(paths[0]);
+
   return new Promise((resolve, reject) => {
     const outputPath = path.join(workDir, outputName);
+    const command = ffmpeg();
+    paths.forEach((clip) => command.input(clip));
 
-    // Simple hard cut, not a crossfade — Kling's clip already ends on
-    // (approximately) the staged image, and the continuation clip starts
-    // from that same staged image, so the cut should read as nearly
-    // seamless without needing a transition effect to hide a mismatch.
-    //
-    // IMPORTANT: Kling's native output and our own FFmpeg-rendered clip
-    // are NOT guaranteed to share the same resolution, fps, or pixel
-    // format — confirmed by a real "Error reinitializing filters! Failed
-    // to inject frame into filter network: Invalid argument" failure when
-    // concatenating them directly. The fix is to explicitly normalize
-    // BOTH inputs to identical specs (scale + pad to OUTPUT_W x OUTPUT_H,
-    // fixed fps, yuv420p) as part of this same filter graph, rather than
-    // assuming they already match.
-    ffmpeg()
-      .input(firstPath)
-      .input(secondPath)
-      .complexFilter([
-        // Scale-to-fill + center-crop, not scale-to-fit + pad. Kling's native
-        // resolution (e.g. 1176x784) doesn't match our 1920x1080 canvas, and
-        // padding to fit left it letterboxed — visually smaller than the
-        // continuation clip, which already fills the frame. That mismatch is
-        // what read as a jarring zoom jump at the cut: same canvas size, very
-        // different effective content size. Crop-to-fill matches the same
-        // convention already used elsewhere (the 16:9 pre-crop fix for the
-        // Ken Burns stretching bug) — content fills the frame on both sides
-        // of the cut, no black bars, no apparent size jump.
-        `[0:v]scale=${OUTPUT_W}:${OUTPUT_H}:force_original_aspect_ratio=increase,crop=${OUTPUT_W}:${OUTPUT_H},fps=20,format=yuv420p,setpts=PTS-STARTPTS[v0]`,
-        `[1:v]scale=${OUTPUT_W}:${OUTPUT_H}:force_original_aspect_ratio=increase,crop=${OUTPUT_W}:${OUTPUT_H},fps=20,format=yuv420p,setpts=PTS-STARTPTS[v1]`,
-        "[v0][v1]concat=n=2:v=1:a=0[outv]",
-      ])
+    let filterParts = [];
+    let lastLabel = "0:v";
+    let cumulativeOffset = durations[0] - CROSSFADE_DURATION;
+
+    for (let i = 1; i < paths.length; i++) {
+      const nextLabel = `${i}:v`;
+      const outLabel = i === paths.length - 1 ? "outv" : `v${i}`;
+      filterParts.push(
+        `[${lastLabel}][${nextLabel}]xfade=transition=fade:duration=${CROSSFADE_DURATION}:offset=${Math.max(0, cumulativeOffset).toFixed(2)}[${outLabel}]`
+      );
+      lastLabel = outLabel;
+      cumulativeOffset += durations[i] - CROSSFADE_DURATION;
+    }
+
+    // NEW (July 15, 2026 — real render hang, 32+ minutes of total
+    // silence with the process itself still healthy per the memory
+    // logger): nothing previously bounded how long a single xfadeChain
+    // ffmpeg call could run. If the process spawns and then genuinely
+    // never emits 'end' OR 'error' — a real ffmpeg hang, not a crash —
+    // this used to wait forever with zero recourse. XFADE_TIMEOUT_MS
+    // gives it a generous window (this file's own batches are small,
+    // ≤3 clips each) before force-killing the process and failing
+    // cleanly instead of silently consuming Railway resources forever.
+    const XFADE_TIMEOUT_MS = 120000; // 2 minutes — generous for a ≤3-clip batch
+    let settled = false;
+    const timeoutHandle = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      console.error(`[xfadeChain] TIMEOUT after ${XFADE_TIMEOUT_MS}ms — killing hung ffmpeg process for ${outputPath}.`);
+      try { command.kill("SIGKILL"); } catch (err) { /* best-effort */ }
+      reject(new Error(`xfadeChain timed out after ${XFADE_TIMEOUT_MS}ms for ${outputPath} — ffmpeg process spawned but never completed or errored.`));
+    }, XFADE_TIMEOUT_MS);
+
+    command
+      .complexFilter(filterParts)
       .outputOptions(["-map", "[outv]", "-pix_fmt", "yuv420p"])
       .output(outputPath)
-      .on("start", (cmd) => console.log(`  [Kling] concatTwoClips ffmpeg command: ${cmd}`))
-      .on("end", () => resolve(outputPath))
-      .on("error", (err) => reject(new Error(`Continuation concat failed: ${err.message}`)))
+      .on("end", async () => {
+        if (settled) return;
+        // FIX (July 15, 2026 — real render failure): ffmpeg's 'end' event
+        // firing means the PROCESS reported success, but on a container
+        // filesystem under I/O load (which a render with several
+        // sequential batch xfadeChain calls definitely has), that can
+        // fire microseconds before the output file is actually durably
+        // visible on disk. Confirmed real: a genuine 2-clip batch's
+        // output (concat_r0_6.mp4) resolved successfully here, then
+        // probeDuration's ffprobe call moments later got "No such file
+        // or directory" on that exact path. This almost certainly
+        // explains the prior silent deaths too — those likely hit this
+        // same race, just before the process-level crash handlers
+        // existed to catch and log the resulting unhandled rejection
+        // instead of the process dying with zero trace.
+        //
+        // Polling a few times with a short delay before giving up gives
+        // the filesystem a moment to catch up rather than trusting the
+        // event's timing blindly.
+        for (let attempt = 0; attempt < 5; attempt++) {
+          if (fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0) {
+            settled = true;
+            clearTimeout(timeoutHandle);
+            resolve(outputPath);
+            return;
+          }
+          await new Promise((r) => setTimeout(r, 200));
+        }
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeoutHandle);
+        reject(new Error(`xfadeChain reported success but ${outputPath} never became visible on disk after 1s of polling.`));
+      })
+      .on("error", (err) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeoutHandle);
+        reject(new Error(`Concatenation failed: ${err.message}`));
+      })
       .run();
   });
 }
 
-async function applyContinuationMotion(klingClipPath, frame, workDir) {
-  // Extract the actual last frame of Kling's clip — this is the
-  // pixel-exact state Kling ended on. Ken Burns starts from this image,
-  // making the cut between Kling and Ken Burns invisible to the viewer,
-  // instead of jumping back to the composition the room started at.
+// Keeps any single xfadeChain() call's simultaneous open-input count
+// bounded. CONFIRMED CAUSE (July 15, 2026 — real render failure, 17
+// clips): "Error reinitializing filters! Failed to inject frame into
+// filter network: Resource temporarily unavailable" on the LAST stream
+// of a 17-input complex filter graph — the exact same resource-
+// exhaustion error signature already root-caused once before in this
+// file (see mapWithConcurrencyLimit's header comment), but that earlier
+// fix only covered too many concurrent ffmpeg PROCESSES (normalizeClip,
+// extractMidpointFrame). It never covered this: one single process with
+// 17 simultaneous input STREAMS chained through 16 xfade filters in one
+// complex filter graph. An 11-clip job rendered fine; 17 didn't — a real
+// scaling ceiling, not a one-off.
+//
+// LOWERED to 3 (July 15, 2026 — same exact death, second time in a row,
+// now with even longer clips than the first failure — 11.2s padded vs
+// 9.52s last time, same silent cutoff right after the last clip
+// normalizes, right at the transition into concatenation's heaviest
+// phase). Memory graph data was inconclusive on the first failure, but
+// two consecutive identical deaths at growing clip sizes is a strong
+// enough pattern to act on rather than wait for cleaner metrics.
+const XFADE_BATCH_SIZE = 3;
+
+// ── CONCATENATE CLIPS (batched) ───────────────────────────────────────
+async function concatenateClips(clipPaths, workDir) {
+  // NEW — normalize every clip BEFORE the single-clip early-return check
+  // too. A single Kling clip still needs to end up at a known, consistent
+  // resolution/fps/pixel format for mixAudio()/renderFormat() downstream,
+  // even though there's no xfade chain to crash with only one clip.
   //
-  // Logging on both sides of this call deliberately — this is new,
-  // never-before-exercised code, and the Kling polling fix just taught us
-  // that any unlogged await is a place a future hang can vanish without a
-  // trace. Same principle applied here preemptively.
-  console.log(`  [Kling] Extracting last frame from ${klingClipPath}`);
-  const lastFramePath = await extractLastFrame(klingClipPath, workDir);
-  console.log(`  [Kling] Last frame extracted: ${lastFramePath}`);
-
-  // Default to luxury_parallax — push_in immediately after Kling's own
-  // push-in transformation would feel repetitive (same motion twice in a
-  // row). A slow parallax drift gives the second beat real contrast and
-  // matches the validated "Push → Transform → Parallax" sequence design.
-  const continuationPreset = frame.continuationPreset || "luxury_parallax";
-  const continuationDuration = frame.continuationDurationSeconds || 3;
-
-  console.log(`  [Kling] Adding ${continuationDuration}s continuation motion (${continuationPreset})`);
-
-  // startZoom = 1.0 is correct here: the extracted last frame already
-  // represents Kling's full zoomed/panned composition — Ken Burns doesn't
-  // need to compensate for any prior zoom state, it just continues
-  // naturally from that still image.
-  const continuationResult = await applyMotionPreset(
-    {
-      localPath: lastFramePath, // Kling's actual last frame, not the original staged image
-      motionPreset: continuationPreset,
-      durationSeconds: continuationDuration,
-    },
-    workDir,
-    1.0
+  // FIX (July 14, 2026 — real test failure): was Promise.all, unbounded —
+  // see mapWithConcurrencyLimit's header comment for the full reasoning.
+  const normalizedPaths = await mapWithConcurrencyLimit(
+    clipPaths, FFMPEG_CONCURRENCY_LIMIT, (clip, i) => normalizeClip(clip, workDir, i)
   );
 
-  // ── TEMPORARY DEBUG: upload both individual clips BEFORE concatenation,
-  // so each can be inspected in isolation. This is the fastest way to tell
-  // whether the bug lives in the parallax filter itself (motionPresets.js)
-  // or only appears after the concat/normalize step. Remove once the
-  // continuation feature is confirmed working end to end.
-  try {
-    const { uploadToCloudinary } = require("./cloudinaryUpload");
-    const debugUrls = await uploadToCloudinary(
-      { debug_kling_only: klingClipPath, debug_parallax_only: continuationResult.path },
-      "debug-continuation"
-    );
-    console.log(`  [DEBUG] Kling clip alone: ${debugUrls.debug_kling_only}`);
-    console.log(`  [DEBUG] Parallax clip alone: ${debugUrls.debug_parallax_only}`);
-  } catch (debugErr) {
-    console.error(`  [DEBUG] Debug upload failed (non-fatal): ${debugErr.message}`);
+  if (normalizedPaths.length === 1) {
+    return normalizedPaths[0];
   }
 
-  const combinedPath = await concatTwoClips(
-    klingClipPath,
-    continuationResult.path,
-    workDir,
-    `kling_continued_${Date.now()}.mp4`
-  );
+  const durations = await Promise.all(normalizedPaths.map(probeDuration));
 
-  // ── TEMPORARY DEBUG: upload the combined clip too, right after concat,
-  // before it heads into the rest of the pipeline. The two uploads above
-  // confirmed each half individually — this one confirms whether the
-  // CONCAT step itself produces a correct ~8s combined file, or whether
-  // the bug is further downstream (assemble.js) truncating something
-  // that was already fine at this point. Remove alongside the other two
-  // debug uploads once the full chain is confirmed working.
-  try {
-    const { uploadToCloudinary } = require("./cloudinaryUpload");
-    const combinedDebugUrls = await uploadToCloudinary(
-      { debug_combined: combinedPath },
-      "debug-continuation"
-    );
-    console.log(`  [DEBUG] Combined clip (post-concat, pre-pipeline): ${combinedDebugUrls.debug_combined}`);
-  } catch (debugErr) {
-    console.error(`  [DEBUG] Combined debug upload failed (non-fatal): ${debugErr.message}`);
+  // Small jobs: one chain, same as before, no behavior change.
+  if (normalizedPaths.length <= XFADE_BATCH_SIZE) {
+    return xfadeChain(normalizedPaths, durations, workDir, "concatenated.mp4");
   }
 
-  return { path: combinedPath, endingZoom: continuationResult.endingZoom };
-}
+  // Large jobs: divide-and-conquer. Chain each batch of XFADE_BATCH_SIZE
+  // clips into an intermediate file (bounded input count per ffmpeg
+  // call), probe each intermediate's REAL resulting duration (crossfade
+  // overlap means it's shorter than a naive sum of its inputs), then
+  // repeat on the intermediates. Keeps going until one file remains.
+  //
+  // FIX (July 15, 2026 — real render still failed after the first
+  // batching attempt): batches were being run through
+  // mapWithConcurrencyLimit at FFMPEG_CONCURRENCY_LIMIT=3 — the same
+  // pool used for normalizeClip. That was the wrong reuse. normalizeClip
+  // is one input per process, so 3 concurrent calls = 3 total open
+  // streams, trivial. Each xfadeChain batch call is itself a heavy
+  // multi-stream ffmpeg operation — running 3 of THOSE concurrently
+  // meant up to 3 processes × 6 inputs ≈ 18 simultaneous streams on the
+  // container at once, barely less aggregate load than the original
+  // 20-in-one-process failure this was supposed to fix. Confirmed by a
+  // real render crashing on batch 1 alone (stream #5:0) — under
+  // contention from the other batches starting alongside it. Batches now
+  // run strictly sequentially — one xfadeChain call at a time, nothing
+  // else competing with it. Costs some wall-clock time; that's the right
+  // trade for a step that's failed twice in production.
+  let currentPaths = normalizedPaths;
+  let currentDurations = durations;
+  let round = 0;
 
-// ── KLING GENERATION ──────────────────────────────────────────────────
-
-async function generateKlingClip(frame, workDir) {
-  ensureConfigured();
-  enforceScopeRules(frame);
-
-  const prompt = buildPrompt(frame);
-
-  // Kling's API only accepts whole-second duration values (3-15), not
-  // decimals. Our room-type defaults (e.g. 5.5s for "living") are tuned
-  // for FFmpeg/Ken Burns and need to be rounded for Kling specifically —
-  // this caused a 422 "Unprocessable Entity" the first time we tested.
-  const rawDuration = frame.durationSeconds || 5;
-  const roundedDuration = Math.min(15, Math.max(3, Math.round(rawDuration)));
-  const duration = String(roundedDuration);
-
-  console.log(`  [Kling] Submitting job — room: ${frame.roomType}, duration: ${duration}s (requested ${rawDuration}s)`);
-
-  const KLING_ENDPOINT = "fal-ai/kling-video/o3/standard/image-to-video";
-
-  // Submitting explicitly via queue.submit() + our own polling loop, rather
-  // than fal.subscribe()'s blocking internal poll. fal.subscribe() submits
-  // and waits in one opaque call — if anything in that internal loop dies
-  // silently (dropped connection, missed status transition), there's no
-  // visibility and no error ever surfaces; the awaited promise just never
-  // resolves or rejects. Confirmed twice in testing: Kling completed
-  // successfully on fal.ai's own dashboard both times, but the Railway
-  // process never logged anything past job submission — no completion, no
-  // [Kling] failure fallback, no top-level "Job failed" catch. Total
-  // silence with no JS-catchable error means the process likely wasn't
-  // failing in JS at all; explicit polling gives us a log line every
-  // attempt, so a future stall shows up as a clear gap at a known interval
-  // instead of vanishing without a trace.
-  const { request_id } = await fal.queue.submit(KLING_ENDPOINT, {
-    input: {
-      image_url: forceCloudinary16x9(frame.imageUrl),
-      end_image_url: frame.endImageUrl ? forceCloudinary16x9(frame.endImageUrl) : undefined,
-      prompt,
-      duration,
-      generate_audio: false, // Mubert handles music separately — avoid conflicting audio tracks
-    },
-  });
-
-  console.log(`  [Kling] Queued — request_id: ${request_id} (save this — recoverable via fal.ai dashboard even if this process dies)`);
-
-  const POLL_INTERVAL_MS = 10000;
-  const MAX_POLL_ATTEMPTS = 90; // 90 * 10s = 15 minute ceiling — well above observed real Kling generation time
-
-  let finalStatus = null;
-  for (let attempt = 1; attempt <= MAX_POLL_ATTEMPTS; attempt++) {
-    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
-
-    const status = await fal.queue.status(KLING_ENDPOINT, {
-      requestId: request_id,
-      logs: true,
-    });
-
-    console.log(`  [Kling] Poll ${attempt}/${MAX_POLL_ATTEMPTS} — status: ${status.status}`);
-    if (status.status === "IN_PROGRESS" && status.logs) {
-      status.logs.forEach((log) => console.log(`  [Kling] ${log.message}`));
+  while (currentPaths.length > 1) {
+    const batches = [];
+    for (let i = 0; i < currentPaths.length; i += XFADE_BATCH_SIZE) {
+      batches.push({
+        paths: currentPaths.slice(i, i + XFADE_BATCH_SIZE),
+        durations: currentDurations.slice(i, i + XFADE_BATCH_SIZE),
+      });
     }
 
-    if (status.status === "COMPLETED") {
-      finalStatus = status;
-      break;
+    const batchOutputs = [];
+    for (let i = 0; i < batches.length; i++) {
+      console.log(`[concatenateClips] Round ${round}, batch ${i}/${batches.length - 1} starting (${batches[i].paths.length} clips)...`);
+      const out = await xfadeChain(batches[i].paths, batches[i].durations, workDir, `concat_r${round}_${i}.mp4`);
+      console.log(`[concatenateClips] Round ${round}, batch ${i}/${batches.length - 1} done.`);
+      batchOutputs.push(out);
     }
+
+    // NEW (July 15, 2026 — same crash, second time in a row, at growing
+    // clip sizes): every normalized clip and every prior round's
+    // intermediate files were sitting on disk for the ENTIRE render with
+    // zero cleanup — a real, growing footprint as clip durations
+    // increased this session (padded clips went from 7.52s to 9.52s to
+    // 11.2s across three consecutive test rounds). currentPaths here are
+    // exactly what THIS round just consumed as input and will never be
+    // read again — safe to delete now that their outputs exist on disk.
+    // Best-effort: a failed cleanup should never crash the render over
+    // something that was only ever a disk-space optimization.
+    // NEW (July 15, 2026 — found while tracing the missing-file bug
+    // above): a batch with a single leftover clip (odd clip counts)
+    // passes that file through unchanged in xfadeChain rather than
+    // creating a new one — so it ends up in BOTH currentPaths (about to
+    // be deleted below) AND batchOutputs (what the NEXT round needs).
+    // Excluding anything that's also a batch output from deletion, so a
+    // passthrough file doesn't get deleted out from under the round that
+    // still needs it.
+    const outputSet = new Set(batchOutputs);
+    for (const consumedPath of currentPaths) {
+      if (outputSet.has(consumedPath)) continue;
+      try { fs.unlinkSync(consumedPath); } catch (err) { /* non-fatal */ }
+    }
+
+    currentDurations = await Promise.all(batchOutputs.map(probeDuration));
+    currentPaths = batchOutputs;
+    round++;
   }
 
-  if (!finalStatus) {
-    throw new Error(
-      `Kling request ${request_id} did not complete within ${(MAX_POLL_ATTEMPTS * POLL_INTERVAL_MS) / 60000} minutes of polling. Check this request_id directly on the fal.ai dashboard — the generation may have finished even if polling here gave up.`
-    );
+  // Final result needs to land at the canonical path the rest of the
+  // pipeline (mixAudio, renderFormat) already expects.
+  const finalPath = path.join(workDir, "concatenated.mp4");
+  if (currentPaths[0] !== finalPath) {
+    fs.copyFileSync(currentPaths[0], finalPath);
   }
-
-  const result = await fal.queue.result(KLING_ENDPOINT, { requestId: request_id });
-
-  const videoUrl = result.data?.video?.url;
-  if (!videoUrl) {
-    throw new Error("Kling returned no video URL");
-  }
-
-  console.log(`  [Kling] Generation complete — downloading clip from fal.ai`);
-
-  // Download the generated clip to local disk so it can flow into the
-  // same assembleVideo() pipeline as Ken Burns clips — from this point
-  // forward, the rest of the pipeline doesn't know or care whether a
-  // clip came from FFmpeg or Kling.
-  const outputPath = path.join(workDir, `kling_${Date.now()}.mp4`);
-  const response = await axios.get(videoUrl, { responseType: "arraybuffer" });
-  fs.writeFileSync(outputPath, response.data);
-
-  console.log(`  [Kling] Clip downloaded to ${outputPath} (${response.data.length} bytes)`);
-
-  return outputPath;
+  return finalPath;
 }
 
-// ── ENTRY POINT WITH FALLBACK ────────────────────────────────────────
-// AI motion is a premium enhancement, not a hard dependency. Any failure
-// (API down, scope rejection, fal.ai account issue) falls back to the
-// proven Ken Burns path rather than failing the entire video job.
+// ── REVEAL PRESETS — Ken Burns tier (July 17, 2026) ──────────────────────
+// Replaces the old hardcoded buildBeforeAfterClip(), which produced the
+// exact same wipeleft/0.8s/pull_back+push_in clip regardless of what a
+// user picked — confirmed dead-end from the July 16 handoff ("Reveal
+// presets... never actually implemented. buildBeforeAfterClip() still
+// hardcodes one wipe transition/timing for every preset").
+//
+// Real, fixed 3-phase structure, locked via the reveal-preset spec
+// session (see 06_DECISIONS in Notion):
+//   Phase 1 — Opener (1.5s):       vacant/before image, motionRenderer.py
+//                                  preset from REVEAL_PRESETS[key].openerMotion
+//   Phase 2 — Wipe (0.4s):         ffmpeg xfade between opener and
+//                                  continuation, transition type from
+//                                  REVEAL_PRESETS[key].wipeTransition
+//   Phase 3 — Continuation (4.0s): staged/after image, motionRenderer.py
+//                                  preset = the user's End Motion choice
+// Total clip duration: 1.5 + 4.0 - overlap... see buildRevealClip's own
+// comment for the exact xfade-offset math (wipe duration is TIME SPENT
+// crossfading, not extra time added on top of the two phase durations).
+//
+// pull_back is excluded from every preset's End Motion list on purpose —
+// paired with ANY opener (soft_hold or restrained_push), a pull_back
+// continuation would reverse the reveal direction and read as a
+// collision, exactly the problem Sam flagged with the old hardcoded
+// pull_back(vacant)+push_in(staged) pairing.
+const REVEAL_OPENER_DURATION = 1.5;
+const REVEAL_WIPE_DURATION = 0.4;
+const REVEAL_CONTINUATION_DURATION = 4.0;
 
-async function applyKlingMotion(frame, workDir, fallbackFn) {
-  let clipPath;
-
-  // Kling generation has its own try/catch — if THIS fails, we have no
-  // usable clip at all, so falling back to Ken Burns from scratch is
-  // correct here.
-  try {
-    clipPath = await generateKlingClip(frame, workDir);
-    console.log(`  [Kling] Clip ready: ${clipPath}`);
-  } catch (err) {
-    console.error(`  [Kling] Generation failed, falling back to Ken Burns: ${err.message}`);
-    const fallbackResult = await fallbackFn();
-    return { ...fallbackResult, source: "ken_burns_fallback" };
-  }
-
-  // Continuation motion is a SEPARATE try/catch. If Kling already
-  // succeeded (real money already spent, real working clip in hand),
-  // a failure in the continuation step should never discard that —
-  // it should just skip the continuation and return the Kling clip as-is.
-  let endingZoom = 1.0;
-  if (frame.addContinuationMotion) {
-    try {
-      const continued = await applyContinuationMotion(clipPath, frame, workDir);
-      clipPath = continued.path;
-      endingZoom = continued.endingZoom;
-    } catch (err) {
-      console.error(`  [Kling] Continuation motion failed, using Kling clip without it: ${err.message}`);
-      // clipPath stays as the successful Kling-only result — not discarded.
-    }
-  }
-
-  return { path: clipPath, source: "kling", endingZoom };
-}
-
-module.exports = {
-  applyKlingMotion,
-  generateKlingClip,
-  enforceScopeRules,
-  buildPrompt,
-  extractLastFrame,
-  concatTwoClips,
-  KLING_MOTION_TEMPLATES,
-  VALID_KLING_PRESETS,
-  SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS,
+// wipeTransition values are real ffmpeg xfade transition names.
+// ASSUMPTION FLAGGED FOR SAM: the locked spec confirms opener motion +
+// End Motion exclusions per preset, but did not lock an exact ffmpeg
+// transition name per preset — these three are my proposed defaults,
+// not yet confirmed. Easy to change, all in one place.
+// NOTE (July 18, 2026) — allowedEndMotions now mixes two different
+// renderers: Ken Burns presets (motionRenderer.py, unchanged names) and
+// LTX Fast presets (ltxMotion.js's LTX_MOTION_TEMPLATES). The two
+// namespaces don't collide (confirmed: no shared preset names between
+// the two lists), so renderPipeline.js can dispatch to the right
+// renderer with a single lookup: LTX_MOTION_TEMPLATES[endMotion]
+// existing means LTX, otherwise Ken Burns. LTX additions follow each
+// preset's EXISTING characterological restriction, not just "add
+// everything": luxury_drift already excludes push_in/pull_back/tilt_up/
+// tilt_down (a deliberate lateral-only identity) — its LTX additions
+// exclude cinematic_push for the identical reason (it's a push-in
+// motion). water_motion/outdoor_breeze are exterior-only (enforced at
+// runtime by ltxMotion.js's enforceLtxScopeRules, not filtered out of
+// this static list) — the frontend dropdown still needs its own
+// room-type-aware filtering as follow-up UI work, not done in this pass.
+// room_reveal is intentionally NOT included anywhere — Sam's call, "NO
+// Open Plan LTX right now."
+const REVEAL_PRESETS = {
+  classic_reveal: {
+    label: "Classic Reveal",
+    openerMotion: "soft_hold",
+    wipeTransition: "wipeleft",
+    allowedEndMotions: [
+      "push_in", "pan_left", "pan_right", "tilt_up", "tilt_down", "drift", "float", "luxury_parallax",
+      "cinematic_push", "luxury_drift", "floating_camera_drift", "architectural_glide", "corner_to_corner_drift", "living_room_ambient", "fireplace_flicker", "water_motion", "outdoor_breeze",
+      // NEW (July 18, 2026) — open-plan-only (see ltxMotion.js's
+      // openPlanOnly flag/enforceLtxScopeRules — server-side rejects
+      // these on a non-open-plan frame and falls back to Ken Burns
+      // push_in; frontend should filter them out of the dropdown on
+      // non-open-plan reveal frames too, not rely on the backstop alone).
+      "micro_zoom_out", "micro_dolly_back", "open_plan_reveal",
+    ],
+  },
+  luxury_drift: {
+    label: "Luxury Drift",
+    openerMotion: "soft_hold",
+    // "circleopen" reads as a center-out reveal rather than a directional
+    // wipe — matches the "elegant lateral drift" identity better than a
+    // hard-left wipe would.
+    wipeTransition: "circleopen",
+    allowedEndMotions: [
+      "drift", "pan_left", "pan_right", "float", "luxury_parallax",
+      // cinematic_push (LTX) deliberately excluded — same reason
+      // push_in/pull_back/tilt_up/tilt_down are excluded above: this
+      // preset's identity is purely lateral, not a push-in feel.
+      "luxury_drift", "floating_camera_drift", "architectural_glide", "corner_to_corner_drift", "living_room_ambient",
+      // NEW (July 18, 2026) — none of these 3 read as a push-in motion
+      // (backward dolly, zoom-out, and a focus-redistribution reveal),
+      // so they're consistent with this preset's lateral-only identity.
+      // Same open-plan-only gating as classic_reveal above.
+      "micro_zoom_out", "micro_dolly_back", "open_plan_reveal",
+    ],
+  },
+  cinematic_reveal: {
+    label: "Cinematic Reveal",
+    openerMotion: "restrained_push",
+    // "smoothleft" (softer falloff than wipeleft) to differentiate from
+    // Classic Reveal's harder wipe, and to match the gentler continuous-
+    // push feel of a restrained_push opener.
+    wipeTransition: "smoothleft",
+    allowedEndMotions: [
+      "push_in", "pan_left", "pan_right", "tilt_up", "tilt_down", "drift", "float", "luxury_parallax",
+      "cinematic_push", "luxury_drift", "floating_camera_drift", "architectural_glide", "corner_to_corner_drift", "living_room_ambient", "fireplace_flicker", "water_motion", "outdoor_breeze",
+      // NEW (July 18, 2026) — same open-plan-only gating as above.
+      "micro_zoom_out", "micro_dolly_back", "open_plan_reveal",
+    ],
+  },
 };
+
+// beforeClipPath / afterClipPath are pre-rendered motionRenderer.py clips
+// — beforeClipPath at REVEAL_OPENER_DURATION using the preset's
+// openerMotion, afterClipPath at continuationDurationOverride (or
+// REVEAL_CONTINUATION_DURATION if omitted) using the user's chosen End
+// Motion. This function ONLY does the wipe compositing; it does not call
+// motionRenderer.py itself, so the caller (renderPipeline.js) controls
+// exactly what source images and durations went into each phase.
+//
+// continuationDurationOverride (July 18, 2026) — lets renderPipeline.js's
+// intro/outro narration padding (+5s on the last clip) actually reach a
+// Reveal Preset's continuation phase. Without this, a padded reveal clip
+// silently rendered at the bare fixed duration anyway — confirmed as the
+// real cause of a narration cutoff on a real render (see renderPipeline.js's
+// padding-block comment for the full diagnosis). The xfade `offset` math
+// doesn't need to change for this — offset only depends on opener/wipe
+// durations, both still fixed, since it's measured from the start of the
+// FIRST input regardless of how long the second input's trimmed clip is.
+function buildRevealClip(beforeClipPath, afterClipPath, presetKey, workDir, outputName, continuationDurationOverride) {
+  return new Promise((resolve, reject) => {
+    const preset = REVEAL_PRESETS[presetKey];
+    if (!preset) {
+      reject(new Error(`buildRevealClip: unknown reveal preset "${presetKey}"`));
+      return;
+    }
+    const outputPath = path.join(workDir, outputName);
+    const continuationDuration = continuationDurationOverride || REVEAL_CONTINUATION_DURATION;
+
+    // xfade's `offset` is measured from the start of the FIRST input and
+    // marks where the crossfade begins — so offset = openerDuration - wipeDuration
+    // means the crossfade starts wipeDuration seconds before the opener
+    // clip ends, and finishes exactly as the opener clip's trimmed length
+    // runs out. Total output duration = openerDuration + continuationDuration - wipeDuration
+    // (the wipe is time SHARED between the two phases, not added on top).
+    const offset = REVEAL_OPENER_DURATION - REVEAL_WIPE_DURATION;
+
+    ffmpeg()
+      .input(beforeClipPath)
+      .input(afterClipPath)
+      .complexFilter([
+        `[0:v]trim=duration=${REVEAL_OPENER_DURATION},setpts=PTS-STARTPTS[opener]`,
+        `[1:v]trim=duration=${continuationDuration},setpts=PTS-STARTPTS[continuation]`,
+        `[opener][continuation]xfade=transition=${preset.wipeTransition}:duration=${REVEAL_WIPE_DURATION}:offset=${offset}[out]`,
+      ])
+      .outputOptions(["-map", "[out]", "-pix_fmt", "yuv420p"])
+      .output(outputPath)
+      .on("end", () => resolve(outputPath))
+      .on("error", (err) => reject(new Error(`Reveal Preset "${presetKey}" wipe failed: ${err.message}`)))
+      .run();
+  });
+}
+
+// ── MIX AUDIO — music + optional narration segments ────────────────────
+//
+// CHANGE (July 14, 2026 — footage-grounded narration rebuild): REPLACES
+// the single continuous narrationPath model. Narration is now generated
+// as separate segments, one per room/clip, each with its own real start
+// time in the final timeline (computed via computeClipTimeline — see its
+// header comment). Each segment gets adelay'd to its real position, all
+// segments are mixed together into one combined narration stream, THEN
+// that combined stream goes through the same sidechain-ducking-against-
+// music approach as before. narrationSegments is an array of
+// { audioPath, startTime } — empty/absent means music-only, same as the
+// old narrationPath being absent.
+//
+// knownVideoDuration (new, July 17, 2026): assembleVideo now computes the
+// real final duration from known values (see its header comment for the
+// full race-condition reasoning) and passes it here explicitly, rather
+// than this function re-probing videoPath itself via ffprobe on a file
+// that may have just been written moments earlier. Falls back to probing
+// if omitted, so this stays safe to call directly (e.g. future tooling,
+// tests) without always needing a caller to compute it first.
+
+function mixAudio(videoPath, musicPath, workDir, narrationSegments, knownVideoDuration) {
+  return new Promise(async (resolve, reject) => {
+    try {
+      const outputPath = path.join(workDir, "with_music.mp4");
+      const videoDuration = knownVideoDuration != null ? knownVideoDuration : await probeDuration(videoPath);
+      const musicDuration = await probeDuration(musicPath);
+      const fadeOutStart = Math.max(0, videoDuration - 1.5);
+      const hasNarration = narrationSegments && narrationSegments.length > 0;
+
+      // FIX (July 17, 2026 — third attempt at the same underlying bug):
+      // music_fitted.mp3 is shorter than the real final videoDuration
+      // (closing card + real per-clip duration variance both add time
+      // AFTER music is generated in renderPipeline.js Step 2), so it
+      // needs to be extended to cover the whole video. Two prior attempts
+      // both failed on real renders: the `aloop` FILTER mishandles a
+      // partial final loop on compressed audio; `-stream_loop` on the
+      // INPUT then also produced dead silence on a real test — and
+      // musicGen.js confirms music_fitted.mp3 has no baked-in silence at
+      // all (fitTrackToDuration always loops+trims to a fully-packed
+      // file), which rules out the "silent tail" theory the second fix
+      // was chasing. Root cause of the stream_loop failure is unconfirmed
+      // (possibly a version-specific quirk combining -stream_loop with
+      // -filter_complex on this container's ffmpeg build), but rather
+      // than debug that further, this switches to plain `concat` —
+      // the exact same filter xfadeChain already uses reliably for every
+      // clip transition in this codebase all session. The music file is
+      // added as N separate inputs (enough copies to cover videoDuration)
+      // and concatenated explicitly in the filtergraph, then atrim cuts
+      // it to the exact needed length. No input-level looping involved.
+      const musicCopies = Math.max(1, Math.ceil(videoDuration / musicDuration));
+
+      const command = ffmpeg().input(videoPath);
+      for (let i = 0; i < musicCopies; i++) {
+        command.input(musicPath);
+      }
+      // Music occupies input indices 1..musicCopies; narration (if any)
+      // starts right after.
+      const narrationStartIndex = 1 + musicCopies;
+
+      let filterParts;
+      const musicInputLabels = [];
+      for (let i = 0; i < musicCopies; i++) {
+        musicInputLabels.push(`[${i + 1}:a]`);
+      }
+      // Single copy needs no concat at all — just alias it directly so
+      // the rest of the graph can always reference [music_looped]
+      // uniformly regardless of how many copies were needed.
+      const musicLoopedFilter =
+        musicCopies === 1
+          ? `[1:a]anull[music_looped]`
+          : `${musicInputLabels.join("")}concat=n=${musicCopies}:v=0:a=1[music_looped]`;
+
+      if (hasNarration) {
+        narrationSegments.forEach((seg) => command.input(seg.audioPath));
+
+        filterParts = [
+          musicLoopedFilter,
+          // FIX #2 (Sam's feedback, real render — still too loud): 0.35
+          // wasn't enough headroom. Dropping further to 0.2, and
+          // tightening the sidechain ducking itself (lower threshold =
+          // engages more easily, higher ratio = ducks harder once
+          // engaged) so music is genuinely a soft bed under narration,
+          // not competing with it.
+          `[music_looped]atrim=0:${videoDuration.toFixed(2)},asetpts=PTS-STARTPTS,afade=t=in:st=0:d=1,afade=t=out:st=${fadeOutStart.toFixed(2)}:d=1.5,volume=0.35[music_faded]`,
+        ];
+
+        // Each segment: fade in/out on its OWN local timeline (0..its own
+        // duration), THEN adelay shifts the whole faded clip to its real
+        // position in the final video. Order matters — afade's st= values
+        // are relative to the stream's own start, so they have to be
+        // applied before the stream gets shifted forward.
+        //
+        // NEW (July 14, 2026 — Sam's speed-correction suggestion): each
+        // segment is ALSO hard-capped (atrim) at the real gap before the
+        // next segment starts. narrationGen.js already corrects for this
+        // by regenerating a too-long segment at a faster ElevenLabs
+        // `speed` — but that correction is clamped to ElevenLabs' real
+        // 0.7–1.2 range, so a segment whose natural length wildly exceeds
+        // its window even at max speed could still theoretically overrun.
+        // This is the backstop that guarantees no audible overlap between
+        // adjacent room narrations regardless — defense in depth, not the
+        // primary fix.
+        const delayedLabels = [];
+        narrationSegments.forEach((seg, i) => {
+          const inputIndex = narrationStartIndex + i; // 0=video, 1..musicCopies=music, rest=narration segments
+          const delayMs = Math.round(seg.startTime * 1000);
+          const label = `narr_${i}`;
+          const nextSeg = narrationSegments[i + 1];
+          const capDuration = nextSeg ? Math.max(0.1, nextSeg.startTime - seg.startTime) : seg.duration;
+          const fadeOutAt = Math.max(0, Math.min(seg.duration, capDuration) - 0.4);
+          filterParts.push(
+            `[${inputIndex}:a]afade=t=in:st=0:d=0.3,atrim=end=${capDuration.toFixed(2)},afade=t=out:st=${fadeOutAt.toFixed(2)}:d=0.4,adelay=${delayMs}|${delayMs}[${label}]`
+          );
+          delayedLabels.push(`[${label}]`);
+        });
+
+        // Combine all per-room segments onto the shared timeline into one
+        // narration stream — each already sits at its correct offset via
+        // adelay above, so amix here is just summing them, not blending
+        // overlapping speech (segments shouldn't overlap in practice,
+        // since they're spaced by real, non-overlapping clip positions).
+        filterParts.push(
+          `${delayedLabels.join("")}amix=inputs=${narrationSegments.length}:duration=longest:dropout_transition=0[narration_mixed]`
+        );
+
+        // FIX #4 (Sam's feedback, real render — "narration is barely
+        // heard" after the loudnorm-removal fix): removing loudnorm from
+        // the COMBINED mix was correct — it was undoing the music
+        // balance work. But that also removed the only thing that was
+        // guaranteeing narration ITSELF sat at a strong, consistent
+        // level regardless of what ElevenLabs happened to output raw.
+        // With nothing boosting narration up, the whole mix could end up
+        // too quiet overall even with music correctly balanced under it.
+        // Normalizing HERE — narration alone, before it ever touches
+        // music — fixes that without reintroducing the original bug:
+        // this loudnorm only ever sees narration, so it has no way to
+        // rebalance music back up the way normalizing the combined mix
+        // did.
+        filterParts.push(`[narration_mixed]loudnorm=I=-16:TP=-1.5:LRA=11[narration_all]`);
+
+        // Defensive cap — same reasoning as the single-track version this
+        // replaces: even with real per-clip timestamps, guarantee nothing
+        // plays into the final buffer before the video ends.
+        //
+        // FIX (July 18, 2026 — real render, Sam's report: "music stops
+        // with narration, and there's still 2s of dead space"): this used
+        // to atrim+asplit WITHOUT padding, then rely on the final
+        // amix=duration=longest below to extend the mix out to match
+        // music_ducked's full length. In practice, amix's duration=longest
+        // isn't reliably extending past the point where the SHORTER input
+        // (this narration stream, intentionally short by narrationEndCap)
+        // ends — a known real-world FFmpeg quirk, not just a theoretical
+        // one. The old apad(whole_dur=videoDuration) at the very end of
+        // this function (see below) was padding the ALREADY-truncated
+        // mix out to the right total length — with silence, not
+        // continued music, since by then the real music content inside
+        // the mix was already gone. That's exactly the reported bug:
+        // music dying early, then dead air filling the rest, instead of
+        // narration-free music genuinely continuing through the reserved
+        // end buffer. Padding narration to the FULL videoDuration HERE —
+        // before it ever reaches sidechaincompress or the final amix —
+        // makes both audio streams provably the same length going in, so
+        // neither filter's own duration-matching behavior can truncate
+        // anything early regardless of how reliable that behavior is.
+        const narrationEndCap = Math.max(0, videoDuration - NARRATION_END_BUFFER_SECONDS);
+        filterParts.push(`[narration_all]atrim=end=${narrationEndCap.toFixed(2)},apad=whole_dur=${videoDuration.toFixed(2)},asplit=2[narration_for_sidechain][narration_for_mix]`);
+
+        filterParts.push(
+          `[music_faded][narration_for_sidechain]sidechaincompress=threshold=0.03:ratio=10:attack=5:release=300[music_ducked]`,
+          `[music_ducked][narration_for_mix]amix=inputs=2:duration=longest:dropout_transition=2[premix]`,
+          // FIX #3 (Sam's feedback, real render — still no noticeable
+          // volume change despite two real upstream fixes): loudnorm
+          // here was normalizing the COMBINED mix's overall integrated
+          // loudness to -16 LUFS, with zero awareness of the internal
+          // music/narration balance everything upstream was carefully
+          // tuning. If hitting that target meant boosting music's
+          // relative contribution back up, loudnorm would do exactly
+          // that — silently undoing the volume=0.2 + sidechain ducking
+          // work above. Replaced with alimiter, which only prevents
+          // clipping (a safety ceiling) and does nothing to re-balance
+          // the mix — so the upstream tuning actually survives to the
+          // final output now.
+          `[premix]alimiter=limit=0.95[audio_out]`,
+        );
+      } else {
+        filterParts = [
+          musicLoopedFilter,
+          // Same concat-based extension as the narration branch above —
+          // music needs to cover the real full videoDuration (including
+          // any closing card), not just its own original fitted length.
+          `[music_looped]atrim=0:${videoDuration.toFixed(2)},asetpts=PTS-STARTPTS,afade=t=in:st=0:d=1,afade=t=out:st=${fadeOutStart.toFixed(2)}:d=1.5,volume=0.6[music_faded]`,
+          `[music_faded]loudnorm=I=-16:TP=-1.5:LRA=11[audio_out]`,
+        ];
+      }
+
+      // FIX (July 17, 2026 — real render, closing card silently truncated):
+      // videoPath here is probed AFTER assembleVideo's optional closing-card
+      // step, so videoDuration already reflects the full video INCLUDING the
+      // appended card. But [audio_out] above (music via amix duration=longest,
+      // or narration) only ever spans the ORIGINAL clip timeline — music's own
+      // length comes from generateMusic({durationSeconds: totalDuration}) back
+      // in renderPipeline.js Step 2, computed before the closing card exists,
+      // and narration never extends past its own last segment + buffer either.
+      // The old "-shortest" output flag then truncated the OUTPUT to whichever
+      // mapped stream was shorter — which was always the audio, landing almost
+      // exactly at the end of narration/buffer and silently cutting off the
+      // entire closing card that had already rendered fine on the video track.
+      // Explicitly padding audio with silence out to the real video duration
+      // means -shortest (kept below as a defensive rounding backstop, not the
+      // active truncation mechanism) has nothing left to cut.
+      filterParts.push(`[audio_out]apad=whole_dur=${videoDuration.toFixed(2)}[audio_out_padded]`);
+
+      command
+        .complexFilter(filterParts)
+        .outputOptions(["-map", "0:v", "-map", "[audio_out_padded]", "-c:v", "copy", "-c:a", "aac", "-shortest"])
+        .output(outputPath)
+        .on("end", () => resolve(outputPath))
+        .on("error", (err) => reject(new Error(`Audio mix failed: ${err.message}`)))
+        .run();
+    } catch (err) {
+      reject(err);
+    }
+  });
+}
+
+// ── RENDER FORMAT (16:9 master, 9:16 reframe) ────────────────────────────
+
+function renderFormat(inputPath, dimensions, workDir, outputName) {
+  return new Promise((resolve, reject) => {
+    const outputPath = path.join(workDir, outputName);
+    const [w, h] = dimensions.split("x");
+
+    // 9:16 reframe crops to center — smart subject-aware cropping is a
+    // Phase 2B refinement; center crop is the correct safe default for v1.
+    const filter =
+      dimensions === "1080x1920"
+        ? `crop=ih*9/16:ih,scale=${w}:${h}`
+        : `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2`;
+
+    ffmpeg(inputPath)
+      .videoFilters(filter)
+      .outputOptions(["-c:a", "copy", "-movflags", "+faststart"])
+      .output(outputPath)
+      .on("end", () => resolve(outputPath))
+      .on("error", (err) => reject(new Error(`Format render failed (${dimensions}): ${err.message}`)))
+      .run();
+  });
+}
+
+// ── ENTRY POINT ────────────────────────────────────────────────────────
+
+// ── CLOSING CARD (Sam's idea, built July 15, 2026) ──────────────────────
+// Text fades in the instant narration's LAST spoken word actually ends
+// (not the clip's nominal duration — the real, possibly speed-corrected
+// end timestamp, passed in from renderPipeline.js), holds through the
+// video's own natural tail. That tail already exists by design: mixAudio
+// reserves NARRATION_END_BUFFER_SECONDS (2s) of narration-free video at
+// the very end specifically so speech never gets cut off by the video
+// ending — this reuses that exact same reserved window rather than
+// adding new video length on top of it.
+//
+// Background is the LAST frame's real source still (not a video-
+// extracted frame) at reduced opacity, overlaid on whatever's already
+// playing at that point in the timeline (the tail of the last clip's own
+// motion) rather than a hard cut to a static image — reads as the shot
+// settling into a closing card, not an abrupt swap.
+//
+// Gracefully skipped (returns the input path unchanged) if timing
+// doesn't make sense — e.g. narration ran long enough that there's no
+// real tail left to show a card in. A closing card is a nice-to-have;
+// it should never be the reason a render fails.
+function escapeDrawtext(text) {
+  // ffmpeg drawtext treats \ : ' as filter-syntax-significant — escape
+  // them so an address with an apostrophe or a colon doesn't break the
+  // filter graph or get silently mangled.
+  return text.replace(/\\/g, "\\\\\\\\").replace(/:/g, "\\:").replace(/'/g, "\u2019");
+}
+
+// ── CLOSING CARD (Sam's idea, rebuilt July 16, 2026) ────────────────────
+// REPLACES the live-overlay version entirely, which hung THREE separate
+// times despite three different targeted fixes (duration cap, font
+// family, no font at all) — the last fix (removing the font parameter)
+// still hung with total silence for the full 60s timeout, which rules
+// out font as the cause and points at something structural in blending
+// a looped image live with ongoing video via overlay.
+//
+// New approach: render the closing card as its own small, completely
+// standalone clip — a single still image, no loop-duration ambiguity, no
+// second video stream to reconcile via overlay/shortest — using the same
+// kind of simple one-input render every normal clip in this pipeline
+// already does successfully. Then APPEND it using xfadeChain, the exact
+// same proven concatenation machinery that's handled every other
+// transition in this video without issue all session. Reuses working
+// code instead of patching the same fragile filter graph a fourth time.
+//
+// Trade-off, accepted explicitly: this adds real seconds to the video
+// (a genuine new clip) rather than reusing the narration-end buffer
+// window the old version tried to blend into. The text still fades in
+// right as the card begins — which, since the card is appended AFTER
+// the main video already finished narration + its buffer, lands at the
+// same perceptual moment ("right as narration ends") the original spec
+// asked for, just via a clean transition into a new clip instead of a
+// live blend on top of continuing footage.
+const CLOSING_CARD_DURATION_SECONDS = 4.0;
+const CLOSING_CARD_FADE_SECONDS = 0.6;
+
+function renderClosingCardClip(stillImagePath, addressLine, ctaLine, workDir, fps) {
+  return new Promise((resolve, reject) => {
+    const outputPath = path.join(workDir, "closing_card.mp4");
+    const command = ffmpeg()
+      .input(stillImagePath)
+      // Single input, fixed finite duration from the start — no second
+      // stream, no "shortest" semantics to get wrong. This is the same
+      // -loop 1 -t pattern that already works correctly everywhere else
+      // in this codebase; the old version's bug was never this pattern
+      // itself, it was combining it with a live overlay onto a SECOND,
+      // independently-timed video stream.
+      .inputOptions(["-loop", "1", "-t", CLOSING_CARD_DURATION_SECONDS.toFixed(2)]);
+
+    // Text fades in over the first CLOSING_CARD_FADE_SECONDS of this
+    // card's own timeline, then holds for the rest — no dependency on
+    // narration timing at all anymore, since the card only ever starts
+    // after the main video (narration + its buffer) has already ended.
+    const alphaExpr = `min(1,t/${CLOSING_CARD_FADE_SECONDS})`;
+
+    // FIX (July 17, 2026 — real render, first card ever seen on screen):
+    // was one drawtext with address + CTA jammed into a single line at a
+    // single fontsize (54) — Sam's real screenshot showed it cramped and
+    // hard to read. drawtext doesn't handle multi-line text reliably in
+    // one call, so this is two separate stacked drawtext filters instead:
+    // address (if present) smaller, above center; CTA larger, below
+    // center — CTA is the action we actually want taken, so it gets the
+    // visual weight. Degrades gracefully to a single centered CTA line
+    // (old single-line layout) when there's no address at all.
+    const filterParts = [
+      // Fill-crop to the standard frame size, then darken directly on
+      // the pixel values (eq=brightness) rather than the old alpha-
+      // blend-over-a-second-stream approach — simpler, and there's
+      // nothing else in this clip for it to blend against.
+      `[0:v]scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,eq=brightness=-0.28[dimmed]`,
+    ];
+
+    if (addressLine) {
+      filterParts.push(
+        `[dimmed]drawtext=text='${escapeDrawtext(addressLine)}':fontcolor=white:fontsize=42:borderw=2:bordercolor=black@0.6:x=(w-text_w)/2:y=(h/2)-60:alpha='${alphaExpr}'[with_addr]`,
+        `[with_addr]drawtext=text='${escapeDrawtext(ctaLine)}':fontcolor=white:fontsize=68:borderw=3:bordercolor=black@0.6:x=(w-text_w)/2:y=(h/2)+10:alpha='${alphaExpr}'[outv]`
+      );
+    } else {
+      filterParts.push(
+        `[dimmed]drawtext=text='${escapeDrawtext(ctaLine)}':fontcolor=white:fontsize=68:borderw=3:bordercolor=black@0.6:x=(w-text_w)/2:y=(h-text_h)/2:alpha='${alphaExpr}'[outv]`
+      );
+    }
+
+    // Standalone single-image render — much simpler than the old
+    // overlay version, so 30s is generous rather than needing the full
+    // 60s the old, more complex filter graph was given.
+    const CLOSING_CARD_TIMEOUT_MS = 30000;
+    let settled = false;
+    const timeoutHandle = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      console.warn(`[renderClosingCardClip] TIMEOUT after ${CLOSING_CARD_TIMEOUT_MS}ms — killing process, proceeding without closing card.`);
+      try { command.kill("SIGKILL"); } catch (err) { /* best-effort */ }
+      reject(new Error("Closing card render timed out"));
+    }, CLOSING_CARD_TIMEOUT_MS);
+
+    command
+      .complexFilter(filterParts)
+      .outputOptions(["-map", "[outv]", "-r", fps.toFixed(3), "-pix_fmt", "yuv420p"])
+      .output(outputPath)
+      .on("end", () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeoutHandle);
+        resolve(outputPath);
+      })
+      .on("error", (err) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeoutHandle);
+        reject(new Error(`Closing card render failed: ${err.message}`));
+      })
+      .run();
+  });
+}
+
+// ── CLOSING CARD AUDIO (decoupled from the main mix, July 17, 2026) ──────
+// REPLACES four straight failed attempts to extend/loop the MAIN mix's
+// audio to cover the card (aloop filter, -stream_loop input, multi-input
+// concat loop, then an analytically-computed duration to dodge a probe
+// race) — each change produced literally no observable difference across
+// real tests, and Sam confirmed the deciding fact: the card audio/music
+// was fine BEFORE the closing card existed at all; adding the card is
+// what broke the LAST MOTION CLIP's own audio, not just the card's.
+// That means the bug was never really about which looping technique
+// extends the audio, or which duration number targets it — it's that
+// folding the card into the SAME big mixAudio filter graph as a moving
+// target kept perturbing something in a working system. Rather than
+// hunt for a fifth fix inside that shared graph, this decouples the two
+// concerns entirely: mixAudio runs on the ORIGINAL video only, exactly
+// as it did before the closing card existed (zero behavior change to the
+// part that was already proven working) — then the card gets appended
+// afterward, in total isolation, with its own small independent music
+// stinger rather than being threaded through the main mix's timing math
+// at all. Costs a slightly-less-than-perfectly-continuous fade across
+// the boundary (main mix's own natural fade-out, then a fresh fade-in on
+// the stinger) in exchange for the main video's audio being structurally
+// unable to regress from the card's presence ever again.
+const CARD_AUDIO_FADE_IN_SECONDS = 0.6;
+const CARD_AUDIO_FADE_OUT_SECONDS = 1.2;
+const CARD_AUDIO_VOLUME = 0.3;
+
+function buildCardAudioStinger(musicPath, workDir) {
+  return new Promise((resolve, reject) => {
+    const outputPath = path.join(workDir, "card_audio.mp3");
+    ffmpeg(musicPath)
+      .setDuration(CLOSING_CARD_DURATION_SECONDS)
+      .audioFilters([
+        `afade=t=in:st=0:d=${CARD_AUDIO_FADE_IN_SECONDS}`,
+        `afade=t=out:st=${(CLOSING_CARD_DURATION_SECONDS - CARD_AUDIO_FADE_OUT_SECONDS).toFixed(2)}:d=${CARD_AUDIO_FADE_OUT_SECONDS}`,
+        `volume=${CARD_AUDIO_VOLUME}`,
+      ])
+      .audioCodec("libmp3lame")
+      .output(outputPath)
+      .on("end", () => resolve(outputPath))
+      .on("error", (err) => reject(new Error(`Card audio stinger failed: ${err.message}`)))
+      .run();
+  });
+}
+
+// mainPath already has final mixed audio (music + narration) muxed in —
+// this appends the visual card via the same proven xfade transition, and
+// concats the card's own short stinger onto the end of the main audio
+// track. No dependency on the main track's internal duration/fade math
+// at all; the two audio pieces are simply placed back to back.
+function appendClosingCardWithAudio(mainPath, closingCard, musicPath, workDir) {
+  return new Promise(async (resolve, reject) => {
+    try {
+      const outputPath = path.join(workDir, "with_closing_card.mp4");
+      const mainDuration = await probeDuration(mainPath);
+      const fps = await probeFps(mainPath);
+      const cardPath = await renderClosingCardClip(closingCard.stillImagePath, closingCard.addressLine, closingCard.ctaLine, workDir, fps);
+      const cardAudioPath = await buildCardAudioStinger(musicPath, workDir);
+
+      const command = ffmpeg().input(mainPath).input(cardPath).input(cardAudioPath);
+      const xfadeOffset = Math.max(0, mainDuration - CROSSFADE_DURATION);
+      const filterParts = [
+        `[0:v][1:v]xfade=transition=fade:duration=${CROSSFADE_DURATION}:offset=${xfadeOffset.toFixed(2)}[outv]`,
+        `[0:a][2:a]concat=n=2:v=0:a=1[outa]`,
+      ];
+
+      const CARD_APPEND_TIMEOUT_MS = 60000;
+      let settled = false;
+      const timeoutHandle = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        console.warn(`[appendClosingCardWithAudio] TIMEOUT after ${CARD_APPEND_TIMEOUT_MS}ms — killing process, proceeding without closing card.`);
+        try { command.kill("SIGKILL"); } catch (err) { /* best-effort */ }
+        reject(new Error("Closing card append timed out"));
+      }, CARD_APPEND_TIMEOUT_MS);
+
+      command
+        .complexFilter(filterParts)
+        .outputOptions(["-map", "[outv]", "-map", "[outa]", "-c:v", "libx264", "-c:a", "aac", "-pix_fmt", "yuv420p"])
+        .output(outputPath)
+        .on("end", () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timeoutHandle);
+          resolve(outputPath);
+        })
+        .on("error", (err) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timeoutHandle);
+          reject(new Error(`Closing card append failed: ${err.message}`));
+        })
+        .run();
+    } catch (err) {
+      reject(err);
+    }
+  });
+}
+
+async function assembleVideo({ clipPaths, musicPath, narrationSegments, formats, workDir, closingCard }) {
+  let concatenated = await concatenateClips(clipPaths, workDir);
+
+  // CHANGE (July 17, 2026 — see appendClosingCardWithAudio's header
+  // comment above for the full reasoning): mixAudio now runs on the
+  // ORIGINAL video only, exactly as it did before the closing card ever
+  // existed — no card-extended duration threaded through it, no special
+  // casing here at all. This is a deliberate return to the last known-
+  // good state for the main video's audio.
+  let withMusic = await mixAudio(concatenated, musicPath, workDir, narrationSegments || []);
+
+  // Closing card is appended AFTER audio mixing now, as a fully separate,
+  // isolated step with its own independent audio stinger — see
+  // appendClosingCardWithAudio's header comment for why. Wrapped in
+  // try/catch: a closing card is a nice-to-have, never the reason a
+  // render fails.
+  if (closingCard && narrationSegments && narrationSegments.length > 0) {
+    try {
+      withMusic = await appendClosingCardWithAudio(withMusic, closingCard, musicPath, workDir);
+    } catch (err) {
+      console.warn(`Closing card skipped (non-fatal, video proceeds without it): ${err.message}`);
+    }
+  }
+
+  const outputs = {};
+
+  if (formats.includes("16x9")) {
+    outputs["16x9"] = await renderFormat(withMusic, "1920x1080", workDir, "output_16x9.mp4");
+  }
+  if (formats.includes("9x16")) {
+    outputs["9x16"] = await renderFormat(withMusic, "1080x1920", workDir, "output_9x16.mp4");
+  }
+
+  return outputs;
+}
+
+module.exports = { assembleVideo, buildRevealClip, REVEAL_PRESETS, REVEAL_OPENER_DURATION, REVEAL_WIPE_DURATION, REVEAL_CONTINUATION_DURATION, concatenateClips, mixAudio, renderFormat, computeClipTimeline, extractMidpointFrame, probeDuration, mapWithConcurrencyLimit, FFMPEG_CONCURRENCY_LIMIT, NARRATION_END_BUFFER_SECONDS };
