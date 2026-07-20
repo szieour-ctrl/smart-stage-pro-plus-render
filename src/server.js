@@ -9,8 +9,12 @@
 
 require("dotenv").config();
 const express = require("express");
+const os = require("os");
+const path = require("path");
+const fs = require("fs");
 const { processRenderJob } = require("./renderPipeline");
 const { processCorrectBatch } = require("./lib/correctPipeline");
+const { generateLtxContinuationClip } = require("./lib/ltxMotion");
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
@@ -164,6 +168,70 @@ app.post("/correct-batch", requireSecret, async (req, res) => {
     .finally(() => {
       activeJobs.delete(job.batchId);
     });
+});
+
+// ── TEMPORARY DIAGNOSTIC — TEST LTX ─────────────────────────────────────
+// Added (July 20, 2026) to test the REAL, deployed ltxMotion.js directly —
+// not a parallel/reimplemented script that could quietly drift from what
+// production actually runs (exactly the kind of gap several of today's
+// bugs turned out to be). Same secret-auth as /render and /correct-batch:
+// this makes a real, billed fal.ai call, so it can't be left open.
+//
+// Usage (GET, so it's testable from a browser address bar or Postman,
+// no request body needed):
+//   /test-ltx?imageUrl=<url>&preset=<presetKey>&duration=<seconds>
+//     &x-railway-secret header required, same as /render
+//
+// Bypasses the entire render pipeline on purpose — no Ken Burns opener,
+// no wipe, no narration, no job/webhook plumbing. Just the one thing
+// actually being tested: does the real LTX call succeed end to end.
+//
+// Remove this route once LTX is confirmed reliably working in real
+// renders and no longer needs this kind of direct, isolated testing.
+app.get("/test-ltx", requireSecret, async (req, res) => {
+  const { imageUrl, preset, duration, roomType, isOpenPlan } = req.query;
+
+  if (!imageUrl || !preset) {
+    return res.status(400).json({
+      error: "Missing required query params.",
+      required: ["imageUrl", "preset"],
+      optional: ["duration (seconds, snaps to nearest valid LTX value)", "roomType (default: 'default')", "isOpenPlan ('true' or omit)"],
+      example: "/test-ltx?imageUrl=https://res.cloudinary.com/.../staged.jpg&preset=cinematic_push&duration=6",
+    });
+  }
+
+  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "test-ltx-"));
+
+  try {
+    // Minimal frame object — only the fields generateLtxContinuationClip
+    // and enforceLtxScopeRules actually read. Real production frames
+    // carry far more (reveal state, motion presets, etc.); none of that
+    // is relevant here.
+    const frame = {
+      remoteImageUrl: imageUrl,
+      continuationDurationSeconds: duration ? Number(duration) : 6,
+      isOpenPlan: isOpenPlan === "true",
+      roomType: roomType || "default",
+    };
+
+    const result = await generateLtxContinuationClip(frame, preset, workDir, "test-ltx-route");
+
+    res.json({
+      success: true,
+      preset,
+      requestedDuration: duration ? Number(duration) : 6,
+      actualDuration: result.duration,
+      videoUrl: result.videoUrl,
+      note: "videoUrl is hosted directly by fal.ai — open it in a browser to watch the clip. Full [LTX] log detail for this request is also in this service's regular logs, same as a real render.",
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    // Clean up the local download even on success — this route only
+    // needs to confirm the real API call works and hand back fal.ai's
+    // own hosted URL, not keep a local copy on this container.
+    fs.rm(workDir, { recursive: true, force: true }, () => {});
+  }
 });
 
 app.listen(PORT, () => {
