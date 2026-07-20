@@ -470,7 +470,19 @@ async function generateLtxContinuationClip(frame, presetKey, workDir, jobId) {
       input: {
         image_url: frame.remoteImageUrl,
         prompt,
-        duration: String(duration),
+        // FIX (July 20, 2026 — confirmed via real fal.ai error body, not
+        // a guess): fal.ai's schema does a strict literal-type match
+        // against the duration enum (6/8/10/.../20) — sending it as a
+        // STRING here ("14" instead of 14) failed validation with
+        // "Input should be 6, 8, 10, 12, 14, 16, 18 or 20" even though
+        // "14" and 14 look identical in a log line. This is the exact,
+        // sole cause of every LTX "Unprocessable Entity" this session —
+        // dispatch/routing was correct the whole time; this one type
+        // mismatch was silently killing every real call at the result-fetch
+        // step (fal.ai's queue reports COMPLETED regardless, since the
+        // job itself ran — it's fetching the actual result that exposes
+        // the input it was never valid for).
+        duration: duration,
         fps: 25, // matches motionRenderer.py's own fps, so LTX and Ken Burns clips are never accidentally frame-rate-mismatched at the concat/comparison level
       },
     }));
@@ -535,7 +547,13 @@ async function generateLtxContinuationClip(frame, presetKey, workDir, jobId) {
 
   console.log(`  ${jobPrefix}[LTX] Clip downloaded to ${outputPath} (${response.data.length} bytes)`);
 
-  return { path: outputPath, duration };
+  // videoUrl added (July 20, 2026) — purely additive, doesn't change
+  // anything for existing callers (generateLtxRevealContinuation,
+  // applyLtxMotion just destructure the fields they already use). Needed
+  // so a test route can hand back a real, clickable fal.ai URL instead of
+  // only a local file path that isn't reachable from outside the
+  // container.
+  return { path: outputPath, duration, videoUrl };
 }
 
 // ── REVEAL_PRESETS ENTRY POINT ────────────────────────────────────────
