@@ -401,7 +401,7 @@ async function processRenderJob(job) {
         // noticing an empty fal.ai dashboard after the fact.
         if (frame.revealEngine !== "ltx" && frame.revealEngine !== "ken_burns") {
           console.error(
-            `  [REVEAL ENGINE MISSING] frame ${i}: revealEngine is "${frame.revealEngine}" (expected "ltx" or "ken_burns"). ` +
+            `  [${job.jobId}] [REVEAL ENGINE MISSING] frame ${i}: revealEngine is "${frame.revealEngine}" (expected "ltx" or "ken_burns"). ` +
             `Defaulting to Ken Burns (the safe/free side) — this frame will NOT call LTX even if the user selected AI Motion. ` +
             `Check that video-job.js's reveal_engine column exists and the frameRows insert/read-back is wired correctly.`
           );
@@ -456,13 +456,24 @@ async function processRenderJob(job) {
         let continuationResult;
         let actualContinuationDuration = continuationDuration;
         const isLtxEndMotion = !!LTX_MOTION_TEMPLATES[endMotion];
+        // TEMPORARY DIAGNOSTIC (July 19, 2026) — every static check of this
+        // code path has come back clean (revealEngine confirmed correct,
+        // both clamps confirmed logically sound, LTX_MOTION_TEMPLATES
+        // confirmed to contain the expected key, renderPipeline.js and
+        // ltxMotion.js confirmed matching deployed code) — yet zero [LTX]
+        // log activity on a real render where all of that should have
+        // resulted in at least an attempted call. Printing the actual
+        // runtime values directly rather than continuing to reason about
+        // what they "should" be. Remove once this mystery is resolved.
+        console.log(`  [DIAGNOSTIC] frame ${i}: presetKey="${presetKey}" revealEngine="${frame.revealEngine}" endMotion(final)="${endMotion}" isLtxEndMotion=${isLtxEndMotion} LTX_MOTION_TEMPLATES_has_key=${Object.prototype.hasOwnProperty.call(LTX_MOTION_TEMPLATES, endMotion)} total_LTX_keys=${Object.keys(LTX_MOTION_TEMPLATES).length}`);
 
         if (isLtxEndMotion) {
           try {
             const ltxResult = await generateLtxRevealContinuation(
               { ...frame, continuationDurationSeconds: continuationDuration },
               endMotion,
-              workDir
+              workDir,
+              job.jobId
             );
             continuationResult = ltxResult;
             actualContinuationDuration = ltxResult.ltxDuration;
@@ -474,7 +485,7 @@ async function processRenderJob(job) {
             // available default — same "premium enhancement, never a hard
             // dependency" principle as every other AI motion fallback in
             // this file.
-            console.error(`  [Reveal] LTX continuation "${endMotion}" failed, falling back to Ken Burns push_in: ${err.message}`);
+            console.error(`  [${job.jobId}] [Reveal] LTX continuation "${endMotion}" failed, falling back to Ken Burns push_in: ${err.message}`);
             continuationResult = await applyMotionPreset(
               { ...frame, motionPreset: "push_in", durationSeconds: continuationDuration },
               workDir,
@@ -516,7 +527,7 @@ async function processRenderJob(job) {
         // still checked server-side too, same "don't trust the client
         // alone" principle as the Reveal Presets' endMotion clamp.
         if (!isStandaloneEligible(frame.ltxMotionPreset)) {
-          console.error(`  [LTX] Rejected standalone use of "${frame.ltxMotionPreset}" — below the Medium-High confidence floor for standalone selection. Falling back to Ken Burns auto.`);
+          console.error(`  [${job.jobId}] [LTX] Rejected standalone use of "${frame.ltxMotionPreset}" — below the Medium-High confidence floor for standalone selection. Falling back to Ken Burns auto.`);
           const result = await applyMotionPreset({ ...frame, motionPreset: "auto" }, workDir, carryZoom);
           clipPath = result.path;
           carryZoom = result.endingZoom;
@@ -525,7 +536,8 @@ async function processRenderJob(job) {
             frame,
             frame.ltxMotionPreset,
             workDir,
-            () => applyMotionPreset({ ...frame, motionPreset: "auto" }, workDir, carryZoom)
+            () => applyMotionPreset({ ...frame, motionPreset: "auto" }, workDir, carryZoom),
+            job.jobId
           );
           clipPath = result.path;
           carryZoom = result.endingZoom;
