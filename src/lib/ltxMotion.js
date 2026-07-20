@@ -321,7 +321,8 @@ function isStandaloneEligible(presetKey) {
 // Real, enforced checks only — advisory gates (fireplace/water/reflective
 // surfaces) are logged, not blocked, since no automatic detection exists
 // for them (same reasoning as klingMotion.js's identical gates).
-function enforceLtxScopeRules(frame, presetKey) {
+function enforceLtxScopeRules(frame, presetKey, jobId) {
+  const jobPrefix = jobId ? `[${jobId}] ` : "";
   const preset = LTX_MOTION_TEMPLATES[presetKey];
   if (!preset) {
     throw new Error(
@@ -366,7 +367,7 @@ function enforceLtxScopeRules(frame, presetKey) {
   // check would just be a confusing false rejection; logging it keeps
   // the requirement visible without pretending we verified it.
   if (preset.gate && preset.gate.type === "advisory") {
-    console.log(`  [LTX] Advisory for preset "${presetKey}": ${preset.gate.note}`);
+    console.log(`  ${jobPrefix}[LTX] Advisory for preset "${presetKey}": ${preset.gate.note}`);
   }
 }
 
@@ -403,9 +404,45 @@ function snapToValidLtxDuration(requestedSeconds) {
 // transformation happening here (Ken Burns' wipe already did that); this
 // is pure camera/ambient motion on an already-real, already-staged image,
 // same category as Kling's SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS.
-async function generateLtxContinuationClip(frame, presetKey, workDir) {
+// NEW (July 20, 2026 — real render showed "Unprocessable Entity" with no
+// further detail on 2 separate real LTX attempts, both otherwise correctly
+// dispatched). @fal-ai/client's ApiError typically carries the REAL reason
+// for a 422 in .body (fal.ai's own validation error JSON) — err.message
+// alone is often just the generic HTTP status phrase, which tells us
+// nothing about WHICH field or value fal.ai actually rejected. This pulls
+// every plausible location that detail could live in, so the next real
+// failure surfaces the actual cause instead of another generic string.
+function extractFalErrorDetail(err) {
+  const parts = [];
+  if (err.status) parts.push(`status=${err.status}`);
+  if (err.body) {
+    try {
+      parts.push(`body=${JSON.stringify(err.body)}`);
+    } catch {
+      parts.push(`body=${String(err.body)}`);
+    }
+  }
+  if (err.response?.data) {
+    try {
+      parts.push(`response.data=${JSON.stringify(err.response.data)}`);
+    } catch {
+      parts.push(`response.data=${String(err.response.data)}`);
+    }
+  }
+  return parts.length > 0 ? parts.join(" | ") : "(no additional detail available on the error object)";
+}
+
+async function generateLtxContinuationClip(frame, presetKey, workDir, jobId) {
+  // NEW (July 19, 2026 — real diagnostic gap found): every log line below
+  // used to be unprefixed, unlike every other log line in renderPipeline.js
+  // (which all carry [jobId]). That made it genuinely ambiguous whether an
+  // LTX call ran at all when someone filtered Railway logs by job ID — the
+  // lines would fire but not show up in a job-ID-filtered view. jobPrefix
+  // is blank if no jobId was passed (backward compatible), so this never
+  // breaks existing call sites that do not have one handy.
+  const jobPrefix = jobId ? `[${jobId}] ` : "";
   ensureConfigured();
-  enforceLtxScopeRules(frame, presetKey);
+  enforceLtxScopeRules(frame, presetKey, jobId);
 
   const prompt = buildLtxPrompt(frame, presetKey);
   const requestedDuration = frame.continuationDurationSeconds || 4.0;
@@ -418,7 +455,7 @@ async function generateLtxContinuationClip(frame, presetKey, workDir) {
     );
   }
 
-  console.log(`  [LTX] Submitting job — preset: ${presetKey}, duration: ${duration}s`);
+  console.log(`  ${jobPrefix}[LTX] Submitting job — preset: ${presetKey}, duration: ${duration}s`);
 
   const LTX_ENDPOINT = "fal-ai/ltx-2.3/image-to-video/fast";
 
@@ -427,16 +464,21 @@ async function generateLtxContinuationClip(frame, presetKey, workDir) {
   // internal polling has gone silent on a real render before with no
   // JS-catchable error at all. Every fal.ai call in this codebase since
   // that discovery uses this same explicit, loggable pattern.
-  const { request_id } = await fal.queue.submit(LTX_ENDPOINT, {
-    input: {
-      image_url: frame.remoteImageUrl,
-      prompt,
-      duration: String(duration),
-      fps: 25, // matches motionRenderer.py's own fps, so LTX and Ken Burns clips are never accidentally frame-rate-mismatched at the concat/comparison level
-    },
-  });
+  let request_id;
+  try {
+    ({ request_id } = await fal.queue.submit(LTX_ENDPOINT, {
+      input: {
+        image_url: frame.remoteImageUrl,
+        prompt,
+        duration: String(duration),
+        fps: 25, // matches motionRenderer.py's own fps, so LTX and Ken Burns clips are never accidentally frame-rate-mismatched at the concat/comparison level
+      },
+    }));
+  } catch (err) {
+    throw new Error(`LTX submit failed: ${err.message} | ${extractFalErrorDetail(err)}`);
+  }
 
-  console.log(`  [LTX] Queued — request_id: ${request_id} (recoverable via fal.ai dashboard even if this process dies)`);
+  console.log(`  ${jobPrefix}[LTX] Queued — request_id: ${request_id} (recoverable via fal.ai dashboard even if this process dies)`);
 
   const POLL_INTERVAL_MS = 10000;
   const MAX_POLL_ATTEMPTS = 90; // 15 minute ceiling, matches klingMotion.js's
@@ -445,11 +487,16 @@ async function generateLtxContinuationClip(frame, presetKey, workDir) {
   for (let attempt = 1; attempt <= MAX_POLL_ATTEMPTS; attempt++) {
     await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
 
-    const status = await fal.queue.status(LTX_ENDPOINT, { requestId: request_id, logs: true });
+    let status;
+    try {
+      status = await fal.queue.status(LTX_ENDPOINT, { requestId: request_id, logs: true });
+    } catch (err) {
+      throw new Error(`LTX status poll failed (request_id ${request_id}): ${err.message} | ${extractFalErrorDetail(err)}`);
+    }
 
-    console.log(`  [LTX] Poll ${attempt}/${MAX_POLL_ATTEMPTS} — status: ${status.status}`);
+    console.log(`  ${jobPrefix}[LTX] Poll ${attempt}/${MAX_POLL_ATTEMPTS} — status: ${status.status}`);
     if (status.status === "IN_PROGRESS" && status.logs) {
-      status.logs.forEach((log) => console.log(`  [LTX] ${log.message}`));
+      status.logs.forEach((log) => console.log(`  ${jobPrefix}[LTX] ${log.message}`));
     }
 
     if (status.status === "COMPLETED") {
@@ -464,20 +511,29 @@ async function generateLtxContinuationClip(frame, presetKey, workDir) {
     );
   }
 
-  const result = await fal.queue.result(LTX_ENDPOINT, { requestId: request_id });
+  let result;
+  try {
+    result = await fal.queue.result(LTX_ENDPOINT, { requestId: request_id });
+  } catch (err) {
+    // This is the exact call that threw "Unprocessable Entity" with no
+    // further detail on 2 real attempts (July 20, 2026) — the status
+    // poll reported COMPLETED both times, so whatever fal.ai objects to
+    // is only surfacing at result-fetch time, not submit or poll time.
+    throw new Error(`LTX result fetch failed (request_id ${request_id}, queue reported COMPLETED): ${err.message} | ${extractFalErrorDetail(err)}`);
+  }
 
   const videoUrl = result.data?.video?.url;
   if (!videoUrl) {
-    throw new Error("LTX returned no video URL");
+    throw new Error(`LTX returned no video URL (request_id ${request_id}). Full result: ${JSON.stringify(result).slice(0, 500)}`);
   }
 
-  console.log(`  [LTX] Generation complete — downloading clip from fal.ai`);
+  console.log(`  ${jobPrefix}[LTX] Generation complete — downloading clip from fal.ai`);
 
   const outputPath = path.join(workDir, `ltx_${Date.now()}.mp4`);
   const response = await axios.get(videoUrl, { responseType: "arraybuffer" });
   fs.writeFileSync(outputPath, response.data);
 
-  console.log(`  [LTX] Clip downloaded to ${outputPath} (${response.data.length} bytes)`);
+  console.log(`  ${jobPrefix}[LTX] Clip downloaded to ${outputPath} (${response.data.length} bytes)`);
 
   return { path: outputPath, duration };
 }
@@ -487,8 +543,8 @@ async function generateLtxContinuationClip(frame, presetKey, workDir) {
 // applyMotionPreset() when the user's End Motion selection is an LTX
 // preset. Returns the same {path, endingZoom} shape applyMotionPreset()
 // does, so the caller doesn't need separate handling downstream.
-async function generateLtxRevealContinuation(frame, presetKey, workDir) {
-  const result = await generateLtxContinuationClip(frame, presetKey, workDir);
+async function generateLtxRevealContinuation(frame, presetKey, workDir, jobId) {
+  const result = await generateLtxContinuationClip(frame, presetKey, workDir, jobId);
   // endingZoom is meaningless for an LTX-generated clip (no affine zoom
   // state to hand off) — 1.0 is a safe, neutral value. Nothing downstream
   // currently uses this for anything other than seeding the NEXT Ken
@@ -500,13 +556,14 @@ async function generateLtxRevealContinuation(frame, presetKey, workDir) {
 // ── STANDALONE ENTRY POINT WITH FALLBACK ──────────────────────────────
 // Mirrors klingMotion.js's applyKlingMotion() exactly — same fallback
 // contract, same "premium enhancement, not a dependency" principle.
-async function applyLtxMotion(frame, presetKey, workDir, fallbackFn) {
+async function applyLtxMotion(frame, presetKey, workDir, fallbackFn, jobId) {
+  const jobPrefix = jobId ? `[${jobId}] ` : "";
   try {
-    const result = await generateLtxContinuationClip(frame, presetKey, workDir);
-    console.log(`  [LTX] Clip ready: ${result.path}`);
+    const result = await generateLtxContinuationClip(frame, presetKey, workDir, jobId);
+    console.log(`  ${jobPrefix}[LTX] Clip ready: ${result.path}`);
     return { path: result.path, source: "ltx", endingZoom: 1.0 };
   } catch (err) {
-    console.error(`  [LTX] Generation failed, falling back to Ken Burns: ${err.message}`);
+    console.error(`  ${jobPrefix}[LTX] Generation failed, falling back to Ken Burns: ${err.message}`);
     const fallbackResult = await fallbackFn();
     return { ...fallbackResult, source: "ken_burns_fallback" };
   }
