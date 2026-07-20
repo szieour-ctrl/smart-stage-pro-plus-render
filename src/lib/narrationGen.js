@@ -199,25 +199,25 @@ function groupContiguousByRoom(localFrames, framePaths, timeline) {
 // Returns: [{ index, text }] in the same order.
 function generateSegmentedScript(address, segments, apiKey) {
   return new Promise((resolve, reject) => {
-    // NEW (July 20, 2026 — real evidence this was needed, not a guess):
-    // two separate real renders showed the final/CTA group overrunning
-    // its window by ~60%, even after a prompt fix explicitly told Claude
-    // to drop the room detail first if content didn't fit. It didn't —
-    // the generated text always included a FULL, correctly-spelled
-    // address woven into a complete sentence, every time, regardless of
-    // budget pressure. Rather than keep tuning prompt wording against
-    // demonstrated non-compliance, this removes the actual problem: the
-    // address is a KNOWN, FIXED value — there's no reason to ask an LLM
-    // to generate it at all, spending real word budget on something we
-    // already have verbatim and risking it getting paraphrased or
-    // mangled in the process. Claude now writes a placeholder token
-    // instead of the real address text; the real address gets substituted
-    // in mechanically after generation (see the resolve() call below).
-    // addressWordCount is real address's own word count, subtracted from
-    // the final group's word-budget prompt line so Claude is told an
-    // honest, achievable target instead of one that quietly assumed it
-    // would also need room for 4-6 words of address text on top of it.
-    const addressWordCount = address ? address.split(/\s+/).filter(Boolean).length : 5;
+    // REBUILT (July 20, 2026 — real evidence the placeholder-token
+    // version wasn't good enough either): the previous fix asked Claude
+    // to write a literal {{ADDRESS}} token instead of the real address.
+    // A real render showed Claude just... didn't use it — wrote the full,
+    // correct street address directly into the sentence anyway, token
+    // never appearing anywhere in the output. That's the SECOND
+    // instruction-compliance approach to fail against real evidence (the
+    // first was "cut the room detail if it doesn't fit," which also
+    // didn't hold). Removing the dependency on compliance entirely this
+    // time, not trying a third wording: the final group's response now
+    // has TWO separate fields — "text" (room/exterior detail only) and
+    // "closing" (the CTA only) — and BOTH are explicitly told to contain
+    // NO address/location content whatsoever. The real address is
+    // inserted as our own fixed, deterministic sentence BETWEEN them in
+    // code, after generation (see the resolve() call below) — there's
+    // nothing left for Claude to get right or wrong about it, because
+    // it's never asked to touch it at all, not even via a token.
+    const addressSentence = address ? `This is ${address}.` : "";
+    const addressWordCount = addressSentence ? addressSentence.split(/\s+/).filter(Boolean).length : 0;
 
     const segmentDescriptions = segments
       .map((s, i) => {
@@ -226,13 +226,14 @@ function generateSegmentedScript(address, segments, apiKey) {
           : i === 0 ? " — THIS IS THE OPENING GROUP" : (i === segments.length - 1 ? " — THIS IS THE CLOSING GROUP" : "");
         const isFinal = i === segments.length - 1;
         const rawWordTarget = wordBudgetForSegment(s.availableWindow);
-        // Final group's real target for Claude to write is LOWER than the
-        // raw window-based number — some of that budget is reserved for
-        // the address placeholder, which costs real speaking time when
-        // substituted even though Claude isn't the one writing it.
-        const wordTarget = isFinal ? Math.max(8, rawWordTarget - addressWordCount) : rawWordTarget;
+        // Reserves real speaking time for the address sentence we insert
+        // in code — that sentence costs real seconds when spoken even
+        // though Claude never writes it, so the ceiling given to Claude
+        // has to be honest about how much of the window is actually
+        // available for what it's writing.
+        const wordTarget = isFinal ? Math.max(10, rawWordTarget - addressWordCount) : rawWordTarget;
         const targetNote = isFinal
-          ? `target ${wordTarget} words max for what YOU write (the {{ADDRESS}} placeholder below doesn't count against this — it's substituted afterward, already accounted for separately)`
+          ? `target ${wordTarget} words max combined across "text" and "closing" (a separate fixed address sentence gets inserted between them afterward — already accounted for, don't write about it)`
           : `target ${wordTarget} words max`;
         return `Group ${i + 1}: "${s.roomLabel}"${marker} — ${s.framePaths.length} frame(s) shown for this group — ${targetNote} (this group has about ${s.availableWindow.toFixed(1)}s of real speaking room before the next group starts).`;
       })
@@ -244,7 +245,7 @@ IMPORTANT: frames are grouped because they were tagged with the same room-type l
 - If they're clearly the same space (same fixtures, same finishes, same layout from a different angle) — narrate it as one continuous room description, as usual.
 - If they're clearly DIFFERENT rooms that just share a type — say so distinctly in the narration (e.g. "...and down the hall, a second full bath offers..."), don't blend two different rooms into one generic description as if they were one.
 
-Address: ${address || "this property"}
+Address: ${address || "this property"} (for your own context only — see the FINAL group rule below for exactly how/whether to reference this; do not assume every group should mention it)
 
 ${segmentDescriptions}
 
@@ -260,12 +261,11 @@ Rules:
 - ONE sentence per group. Two only if both are short. This is the single most important constraint — a segment that tries to name the room, list what's in it, AND editorialize about value will not fit its window and will get cut off mid-sentence. Pick the one detail that matters most and say only that.
 - Each group's word target is a HARD CEILING, not a suggestion. There is no correction step after this — whatever you write plays at natural pace in exactly the time given. Going even slightly over means the audio gets cut off mid-word, which sounds like a broken, amateur edit. When in doubt, write UNDER the target, never over it — a slightly short segment just means a beat of natural silence, which is fine; an over-budget one is a real, audible defect.
 - Vary how each segment opens. Do NOT start consecutive (or most) segments with the same phrase (e.g. "Here we have," "This room features") — that reads as a stutter when segments play back to back. Vary sentence structure across the whole script the way a real person naturally would, not a template being refilled per room.
-- THE OPENING GROUP IS DIFFERENT FROM AN ORDINARY GROUP: a video needs a strong opening. It must (1) give one real, grounded observation about the room or exterior actually shown — same as any other group — combined naturally with (2) a brief, warm welcome that references the property's LOCATION (street and/or city — e.g. "Welcome to 123 Main Street in Roseville," or more informally "This beautiful Roseville home..."). Keep the location reference informal and brief here — do NOT recite the complete formal address (street, city, state, zip) as if reading a mailing label; that full, precise address belongs at the close, not here, so don't be redundant with it.
-- THE FINAL GROUP IS DIFFERENT FROM EVERY OTHER GROUP — it has more to say and more time to say it in (check its word target above; it's deliberately given a larger budget than an ordinary room, specifically so it can carry this): it must (1) give one real, grounded observation about the room or exterior actually shown — same as any other group, don't skip this — then (2) include the literal token {{ADDRESS}} at the natural point in the sentence where the property address belongs (do NOT write out the actual street address yourself — a fixed, verified address string gets substituted in for that exact token after you respond, so just leave it as {{ADDRESS}}, spelled exactly like that, and it will read naturally once substituted, e.g. "This is {{ADDRESS}}, and..."), then (3) close with a strong, original call to action inviting a showing. All three, as one flowing close — not three stiff, disconnected sentences bolted together, but a real person's closing thought that happens to cover all three. This replaces the "one sentence only" constraint for this group specifically; the other groups' one-or-two-sentence rule still applies to them.
-- The word target given for the final group already excludes the {{ADDRESS}} token's real spoken length — it's accounted for separately, so don't also budget words for it yourself. That target is what you're actually writing, and it's real — if your room detail + CTA (plus the bare 3-word token {{ADDRESS}}) genuinely won't fit within it, cut the room detail first, then trim the CTA. The address and a real invitation to see it in person are the two things this segment cannot skip; a beautifully observed room detail that pushes the segment over its ceiling and gets cut off mid-sentence helps no one.
-- For the CTA specifically: do NOT write the literal phrase "schedule your private showing" (or close variants like "schedule your private tour/viewing") — that exact instruction already appears as on-screen text on the closing card that follows this segment, so saying it verbatim here is pure repetition. Write something that earns the invitation instead — a genuine, warm reason to come see it in person, in your own words, not the boilerplate line the viewer is about to read anyway.
-- If the FINAL group's image looks like a branded closing card rather than an ordinary room/exterior photo — visible overlaid text (an address, a tagline), a darkened or gradient-scrimmed background rather than a naturally-lit room — do NOT describe it as if it were a normal room, and do NOT read the on-screen text aloud verbatim like you're narrating a sign. Instead, cover the same three things (a real observation about the property, the {{ADDRESS}} token, an original CTA) as a natural, warm spoken close that complements what's already shown on screen, rather than reading text the viewer can already see.
-- Return ONLY a JSON array, nothing else — no markdown fences, no prose before or after. Exact shape: [{"index": 0, "text": "..."}, {"index": 1, "text": "..."}, ...] with exactly ${segments.length} entries, one per group, in the order shown.`;
+- THE OPENING GROUP IS DIFFERENT FROM AN ORDINARY GROUP: a video needs a strong opening. It must (1) give one real, grounded observation about the room or exterior actually shown — same as any other group — combined naturally with (2) a brief, warm welcome that references the property's general LOCATION (city, or street + city informally — e.g. "Welcome to Main Street in Roseville," or "This beautiful Roseville home..."). Keep it informal and brief — do NOT recite the complete formal address (street number, city, state, zip) as if reading a mailing label here; that full, precise address belongs only at the close (see below), not here.
+- THE FINAL GROUP HAS A DIFFERENT RESPONSE SHAPE FROM EVERY OTHER GROUP — instead of one "text" field, it needs TWO fields: {"index": N, "text": "...", "closing": "..."}. "text" = one real, grounded observation about the room/exterior actually shown, same as any ordinary group — a single detail, not a list. "closing" = a strong, original call to action inviting a showing. NEITHER field should mention the address, street name, city, state, or any part of the location — say NOTHING about where the property is in either field. The complete, exact address gets inserted automatically BETWEEN "text" and "closing" after you respond (a separate, fixed sentence you never see or write) — so the two fields you write will be read as: [your text] + [inserted address sentence] + [your closing], and need to flow naturally into that gap without referencing it directly. Combined word count for "text" + "closing" together must stay within this group's target above.
+- For the CTA ("closing" field) specifically: do NOT write the literal phrase "schedule your private showing" (or close variants like "schedule your private tour/viewing") — that exact instruction already appears as on-screen text on the closing card that follows this segment, so saying it verbatim here is pure repetition. Write something that earns the invitation instead — a genuine, warm reason to come see it in person, in your own words, not the boilerplate line the viewer is about to read anyway.
+- If the FINAL group's image looks like a branded closing card rather than an ordinary room/exterior photo — visible overlaid text (an address, a tagline), a darkened or gradient-scrimmed background rather than a naturally-lit room — do NOT describe it as if it were a normal room in the "text" field, and do NOT read the on-screen text aloud verbatim like you're narrating a sign. Instead, "text" can be a brief, natural transition line (no address, no room description) and "closing" the original CTA — the inserted address sentence between them still applies exactly the same way.
+- Return ONLY a JSON array, nothing else — no markdown fences, no prose before or after. Every entry except the final group uses {"index": N, "text": "..."}; the final group entry uses {"index": N, "text": "...", "closing": "..."} as described above. Exactly ${segments.length} entries, one per group, in the order shown.`;
 
     const content = [{ type: "text", text: promptText }];
     segments.forEach((s, i) => {
@@ -307,20 +307,24 @@ Rules:
           const cleaned = text.trim().replace(/^```(json)?/i, "").replace(/```$/, "").trim();
           const segmentsOut = JSON.parse(cleaned);
           if (!Array.isArray(segmentsOut)) throw new Error("Claude's response was not a JSON array");
-          // Real, mechanical substitution — not another prompt-compliance
-          // hope. Whatever Claude wrote for {{ADDRESS}}'s surrounding
-          // text, the actual address text inserted here is always exactly
-          // right, because it's the same literal string passed in, never
-          // regenerated or paraphrased. Applied to every segment, not just
-          // the final one — harmless no-op for segments that don't
-          // contain the token at all, and covers the (currently unused)
-          // case of another segment referencing it in the future too.
-          const realAddress = address || "this property";
-          segmentsOut.forEach((seg) => {
-            if (typeof seg.text === "string" && seg.text.includes("{{ADDRESS}}")) {
-              seg.text = seg.text.split("{{ADDRESS}}").join(realAddress);
+          // REBUILT (July 20, 2026) — no more token substitution (the
+          // previous approach Claude simply didn't use, writing the real
+          // address directly instead — confirmed on a real render). The
+          // final segment now arrives as separate "text"/"closing" fields
+          // that never contained any address content in the first place
+          // (nothing to substitute, nothing to strip) — this just joins
+          // them with our own fixed, always-correct address sentence
+          // built earlier in this function. Every other segment is
+          // untouched, using its "text" field exactly as before.
+          if (segmentsOut.length > 0) {
+            const last = segmentsOut[segmentsOut.length - 1];
+            if (typeof last.closing === "string") {
+              const detail = (last.text || "").trim();
+              const closing = last.closing.trim();
+              last.text = [detail, addressSentence, closing].filter(Boolean).join(" ");
+              delete last.closing;
             }
-          });
+          }
           resolve(segmentsOut);
         } catch (e) {
           reject(new Error(`Claude segmented-script response parse error: ${e.message}. Raw: ${data.slice(0, 500)}`));
