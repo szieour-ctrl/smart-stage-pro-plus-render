@@ -346,29 +346,36 @@ def render_frame(img, zoom, pan_x_frac, pan_y_frac, out_w, out_h):
 
 def draw_label_badge(frame, text):
     """
-    Burns a small, unobtrusive text badge into the bottom-left corner of a
-    frame — e.g. "Original" on the Room Reveal opener, before the wipe.
-    Semi-transparent dark background behind white text for legibility
-    against any photo. Uses cv2 (already the renderer's own dependency —
-    no new library needed).
+    Burns a text badge into the upper-left corner of a frame — e.g.
+    "Original" on the Room Reveal opener, before the wipe. Semi-transparent
+    dark background behind white text for legibility against any photo.
+    Uses cv2 (already the renderer's own dependency — no new library needed).
+
+    REVISED (July 21, 2026 — real render feedback: the opener wipes fast
+    enough that the original bottom-left, smaller badge was missed ~95% of
+    the time — Sam had to pause playback to find it at all). Moved to the
+    UPPER section of the frame (out of the way of typical bottom-of-frame
+    room content like floor/rugs, and the first place a viewer's eye lands)
+    and enlarged substantially — font_scale 0.7→1.3, thickness 2→3 — so it
+    reads clearly even across a sub-second opener before the wipe.
     """
     h, w = frame.shape[:2]
     font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 0.7
-    thickness = 2
-    padding = 14
+    font_scale = 1.3
+    thickness = 3
+    padding = 20
 
     (text_w, text_h), baseline = cv2.getTextSize(text, font, font_scale, thickness)
 
-    x1, y1 = 24, h - 24 - text_h - 2 * padding
-    x2, y2 = x1 + text_w + 2 * padding, h - 24
+    x1, y1 = 32, 32
+    x2, y2 = x1 + text_w + 2 * padding, y1 + text_h + 2 * padding
 
     # Semi-transparent dark rectangle behind the text — alpha-blended onto
     # a copy of the region rather than drawn opaque, so it reads as a badge
     # rather than a hard block over the photo.
     overlay = frame.copy()
     cv2.rectangle(overlay, (x1, y1), (x2, y2), (20, 20, 20), thickness=-1)
-    alpha = 0.55
+    alpha = 0.6
     cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, dst=frame)
 
     text_x = x1 + padding
