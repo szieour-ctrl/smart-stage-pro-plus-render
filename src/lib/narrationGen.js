@@ -305,7 +305,29 @@ Rules:
           // Strip markdown fences defensively — the prompt explicitly
           // forbids them, but models occasionally add them anyway.
           const cleaned = text.trim().replace(/^```(json)?/i, "").replace(/```$/, "").trim();
-          const segmentsOut = JSON.parse(cleaned);
+          // FIX (July 21, 2026 — real render failure): a real response came
+          // back with a full reasoning preamble BEFORE the JSON array
+          // ("Looking at the frames carefully:\n\n- Group 1: ... Group 2:
+          // ..."), despite the prompt's explicit "Return ONLY a JSON array,
+          // nothing else — no prose before or after." JSON.parse(cleaned)
+          // failed immediately ("Unexpected token L... at position 0") since
+          // `cleaned` started with "Looking", not "[". This is the SAME
+          // category of problem this file has hit twice before (the address
+          // token and the "cut room detail" instruction-compliance
+          // failures) — asking Claude to comply with a strict output shape
+          // isn't reliable, so stop depending on it entirely rather than
+          // trying a differently-worded instruction a third time. Instead
+          // of assuming `cleaned` IS the array, find the JSON array
+          // EMBEDDED in it — from the first "[" to the last "]" — and parse
+          // only that substring. This works whether Claude adds prose
+          // before, after, both, or neither.
+          const arrayStart = cleaned.indexOf("[");
+          const arrayEnd = cleaned.lastIndexOf("]");
+          if (arrayStart === -1 || arrayEnd === -1 || arrayEnd < arrayStart) {
+            throw new Error(`No JSON array found in Claude's response. Raw: ${cleaned.slice(0, 500)}`);
+          }
+          const jsonSlice = cleaned.slice(arrayStart, arrayEnd + 1);
+          const segmentsOut = JSON.parse(jsonSlice);
           if (!Array.isArray(segmentsOut)) throw new Error("Claude's response was not a JSON array");
           // REBUILT (July 20, 2026) — no more token substitution (the
           // previous approach Claude simply didn't use, writing the real
