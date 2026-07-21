@@ -431,8 +431,13 @@ async function processRenderJob(job) {
           + (frame.introOutroPaddingSeconds || 0)
           + (frame.narrationClipPaddingSeconds || 0);
 
+        // NEW (July 20, 2026 — Sam's request): burns a small "Original"
+        // badge into the opener clip only — the vacant/before image shown
+        // before the wipe into the staged continuation. labelText is a
+        // no-op everywhere else in this file (continuation phase, standalone
+        // clips) since only this call site sets it.
         const openerResult = await applyMotionPreset(
-          { ...frame, localPath: frame.beforeLocalPath, motionPreset: preset.openerMotion, durationSeconds: REVEAL_OPENER_DURATION },
+          { ...frame, localPath: frame.beforeLocalPath, motionPreset: preset.openerMotion, durationSeconds: REVEAL_OPENER_DURATION, labelText: "Original" },
           workDir,
           1.0
         );
