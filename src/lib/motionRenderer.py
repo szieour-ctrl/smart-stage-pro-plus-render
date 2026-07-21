@@ -74,6 +74,14 @@ def parse_args():
     p.add_argument("--output-w",   type=int,   default=1920, dest="output_w")
     p.add_argument("--output-h",   type=int,   default=1080, dest="output_h")
     p.add_argument("--fps",        type=int,   default=25)
+    # NEW (July 20, 2026 — Sam's request): burns a small text badge into
+    # every frame of this clip. Only ever passed for the Room Reveal
+    # opener phase (soft_hold/restrained_push, before the wipe) with
+    # "Original" — see motionPresets.js's applyMotionPreset and
+    # renderPipeline.js's opener call site. Optional and unused by every
+    # other caller (continuation phase, standalone Ken Burns), so nothing
+    # else changes shape.
+    p.add_argument("--label-text", default=None, dest="label_text")
     return p.parse_args()
 
 
@@ -334,6 +342,43 @@ def render_frame(img, zoom, pan_x_frac, pan_y_frac, out_w, out_h):
     )
 
 
+# ── LABEL BADGE ───────────────────────────────────────────────────────────────
+
+def draw_label_badge(frame, text):
+    """
+    Burns a small, unobtrusive text badge into the bottom-left corner of a
+    frame — e.g. "Original" on the Room Reveal opener, before the wipe.
+    Semi-transparent dark background behind white text for legibility
+    against any photo. Uses cv2 (already the renderer's own dependency —
+    no new library needed).
+    """
+    h, w = frame.shape[:2]
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.7
+    thickness = 2
+    padding = 14
+
+    (text_w, text_h), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+
+    x1, y1 = 24, h - 24 - text_h - 2 * padding
+    x2, y2 = x1 + text_w + 2 * padding, h - 24
+
+    # Semi-transparent dark rectangle behind the text — alpha-blended onto
+    # a copy of the region rather than drawn opaque, so it reads as a badge
+    # rather than a hard block over the photo.
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x1, y1), (x2, y2), (20, 20, 20), thickness=-1)
+    alpha = 0.55
+    cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, dst=frame)
+
+    text_x = x1 + padding
+    text_y = y2 - padding
+    cv2.putText(frame, text, (text_x, text_y), font, font_scale,
+                (255, 255, 255), thickness, lineType=cv2.LINE_AA)
+
+    return frame
+
+
 # ── FFMPEG PIPE ───────────────────────────────────────────────────────────────
 
 def open_ffmpeg_pipe(output_path, fps, out_w, out_h):
@@ -381,6 +426,8 @@ def main():
     try:
         for zoom, pan_x, pan_y in curve:
             frame = render_frame(img, zoom, pan_x, pan_y, out_w, out_h)
+            if args.label_text:
+                frame = draw_label_badge(frame, args.label_text)
             proc.stdin.write(frame.tobytes())
 
         proc.stdin.close()
