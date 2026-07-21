@@ -390,11 +390,49 @@ function generateSegmentAudio(text, voiceId, apiKey, speed) {
 async function generateNarration({ address, timelineSegments, voiceId, workDir, anthropicKey, elevenLabsKey }) {
   const scriptSegments = await generateSegmentedScript(address, timelineSegments, anthropicKey);
 
+  // FIX (July 20, 2026 — real render, COMPLETE narration failure: first
+  // clip silent, clip 1's script spoken over clip 2, CTA never attempted).
+  // Root cause: generateSegmentedScript's prompt labels groups for Claude
+  // as "Group 1", "Group 2", ... (1-based, for human readability) but never
+  // states what numeric convention the JSON "index" field should use.
+  // Claude naturally mirrored the 1-based labels it was shown, while
+  // seg.index here is 0-based (assigned by groupContiguousByRoom's
+  // .map((g, i) => ({ index: i, ...g }))). Matching by that value
+  // (scriptSegments.find(s => s.index === seg.index)) meant: seg.index=0
+  // never matched anything (Claude wrote index:1 for the first group) →
+  // silently skipped, no narration on the real first clip. seg.index=1
+  // matched Claude's index:1 entry — but that entry's TEXT was written
+  // for "Group 1" (the actual first room) → the real second clip spoke
+  // the first room's narration. The true final group (index N-1, the one
+  // carrying the "closing" CTA field) never matched either, for the same
+  // reason, so the CTA silently vanished too. Same fix already proven for
+  // the address-token problem on July 20: stop depending on Claude
+  // returning a specific numeric convention we never actually specified —
+  // match by ARRAY POSITION instead, which is correct by construction
+  // (generateSegmentedScript's own prompt requires "Exactly N entries, one
+  // per group, in the order shown").
+  if (scriptSegments.length !== timelineSegments.length) {
+    console.error(
+      `[NARRATION MISMATCH] Claude returned ${scriptSegments.length} script segments, ` +
+      `expected ${timelineSegments.length} (one per group). Matching by position — ` +
+      `any group beyond the shorter length will have no narration this render.`
+    );
+  }
+
   const results = [];
   for (let i = 0; i < timelineSegments.length; i++) {
     const seg = timelineSegments[i];
-    const scriptEntry = scriptSegments.find((s) => s.index === seg.index);
-    if (!scriptEntry || !scriptEntry.text) continue; // skip a missing segment rather than fail the whole narration
+    const scriptEntry = scriptSegments[i]; // position-based match — NOT scriptSegments.find(s => s.index === seg.index)
+    if (!scriptEntry || !scriptEntry.text) {
+      // LOUD now (was a bare `continue` with zero logging before) — a
+      // missing segment used to vanish with no trace anywhere in the
+      // logs, which is exactly why this bug took this long to pin down.
+      console.error(
+        `[NARRATION SEGMENT MISSING] position ${i} (roomLabel: "${seg.roomLabel}", ` +
+        `startTime: ${seg.startTime}s) has no usable script text — this clip will play with no narration.`
+      );
+      continue;
+    }
 
     // FIX (July 18, 2026) — this used to recompute availableWindow here,
     // independently from what generateSegmentedScript's prompt was told.
