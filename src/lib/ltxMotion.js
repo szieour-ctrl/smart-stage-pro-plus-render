@@ -153,7 +153,19 @@ function buildCroppedStartUrl(remoteImageUrl) {
 //      cause — 3 no-fireplace renders confirmed LTX did NOT invent a
 //      fireplace where none existed.
 const FLAME_CLAUSE =
-  " If a fireplace or fire pit flame is visible, it should appear with subtle, natural flicker exactly as photographed. If no flame is visible, include a small, photorealistic flame inside the existing fireplace opening, shown with subtle, natural flicker, without altering any surrounding architecture.";
+  // REVISED (July 21, 2026, real render): Rack Focus hallucinated a
+  // fireplace into a living room that had none. Sam re-ran the identical
+  // prompt in fal.ai's own playground and got no hallucination — i.e. not
+  // deterministic, but the wording had a real ambiguity that made it
+  // possible: "If no flame is visible, include a small... flame inside the
+  // existing fireplace opening" never actually required a fireplace to be
+  // present as a precondition for injection — a model that hadn't firmly
+  // ruled out "cozy fireplace" as part of the room's mood had room to
+  // invent the whole opening, not just relight an existing one. New
+  // wording makes presence an explicit, separate precondition ("If a
+  // fireplace or fire pit IS PRESENT and no flame is visible...") instead
+  // of only gating on flame visibility.
+  " If a fireplace or fire pit flame is visible, it should appear with subtle, natural flicker exactly as photographed. If a fireplace or fire pit is present and no flame is visible, include a small, photorealistic flame inside the existing fireplace opening, shown with subtle, natural flicker, without altering any surrounding architecture.";
 
 const LTX_MOTION_TEMPLATES = {
   cinematic_push: {
@@ -180,7 +192,7 @@ const LTX_MOTION_TEMPLATES = {
     // can't be allowed to reopen the kind of roll problem corner_to_corner_
     // drift hit separately in the same test round.
     prompt:
-      "Perform a slow, buoyant floating drift with a gentle, noticeable sway that moves the viewer through the space without introducing any camera roll or tilt. Maintain perfectly level horizons, stable verticals, and natural parallax only from existing geometry. No new textures, reflections, or objects appear.\nIf a fireplace or fire pit flame is visible, it should appear with subtle, natural flicker exactly as photographed. If no flame is visible, include a small, photorealistic flame inside the existing fireplace opening, shown with subtle, natural flicker, without altering any surrounding architecture.",
+      "Perform a slow, buoyant floating drift with a gentle, noticeable sway that moves the viewer through the space without introducing any camera roll or tilt. Maintain perfectly level horizons, stable verticals, and natural parallax only from existing geometry. No new textures, reflections, or objects appear.\nIf a fireplace or fire pit flame is visible, it should appear with subtle, natural flicker exactly as photographed. If a fireplace or fire pit is present and no flame is visible, include a small, photorealistic flame inside the existing fireplace opening, shown with subtle, natural flicker, without altering any surrounding architecture.",
     confidence: "medium-high",
     safeWhen: "Rooms with soft lighting and visible depth.",
     gate: { type: "advisory", note: "Avoid highly reflective rooms (mirrors, glossy tile) — not automatically detected, use judgment when picking the source photo." },
@@ -203,7 +215,7 @@ const LTX_MOTION_TEMPLATES = {
     // tilt and demands level horizons/stable verticals instead of
     // describing a corner-to-corner destination at all.
     prompt:
-      "Perform an ultra-slow lateral drift that gently shifts the viewer's perspective across the room without introducing any diagonal roll or camera tilt. Maintain perfectly level horizons, stable verticals, and natural parallax only from existing geometry. No new space, openings, or architectural features appear.\nIf a fireplace or fire pit flame is visible, allow subtle, natural flicker. If no flame is visible, include a small, photorealistic flame inside the existing fireplace opening, shown with subtle, natural flicker, without altering any surrounding architecture.",
+      "Perform an ultra-slow lateral drift that gently shifts the viewer's perspective across the room without introducing any diagonal roll or camera tilt. Maintain perfectly level horizons, stable verticals, and natural parallax only from existing geometry. No new space, openings, or architectural features appear.\nIf a fireplace or fire pit flame is visible, it should appear with subtle, natural flicker exactly as photographed. If a fireplace or fire pit is present and no flame is visible, include a small, photorealistic flame inside the existing fireplace opening, shown with subtle, natural flicker, without altering any surrounding architecture.",
     confidence: "high",
     safeWhen: "Rooms with visible corners and depth.",
     gate: { type: "advisory", note: "Avoid rooms with obstructed corners." },
@@ -273,8 +285,17 @@ const LTX_MOTION_TEMPLATES = {
     cropTransformation: TWO_IMAGE_CROP_TRANSFORM,
   },
   rack_focus: {
+    // REPLACED (July 21, 2026 — real render: this preset hallucinated a
+    // fireplace in a living room clip; Sam re-ran the identical prompt in
+    // fal.ai's playground and got a clean result, so it wasn't purely
+    // deterministic — but Sam's instinct that Rack Focus specifically was
+    // implicated is plausible: its old wording ("depth-weighted emphasis
+    // shift") invited the model to reinterpret depth/focus across the
+    // room, which is a more open-ended instruction than a flat directional
+    // drift, and empirically correlated with the invented feature. New
+    // wording removes any depth/focus-shift framing entirely.
     prompt:
-      "Perform a gentle cinematic push-in with a soft depth-weighted emphasis shift. Foreground and background remain clear and stable. No blur melt, distortion, or new areas of the room are revealed." + FLAME_CLAUSE,
+      "Perform a slow, gentle hover shift that moves slightly upward and then settles back into place without introducing any roll or tilt. Maintain perfectly level horizons, stable verticals, and natural parallax only from existing geometry. No new space, openings, reflections, or architectural features appear." + FLAME_CLAUSE,
     confidence: "medium-high",
     safeWhen: "A clear foreground detail (hardware, fixture, vignette) with the room visible behind it.",
     gate: null,
@@ -542,7 +563,30 @@ async function generateLtxContinuationClip(frame, presetKey, workDir, jobId) {
   enforceLtxScopeRules(frame, presetKey, jobId);
 
   const prompt = buildLtxPrompt(frame, presetKey);
-  const requestedDuration = frame.continuationDurationSeconds || 4.0;
+  // FIX (July 21, 2026 — real render: CTA/closing clip landed at a bare
+  // 6s while renderPipeline.js's intro/outro padding believed it had given
+  // the last clip +9.8s of real outro room — the CTA script got generated
+  // against a window that never actually existed in the rendered video,
+  // and its audio start position ended up past mixAudio's final atrim cap,
+  // so it played as complete silence, not a truncated read. Root cause:
+  // this function has NEVER read frame.durationSeconds or
+  // frame.introOutroPaddingSeconds at all — those are renderPipeline.js's
+  // entire mechanism for intro/outro padding, built assuming the Ken
+  // Burns/Reveal branches (which DO read them). Standalone LTX has always
+  // used its own, completely separate continuationDurationSeconds default
+  // (4.0, snapped to the 6s floor) with no awareness a frame might be
+  // flagged for extra room. Now: only when renderPipeline.js has actually
+  // flagged this frame as carrying intro/outro padding (real first/last
+  // narrated frame only — every ordinary mid-video LTX clip has
+  // introOutroPaddingSeconds undefined) does this use the already-fully-
+  // computed frame.durationSeconds as the real target instead of the
+  // generic default. This leaves the clean 6s floor untouched for every
+  // ordinary standalone LTX clip, which Sam has explicitly confirmed he
+  // wants left alone — this only changes behavior for the specific frame
+  // that was supposed to get outro room and silently wasn't getting any.
+  const requestedDuration = frame.introOutroPaddingSeconds
+    ? frame.durationSeconds
+    : (frame.continuationDurationSeconds || 4.0);
   const duration = snapToValidLtxDuration(requestedDuration);
 
   if (duration !== requestedDuration) {
