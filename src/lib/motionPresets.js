@@ -142,6 +142,14 @@ function applyMotionPreset(frame, workDir, startZoom = 1.0) {
       "--output-h",   "1080",
     ];
 
+    // NEW (July 20, 2026 — Sam's request): burns a small text badge into
+    // this clip's frames, e.g. "Original" on the Room Reveal opener phase.
+    // Only set by renderPipeline.js's opener call site — every other
+    // caller leaves frame.labelText undefined, so this is a no-op for them.
+    if (frame.labelText) {
+      args.push("--label-text", frame.labelText);
+    }
+
     let stdout = "";
     let stderr = "";
 
