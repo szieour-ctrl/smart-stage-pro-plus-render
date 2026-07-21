@@ -75,6 +75,36 @@ function ensureConfigured() {
   configured = true;
 }
 
+// ── TWO-IMAGE CROP WORKFLOW (July 20, 2026, LTX_Prompt_revision doc) ────
+// Only 3 presets need this: orbit_arc, micro_dolly_back, open_plan_reveal
+// (see requiresTwoImage flag on each below). Per the doc's Section 1: LTX
+// has no reference for what's outside the original frame on any move that
+// expands the frame boundary (rotation, pull-back, or — per Sam's July 20
+// correction — the open-plan reveal's zone-redistribution too). Two-image
+// mechanism: crop the SAME source photo down slightly (94% width/height,
+// centered) to use as the tight Start Frame; the untouched original photo
+// (necessarily wider by comparison, since it's the same image before that
+// crop) is the End Frame. Both frames are guaranteed to share identical
+// lighting/color/style because they're literally the same photograph —
+// satisfies the doc's "both images share consistent lighting, color
+// grade, and style" checklist item with no separate generation step.
+// Standard Cloudinary URL transformation insertion — frame.remoteImageUrl
+// is confirmed to be a Cloudinary delivery URL (renderPipeline.js already
+// depends on this for Kling). Inserting the transformation segment right
+// after "/upload/" is Cloudinary's documented URL-transform convention.
+const TWO_IMAGE_CROP_TRANSFORM = "c_crop,g_center,w_0.94,h_0.94";
+
+function buildCroppedStartUrl(remoteImageUrl) {
+  if (!remoteImageUrl.includes("/upload/")) {
+    // Not a recognizable Cloudinary delivery URL — can't safely insert a
+    // transformation segment. Caller falls back to using the same URL for
+    // both start and end rather than throwing, since a failed crop still
+    // produces a renderable (if less ideal) two-image call.
+    return remoteImageUrl;
+  }
+  return remoteImageUrl.replace("/upload/", `/upload/${TWO_IMAGE_CROP_TRANSFORM}/`);
+}
+
 // ── CINEMATIC LTX FAST PROMPT PACK (16 motions, 2 batches) ────────────
 // Batch 1 (9): Sam's End_Frame_Generation_and_PRO_Plus_Changes doc.
 // Batch 2 (7): Cinematic_LTX_Prompt_Pack_-Addition doc, July 18, 2026 —
@@ -100,38 +130,63 @@ function ensureConfigured() {
 // same "let the user pick, don't fake automatic detection" call already
 // made for Kling's equivalent gates).
 
+// FLAME_CLAUSE — shared suffix appended to every non-ambient camera-motion
+// preset below (v3 pack, LTX_Prompt_revision doc, July 20, 2026, tested by
+// Sam across 6 real renders: 3 with a real fireplace, 3 with none — zero
+// hallucinations in either direction). Two things this deliberately does,
+// confirmed as intentional with Sam and NOT an accidental hallucination
+// exception to the rest of this file's "no new objects" language:
+//   1. Fixes the actual bug this was written for — camera-motion presets'
+//      own "everything stays fixed/unchanged" negative constraints were
+//      unintentionally freezing an already-lit fireplace's flame along
+//      with genuinely-static things (furniture, architecture). This clause
+//      carves out "already-present dynamic elements keep moving naturally"
+//      from "no NEW objects/geometry/reflections" — the actual protection
+//      against hallucination is untouched.
+//   2. Also allows flame INJECTION when no flame is visible in an existing
+//      fireplace opening. Confirmed with Sam this is intentional, not a
+//      hallucination-policy violation: AB 723 governs photo disclosure of
+//      STAGING alterations; this is video, showing a real, physical
+//      feature of the home (the fireplace itself) as lit, which is a
+//      different category from inventing a feature that doesn't exist.
+//      Real-render-tested specifically for the failure mode this could
+//      cause — 3 no-fireplace renders confirmed LTX did NOT invent a
+//      fireplace where none existed.
+const FLAME_CLAUSE =
+  " If a fireplace or fire pit flame is visible, it should appear with subtle, natural flicker exactly as photographed. If no flame is visible, include a small, photorealistic flame inside the existing fireplace opening, shown with subtle, natural flicker, without altering any surrounding architecture.";
+
 const LTX_MOTION_TEMPLATES = {
   cinematic_push: {
     prompt:
-      "The camera performs a smooth, deliberate push-in toward the center of the room, maintaining straight verticals and stable architectural lines. Depth increases naturally as the camera advances, with gentle parallax emerging only from existing room geometry. All architecture, furniture, windows, lighting, and surfaces remain exactly as photographed — no new objects, textures, reflections, or openings appear.",
+      "Perform a smooth, deliberate push-in toward the center of the room, moving inward without touching boundary geometry. All architectural lines remain stable and unchanged. No new objects, openings, reflections, or extended surfaces appear." + FLAME_CLAUSE,
     confidence: "high",
     safeWhen: "Any interior room with clear depth.",
     gate: null,
   },
   luxury_drift: {
     prompt:
-      "The camera glides laterally in a slow, elegant drift, preserving a stable perspective and straight architectural lines. Motion feels refined and controlled, like a slider shot across the room. No new blinds, reflections, textures, or objects appear; the camera stays fully within the photographed space.",
+      "Perform an ultra-slow lateral drift at extremely low velocity, staying fully inside the photographed geometry. Maintain straight verticals and stable perspective. No new blinds, reflections, textures, or objects appear." + FLAME_CLAUSE,
     confidence: "high",
     safeWhen: "Rooms with strong horizontal sightlines.",
     gate: null,
   },
   floating_camera_drift: {
     prompt:
-      "The camera floats gently with subtle micro-sway, creating a weightless, ambient motion. Perspective remains stable, and parallax arises only from existing depth in the photographed room. Architecture, windows, lighting, and furniture remain unchanged — no new textures, blinds, reflections, or objects appear.",
+      "Apply a gentle floating motion with micro-sway and micro-parallax. Maintain ceiling, floor, and wall junctions exactly as photographed. No new textures, reflections, or objects appear." + FLAME_CLAUSE,
     confidence: "medium-high",
     safeWhen: "Rooms with soft lighting and visible depth.",
     gate: { type: "advisory", note: "Avoid highly reflective rooms (mirrors, glossy tile) — not automatically detected, use judgment when picking the source photo." },
   },
   architectural_glide: {
     prompt:
-      "The camera performs a smooth horizontal glide along the room's existing architectural sightline, tracking across visible cabinetry, windows, or built-ins with stable perspective and controlled motion. No new openings, extended rooms, or architectural changes appear; motion stays strictly within the photographed boundaries.",
+      "Perform a smooth horizontal glide along the room's architectural sightline. Parallax arises only from existing geometry. No new openings, extended rooms, or architectural changes appear." + FLAME_CLAUSE,
     confidence: "high",
     safeWhen: "Kitchens, hallways, open-plan living spaces.",
     gate: { type: "advisory", note: "Avoid very tight rooms with no lateral space." },
   },
   corner_to_corner_drift: {
     prompt:
-      "The camera drifts diagonally from one visible corner toward the opposite corner, maintaining stable geometry and allowing natural parallax from existing room depth. No new space, openings, or architectural features appear; motion remains fully within the photographed room.",
+      "Perform a slow diagonal drift from one visible corner toward the opposite corner. Maintain stable geometry and natural parallax. No new space, openings, or architectural features appear." + FLAME_CLAUSE,
     confidence: "high",
     safeWhen: "Rooms with visible corners and depth.",
     gate: { type: "advisory", note: "Avoid rooms with obstructed corners." },
@@ -188,14 +243,21 @@ const LTX_MOTION_TEMPLATES = {
   // equivalents exist at lower cost.
   orbit_arc: {
     prompt:
-      "Create a smooth cinematic lateral drift that gently arcs across the scene, maintaining the central subject in frame. Motion should feel like a soft orbit without rotating around the object. All architecture, furniture, and structural lines remain stable and unchanged. No new areas of the room or exterior are revealed beyond what is visible in the source image.",
+      "Perform a smooth lateral drift that gently arcs across the scene, simulating an orbit without rotating around the subject. No new areas of the room are revealed beyond what is visible in the source image." + FLAME_CLAUSE,
     confidence: "medium-high",
     safeWhen: "A central subject — kitchen island, dining table, pool — with room around it in frame.",
     gate: null,
+    // NEW (July 20, 2026, LTX_Prompt_revision doc) — Orbit/Arc is one of
+    // only 3 presets that require the two-image crop workflow. Wide arc
+    // rotation reveals background area LTX has no reference for on a
+    // single image — see buildCroppedStartUrl's comment above for the
+    // full mechanism (tight cropped start + full original as end).
+    requiresTwoImage: true,
+    cropTransformation: TWO_IMAGE_CROP_TRANSFORM,
   },
   rack_focus: {
     prompt:
-      "Create a gentle cinematic push-in with a subtle depth-weighted motion that suggests a soft focus transition. Foreground and background remain clear and stable, with no blur melt or distortion. Architecture, cabinetry, and furniture stay fixed and unchanged. No new areas of the room are revealed.",
+      "Perform a gentle cinematic push-in with a soft depth-weighted emphasis shift. Foreground and background remain clear and stable. No blur melt, distortion, or new areas of the room are revealed." + FLAME_CLAUSE,
     confidence: "medium-high",
     safeWhen: "A clear foreground detail (hardware, fixture, vignette) with the room visible behind it.",
     gate: null,
@@ -210,28 +272,28 @@ const LTX_MOTION_TEMPLATES = {
   },
   crane_up: {
     prompt:
-      "Create a smooth vertical upward drift with a slight upward tilt, bringing more emphasis to the upper portion already visible in the photo. Ceiling details, fixtures, and windows remain stable and unchanged. Do not reveal any new room areas beyond what is visible in the source image.",
+      "Perform an ultra-slow upward drift with a slight upward tilt, emphasizing the upper portion already visible. No new ceiling planes, no perspective exaggeration, and no new room areas are revealed." + FLAME_CLAUSE,
     confidence: "medium-high",
     safeWhen: "Rooms with visible ceiling detail — chandelier, fan, high windows.",
     gate: null,
   },
   crane_down: {
     prompt:
-      "Create a smooth vertical downward drift with a slight downward tilt, bringing more emphasis to the lower portion already visible in the photo. Flooring, rugs, and lower cabinetry remain stable and unchanged. Do not reveal any new room areas beyond what is visible in the source image.",
+      "Perform an ultra-slow downward drift with a slight downward tilt, emphasizing the lower portion already visible. No new flooring, cabinetry, or extended geometry is revealed." + FLAME_CLAUSE,
     confidence: "medium-high",
     safeWhen: "Rooms with visible flooring detail — tilework, a rug.",
     gate: null,
   },
   parallax_push: {
     prompt:
-      "Create a gentle cinematic push-in with subtle layered micro-parallax, where foreground elements shift slightly faster than background elements. All architecture, furniture, and structural lines remain stable and undistorted. Motion stays within the photographed frame with no new areas revealed.",
+      "Perform a micro push-in with layered micro-parallax. Foreground shifts slightly faster than background while all architecture remains stable. No new areas of the room are revealed." + FLAME_CLAUSE,
     confidence: "medium-high",
     safeWhen: "Rooms with clear foreground/background depth separation.",
     gate: null,
   },
   pan_zoom_reveal: {
     prompt:
-      "Create a smooth lateral pan combined with a gentle push-in, revealing more emphasis on the areas already visible in the photo. Architecture, furniture, and structural lines remain stable and unchanged. Motion stays fully within the photographed frame with no new room areas revealed.",
+      "Perform an ultra-slow lateral pan paired with a micro zoom-out. Maintain all architectural lines exactly as photographed. No widened field of view, no new geometry, and no inferred depth." + FLAME_CLAUSE,
     confidence: "medium-high",
     safeWhen: "Any room with reasonable width to pan across.",
     gate: null,
@@ -249,9 +311,16 @@ const LTX_MOTION_TEMPLATES = {
   // geometry" instruction to cover a specific, known failure mode.
   // UNTESTED — same flag as before: on paper from the doc, not yet
   // confirmed against a real render the way the batch-1/2 presets were.
+  // Batch 3 REVISED (July 20, 2026, LTX_Prompt_revision v3 doc) — replaces
+  // the earlier, much longer hallway-guardrail phrasing (Batch 3 REVISED,
+  // July 18) with the v3 pack's tighter wording, plus the flame clause.
+  // STILL UNTESTED (Sam's real-render testing this session covered the
+  // FLAME_CLAUSE specifically on other presets, not these 3 movements
+  // themselves) — flag carried forward from the prior revision, not
+  // cleared by this change.
   micro_zoom_out: {
     prompt:
-      "A gentle micro zoom-out that slightly breathes outward while keeping all architecture exactly as photographed. The frame subtly expands within the existing boundaries without revealing any new ceiling, flooring, corners, cabinetry, furniture, or hallway entrances. Vertical and horizontal lines remain perfectly straight with no perspective exaggeration. The motion must not expose any additional hallway depth, doorway edges, or side-corridor geometry, even by a few pixels. No widened field of view, no extended space, no added objects, no new reflections, no new geometry, no lens-simulation effects. The entire motion stays strictly inside the photographed space.",
+      "Perform a gentle micro zoom-out that breathes outward while staying strictly inside the photographed boundaries. No new ceiling, flooring, corners, cabinetry, or hallway entrances appear." + FLAME_CLAUSE,
     confidence: "medium-high",
     safeWhen: "Open-plan spaces, especially those with a hallway or corridor nearby that must not be exposed.",
     gate: null,
@@ -259,19 +328,30 @@ const LTX_MOTION_TEMPLATES = {
   },
   micro_dolly_back: {
     prompt:
-      "A smooth micro dolly-back that moves straight backward by a very small amount while preserving all visible architecture. The camera shifts gently away from the scene without exposing any new areas of the kitchen, dining, living room, or adjacent hallways. All geometry, corners, ceiling lines, and flooring remain exactly as photographed. The backward travel must not reveal hallway entrances, hallway depth, doorway edges, or any new wall planes on either side of the open-plan space. No reveal, no widened view, no new surfaces, no added objects, no perspective change, no diagonal or vertical drift. The motion stays fully inside the original frame.",
+      "Perform a smooth micro dolly-back that moves backward without exposing any new areas of the room. No hallway depth, doorway edges, or extended wall planes appear." + FLAME_CLAUSE,
     confidence: "medium-high",
     safeWhen: "Open-plan spaces, especially those with a hallway or corridor nearby that must not be exposed.",
     gate: null,
     openPlanOnly: true,
+    // NEW (July 20, 2026, LTX_Prompt_revision doc) — one of the 3 presets
+    // requiring the two-image crop workflow (see buildCroppedStartUrl).
+    requiresTwoImage: true,
+    cropTransformation: TWO_IMAGE_CROP_TRANSFORM,
   },
   open_plan_reveal: {
     prompt:
-      "A subtle open-plan reveal that gently emphasizes already-visible zones without expanding the field of view. The motion enhances the sense of openness by redistributing focus across the kitchen, dining, and living areas, but never widens the frame or exposes new corners, walls, or architectural features. The reveal must not increase visibility of any hallway, doorway, or side-corridor. No new hallway depth, doorway edges, or extended architecture may appear. No new geometry, no extended space, no added reflections, no perspective shift, no lens-based reveal. All motion remains strictly within the photographed boundaries.",
+      "Perform a subtle open-plan reveal that redistributes focus across already visible zones without widening the frame. No new corners, walls, or hallway geometry appear." + FLAME_CLAUSE,
     confidence: "medium-high",
     safeWhen: "Open-plan spaces with continuous kitchen-dining-living sightlines.",
     gate: null,
     openPlanOnly: true,
+    // NEW (July 20, 2026) — originally shipped as "no crop" in the v3 doc;
+    // Sam's explicit follow-up correction same day added Open-Plan Reveal
+    // to the cropped/two-image tier alongside Orbit/Arc and Micro Dolly
+    // Back (3 total now, not 2 — the doc's "only TWO movements require
+    // cropping" line is superseded by this correction).
+    requiresTwoImage: true,
+    cropTransformation: TWO_IMAGE_CROP_TRANSFORM,
   },
 };
 
@@ -464,27 +544,58 @@ async function generateLtxContinuationClip(frame, presetKey, workDir, jobId) {
   // internal polling has gone silent on a real render before with no
   // JS-catchable error at all. Every fal.ai call in this codebase since
   // that discovery uses this same explicit, loggable pattern.
+  const preset = LTX_MOTION_TEMPLATES[presetKey];
+
+  // NEW (July 20, 2026 — real bug: user reported aspect errors requiring a
+  // full restart). fal.ai's aspect_ratio param defaults to "auto" when
+  // omitted, which infers the ratio from the source image — this codebase
+  // (concat, Ken Burns matching, final assembly) assumes 16:9 everywhere,
+  // so any non-16:9 source silently broke the rest of the pipeline. Now
+  // forced explicitly on every LTX call instead of left on auto. The
+  // matching frontend-side message ("AI Movements can only be rendered
+  // 16:9") is a separate UI fix — see handoff notes, frontend repo pending.
+  const inputPayload = {
+    image_url: preset && preset.requiresTwoImage
+      ? buildCroppedStartUrl(frame.remoteImageUrl)
+      : frame.remoteImageUrl,
+    prompt,
+    duration: duration,
+    fps: 25, // matches motionRenderer.py's own fps, so LTX and Ken Burns clips are never accidentally frame-rate-mismatched at the concat/comparison level
+    aspect_ratio: "16:9",
+    // NEW (July 20, 2026 — real bug: LTX audio was rendering on every
+    // clip despite this pipeline being audio-off/silent by design, narration
+    // and music are mixed in separately by assemble.js). fal.ai's schema
+    // defaults generate_audio to true; this was never set before, so every
+    // LTX clip has been generating (and billing for) audio nobody wanted.
+    generate_audio: false,
+  };
+
+  // Two-image workflow (July 20, 2026, LTX_Prompt_revision doc) — only
+  // orbit_arc, micro_dolly_back, and open_plan_reveal set requiresTwoImage.
+  // end_image_url = the ORIGINAL, uncropped staged image — wider by
+  // comparison to the cropped start frame above, giving LTX real content
+  // to reference for whatever the move would otherwise reveal beyond the
+  // tight start frame's boundaries, per the doc's two-image mechanism.
+  if (preset && preset.requiresTwoImage) {
+    inputPayload.end_image_url = frame.remoteImageUrl;
+  }
+
   let request_id;
   try {
     ({ request_id } = await fal.queue.submit(LTX_ENDPOINT, {
-      input: {
-        image_url: frame.remoteImageUrl,
-        prompt,
-        // FIX (July 20, 2026 — confirmed via real fal.ai error body, not
-        // a guess): fal.ai's schema does a strict literal-type match
-        // against the duration enum (6/8/10/.../20) — sending it as a
-        // STRING here ("14" instead of 14) failed validation with
-        // "Input should be 6, 8, 10, 12, 14, 16, 18 or 20" even though
-        // "14" and 14 look identical in a log line. This is the exact,
-        // sole cause of every LTX "Unprocessable Entity" this session —
-        // dispatch/routing was correct the whole time; this one type
-        // mismatch was silently killing every real call at the result-fetch
-        // step (fal.ai's queue reports COMPLETED regardless, since the
-        // job itself ran — it's fetching the actual result that exposes
-        // the input it was never valid for).
-        duration: duration,
-        fps: 25, // matches motionRenderer.py's own fps, so LTX and Ken Burns clips are never accidentally frame-rate-mismatched at the concat/comparison level
-      },
+      // FIX (July 20, 2026 — confirmed via real fal.ai error body, not
+      // a guess): fal.ai's schema does a strict literal-type match
+      // against the duration enum (6/8/10/.../20) — sending it as a
+      // STRING here ("14" instead of 14) failed validation with
+      // "Input should be 6, 8, 10, 12, 14, 16, 18 or 20" even though
+      // "14" and 14 look identical in a log line. This is the exact,
+      // sole cause of every LTX "Unprocessable Entity" this session —
+      // dispatch/routing was correct the whole time; this one type
+      // mismatch was silently killing every real call at the result-fetch
+      // step (fal.ai's queue reports COMPLETED regardless, since the
+      // job itself ran — it's fetching the actual result that exposes
+      // the input it was never valid for).
+      input: inputPayload,
     }));
   } catch (err) {
     throw new Error(`LTX submit failed: ${err.message} | ${extractFalErrorDetail(err)}`);
@@ -599,4 +710,6 @@ module.exports = {
   VALID_LTX_PRESETS,
   VALID_LTX_DURATIONS,
   OPEN_PLAN_SAFE_LTX_PRESETS,
+  buildCroppedStartUrl,
+  TWO_IMAGE_CROP_TRANSFORM,
 };
