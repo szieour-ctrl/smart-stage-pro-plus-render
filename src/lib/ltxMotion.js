@@ -171,8 +171,16 @@ const LTX_MOTION_TEMPLATES = {
     gate: null,
   },
   floating_camera_drift: {
+    // REVISED (July 21, 2026 — real render feedback: "barely moves"). Sam's
+    // exact wording, verbatim — not the shared FLAME_CLAUSE constant, since
+    // this replaces the whole prompt string as given, flame sentence
+    // included. Adds explicit "gentle, noticeable sway" (the prior wording's
+    // motion was too subtle to read as intentional) while adding an
+    // explicit no-roll/no-tilt constraint, since the fix for "barely moves"
+    // can't be allowed to reopen the kind of roll problem corner_to_corner_
+    // drift hit separately in the same test round.
     prompt:
-      "Apply a gentle floating motion with micro-sway and micro-parallax. Maintain ceiling, floor, and wall junctions exactly as photographed. No new textures, reflections, or objects appear." + FLAME_CLAUSE,
+      "Perform a slow, buoyant floating drift with a gentle, noticeable sway that moves the viewer through the space without introducing any camera roll or tilt. Maintain perfectly level horizons, stable verticals, and natural parallax only from existing geometry. No new textures, reflections, or objects appear.\nIf a fireplace or fire pit flame is visible, it should appear with subtle, natural flicker exactly as photographed. If no flame is visible, include a small, photorealistic flame inside the existing fireplace opening, shown with subtle, natural flicker, without altering any surrounding architecture.",
     confidence: "medium-high",
     safeWhen: "Rooms with soft lighting and visible depth.",
     gate: { type: "advisory", note: "Avoid highly reflective rooms (mirrors, glossy tile) — not automatically detected, use judgment when picking the source photo." },
@@ -185,8 +193,17 @@ const LTX_MOTION_TEMPLATES = {
     gate: { type: "advisory", note: "Avoid very tight rooms with no lateral space." },
   },
   corner_to_corner_drift: {
+    // REVISED (July 21, 2026 — real render feedback: "severe roll"). Sam's
+    // exact wording, verbatim — not the shared FLAME_CLAUSE constant. Root
+    // cause of the roll: the prior wording ("drift from one visible corner
+    // toward the opposite corner") gave LTX a diagonal destination with no
+    // explicit ban on rotating to get there, which it apparently read as
+    // license to roll/tilt the camera along the way. This version keeps
+    // the lateral-drift feel but explicitly rules out diagonal roll/camera
+    // tilt and demands level horizons/stable verticals instead of
+    // describing a corner-to-corner destination at all.
     prompt:
-      "Perform a slow diagonal drift from one visible corner toward the opposite corner. Maintain stable geometry and natural parallax. No new space, openings, or architectural features appear." + FLAME_CLAUSE,
+      "Perform an ultra-slow lateral drift that gently shifts the viewer's perspective across the room without introducing any diagonal roll or camera tilt. Maintain perfectly level horizons, stable verticals, and natural parallax only from existing geometry. No new space, openings, or architectural features appear.\nIf a fireplace or fire pit flame is visible, allow subtle, natural flicker. If no flame is visible, include a small, photorealistic flame inside the existing fireplace opening, shown with subtle, natural flicker, without altering any surrounding architecture.",
     confidence: "high",
     safeWhen: "Rooms with visible corners and depth.",
     gate: { type: "advisory", note: "Avoid rooms with obstructed corners." },
