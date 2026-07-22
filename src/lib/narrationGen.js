@@ -445,6 +445,17 @@ Rules:
 
           if (overBudgetIndices.length > 0) {
             const rewritten = await regenerateOverBudgetSegments(overBudgetPayload, apiKey);
+            // NEW (this session — real gap: a real render showed trimmed-
+            // looking output with no way to tell from the logs whether the
+            // retry rewrite had engaged at all, or whether every one of
+            // these segments fell straight through to mechanical trimming
+            // instead. This log line is what was missing — success was
+            // silent before, only failure logged anything.
+            console.log(
+              rewritten
+                ? `[narration retry] ${overBudgetIndices.length} over-budget segment(s) (positions: ${overBudgetIndices.join(", ")}) got a rewrite from the retry pass.`
+                : `[narration retry] ${overBudgetIndices.length} over-budget segment(s) (positions: ${overBudgetIndices.join(", ")}) — retry did not return usable results, falling through to mechanical trimming for all of them.`
+            );
             if (rewritten) {
               overBudgetIndices.forEach((idx, j) => {
                 segmentsOut[idx].text = rewritten[j].text;
@@ -458,12 +469,23 @@ Rules:
           segmentsOut.forEach((entry, i) => {
             const maxWords = wordTargets[i];
             if (maxWords === undefined) return; // more entries than segments sent — shouldn't happen, but not this function's problem to solve
+            const before = (entry.text || "") + (entry.closing || "");
             if (typeof entry.closing === "string") {
               const { text, closing } = enforceCombinedWordCeiling(entry.text, entry.closing, maxWords);
               entry.text = text;
               entry.closing = closing;
             } else if (typeof entry.text === "string") {
               entry.text = enforceWordCeiling(entry.text, maxWords);
+            }
+            const after = (entry.text || "") + (entry.closing || "");
+            // NEW (this session) — the other missing piece: even after a
+            // successful retry, this mechanical pass still runs as the
+            // final guarantee, and could silently cut the rewrite too if
+            // it also came back over budget. Only logs when this pass
+            // actually changed something, so a normal, in-budget segment
+            // stays quiet in the logs.
+            if (before !== after) {
+              console.log(`[narration mechanical trim] position ${i}: mechanical enforcement cut this segment's text (target ${maxWords} words) — this ran even after any retry attempt, as the final guarantee.`);
             }
           });
 
