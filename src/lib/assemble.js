@@ -471,9 +471,19 @@ async function concatenateClips(clipPaths, workDir) {
 // continuation would reverse the reveal direction and read as a
 // collision, exactly the problem Sam flagged with the old hardcoded
 // pull_back(vacant)+push_in(staged) pairing.
+// RAISED from 4.0 to 6.0 (this session — Sam's request: standardize Ken
+// Burns clip duration to match AI Motion/LTX's ~6s continuation, closing
+// the gap that was forcing every Ken Burns segment into a tighter
+// narration budget than an LTX one got for the same room. New total
+// reveal clip length: REVEAL_OPENER_DURATION(1.5) + 6.0 -
+// REVEAL_WIPE_DURATION(0.4) = 7.1s — matches a real LTX reveal clip's
+// observed 7.12s almost exactly. Confirmed via renderPipeline.js's own
+// math (continuationDuration = this constant + any narration padding) —
+// raising it here alone is sufficient; nothing else needs to change for
+// the padding stack to keep working correctly.
 const REVEAL_OPENER_DURATION = 1.5;
 const REVEAL_WIPE_DURATION = 0.4;
-const REVEAL_CONTINUATION_DURATION = 4.0;
+const REVEAL_CONTINUATION_DURATION = 6.0;
 
 // wipeTransition values are real ffmpeg xfade transition names.
 // ASSUMPTION FLAGGED FOR SAM: the locked spec confirms opener motion +
