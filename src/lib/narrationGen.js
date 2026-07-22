@@ -193,7 +193,71 @@ function groupContiguousByRoom(localFrames, framePaths, timeline) {
   return groups.map((g, i) => ({ index: i, ...g }));
 }
 
-// ── SEGMENTED, VISION-GROUNDED SCRIPT ────────────────────────────────────
+// ── WORD-CEILING ENFORCEMENT ─────────────────────────────────────────────
+// NEW (this session — real render evidence: Claude was NOT respecting its
+// own stated word ceiling, despite extremely explicit prompt language
+// ("HARD CEILING, not a suggestion... the single most important
+// constraint"). Measured against a real render: every non-final segment
+// ran 115-160% of its stated target; the final segment ran 145%. This is
+// the SAME category of failure this file already fixed twice before (the
+// address token Claude just didn't use; the JSON-array preamble Claude
+// added despite being told not to) — same lesson: stop depending on
+// instruction compliance for anything that must be exactly right, enforce
+// it in code instead. eleven_v3 has no speed correction (see below), so
+// word count is the ONLY lever left to guarantee a segment fits its
+// window — this has to actually hold, not just be asked for.
+//
+// Trims to the last sentence-ending punctuation within the budget when
+// there is one reasonably close to the cutoff (so a trim still reads as
+// a complete thought), otherwise hard-trims to the word count and adds a
+// period — better than mid-word ElevenLabs audio truncation either way,
+// but a sentence-boundary trim sounds like a deliberate edit rather than
+// a cutoff.
+function enforceWordCeiling(text, maxWords) {
+  if (!text) return text;
+  const words = text.trim().split(/\s+/).filter(Boolean);
+  if (words.length <= maxWords) return text.trim();
+
+  let trimmed = words.slice(0, maxWords).join(" ");
+  const lastPunctIdx = Math.max(trimmed.lastIndexOf("."), trimmed.lastIndexOf("!"), trimmed.lastIndexOf("?"));
+  if (lastPunctIdx > trimmed.length * 0.5) {
+    return trimmed.slice(0, lastPunctIdx + 1);
+  }
+  // No sentence-ending punctuation within budget (the common case — most
+  // segments are a single sentence per the prompt's own instruction).
+  // Back up to the last comma instead, so the cut lands on a natural
+  // pause rather than mid-phrase — still an incomplete sentence, but a
+  // comma-boundary trim reads as a deliberate pause, not a stumble.
+  const lastCommaIdx = trimmed.lastIndexOf(",");
+  if (lastCommaIdx > trimmed.length * 0.4) {
+    return trimmed.slice(0, lastCommaIdx) + ".";
+  }
+  return /[.!?]$/.test(trimmed) ? trimmed : trimmed + ".";
+}
+
+// For the final group specifically: "text" and "closing" share ONE
+// combined budget, and Claude decides the split between them itself — so
+// enforcement has to trim from the COMBINED total, not each field
+// independently against the full budget (which would let a 20-word
+// budget become 40 words if both fields separately "fit" 20 each). Trims
+// "closing" first (the CTA is the more replaceable, boilerplate-ish half
+// — the room detail in "text" is the one real observation this segment
+// exists to make), then "text" only if closing alone can't absorb enough.
+function enforceCombinedWordCeiling(text, closing, maxWords) {
+  const textWords = (text || "").trim().split(/\s+/).filter(Boolean).length;
+  const closingWords = (closing || "").trim().split(/\s+/).filter(Boolean).length;
+  const total = textWords + closingWords;
+  if (total <= maxWords) return { text, closing };
+
+  const excess = total - maxWords;
+  if (closingWords >= excess) {
+    return { text, closing: enforceWordCeiling(closing, closingWords - excess) };
+  }
+  // Trimming closing to nothing still isn't enough — trim text too.
+  return { text: enforceWordCeiling(text, Math.max(3, textWords - (excess - closingWords))), closing: "" };
+}
+
+
 // segments: [{ index, roomLabel, framePaths: [...], duration }] — one or
 // more representative frames per segment (see groupContiguousByRoom).
 // Returns: [{ index, text }] in the same order.
@@ -219,23 +283,31 @@ function generateSegmentedScript(address, segments, apiKey) {
     const addressSentence = address ? `This is ${address}.` : "";
     const addressWordCount = addressSentence ? addressSentence.split(/\s+/).filter(Boolean).length : 0;
 
+    // NEW (this session) — computed once, used for BOTH the prompt text
+    // below and the post-response enforcement further down. Previously
+    // this was inline in the segmentDescriptions .map() only, with no way
+    // to check Claude's actual output against it afterward — the prompt
+    // said "hard ceiling" but nothing ever verified that ceiling was
+    // respected. See enforceWordCeiling's own comment for why that
+    // mattered (real render evidence: it wasn't).
+    const wordTargets = segments.map((s, i) => {
+      const isFinal = i === segments.length - 1;
+      const rawWordTarget = wordBudgetForSegment(s.availableWindow);
+      return isFinal ? Math.max(10, rawWordTarget - addressWordCount) : rawWordTarget;
+    });
+
     const segmentDescriptions = segments
       .map((s, i) => {
         const marker = segments.length === 1
           ? " — THIS IS BOTH THE OPENING AND CLOSING GROUP (the only group in this video)"
           : i === 0 ? " — THIS IS THE OPENING GROUP" : (i === segments.length - 1 ? " — THIS IS THE CLOSING GROUP" : "");
         const isFinal = i === segments.length - 1;
-        const rawWordTarget = wordBudgetForSegment(s.availableWindow);
-        // Reserves real speaking time for the address sentence we insert
-        // in code — that sentence costs real seconds when spoken even
-        // though Claude never writes it, so the ceiling given to Claude
-        // has to be honest about how much of the window is actually
-        // available for what it's writing.
-        const wordTarget = isFinal ? Math.max(10, rawWordTarget - addressWordCount) : rawWordTarget;
+        const wordTarget = wordTargets[i];
         const targetNote = isFinal
           ? `target ${wordTarget} words max combined across "text" and "closing" (a separate fixed address sentence gets inserted between them afterward — already accounted for, don't write about it)`
           : `target ${wordTarget} words max`;
-        return `Group ${i + 1}: "${s.roomLabel}"${marker} — ${s.framePaths.length} frame(s) shown for this group — ${targetNote} (this group has about ${s.availableWindow.toFixed(1)}s of real speaking room before the next group starts).`;
+        const photoNote = s.framePaths.length > 1 ? ` — MULTI-PHOTO GROUP (${s.framePaths.length} angles of this same space) — this is a bigger target for a real reason, write two or three sentences covering different real aspects of it, not one terse line` : "";
+        return `Group ${i + 1}: "${s.roomLabel}"${marker} — ${s.framePaths.length} frame(s) shown for this group${photoNote} — ${targetNote} (this group has about ${s.availableWindow.toFixed(1)}s of real speaking room before the next group starts).`;
       })
       .join("\n");
 
@@ -251,14 +323,17 @@ ${segmentDescriptions}
 
 IMPORTANT — exterior accuracy: for any group whose room label suggests an EXTERIOR shot (exterior, yard, backyard, front yard, pool, patio, curb appeal), be cautious about ONE specific thing: this platform sometimes adds outdoor furniture/staging (a firepit, patio dining set, planters) or enhances landscaping (fresh lawn, trimmed hedges, seasonal flowers) that may not reflect the property's real, permanent condition. Do NOT describe added outdoor furniture or specific landscaping details (lawn condition, plantings, hedges) as if they're confirmed, permanent features of the property. Time of day and lighting (golden hour warmth, twilight glow) ARE safe to describe normally — that's just atmosphere, not a factual claim about the property itself. Stick to the home's own architectural features (roofline, siding material, window style) plus safe lighting/mood description; just avoid asserting specific outdoor furnishings or landscaping as real. Interior rooms don't need this caution; describe what you actually see in interiors normally.
 
-Write ONE short narration segment per GROUP (not per frame). Pick exactly ONE specific, vivid detail per group — not a list, not room type plus finishes plus layout plus a value statement. One real, grounded observation (a material, a light quality, a single standout feature) said naturally, the way someone would mention the one thing that actually caught their eye walking through — not an inventory of the room. Say the room's name once when you start describing it — don't re-announce it for every frame that's clearly still the same space — but if the group turns out to span more than one real room (see above), make sure narration reflects that rather than silently describing only one of them.
+Write ONE narration segment per GROUP (not per frame) — but how MUCH you write should scale with that group's own word target above, not be the same terse length regardless of group size. A group made of several photos of the same space (a multi-angle primary suite, a multi-room open-plan area) has a bigger combined word target for a real reason — the viewer spends more time there, and it deserves a fuller description covering more of what actually makes that space work, not the same single one-liner a quick single-photo shot gets. Leaving most of a large group's available time as silence just to stay brief is not the goal here; using the time you're actually given to say more about a space that earned more coverage is.
+- A single-photo group with a small word target (roughly 10-15 words): ONE sentence, one specific detail, exactly as before.
+- A multi-photo group with a meaningfully larger word target (roughly 20+ words): write TWO to THREE sentences covering genuinely different aspects of the space — not padding the same observation with filler, but naming two or three distinct real things worth mentioning (e.g. the sightline AND a standout finish AND how the space connects to what's next), the way someone giving an unhurried, attentive tour of a space they lingered in would actually talk about it.
+Regardless of length: pick real, grounded observations — not a list, not room type plus finishes plus layout plus a value statement. Grounded observations (a material, a light quality, a standout feature) said naturally, not an inventory of the room. Say the room's name once when you start describing it — don't re-announce it for every frame that's clearly still the same space — but if the group turns out to span more than one real room (see above), make sure narration reflects that rather than silently describing only one of them.
 
-This is NOT a mechanical, second-by-second description of each image, and it is NOT a features list — it should read like someone who toured the home and mentioned the ONE thing worth noting about each room in passing, tastefully, in a warm, professional, conversational tone, then moved on. The segments together should feel like one continuous, cohesive walkthrough — each one can build on the last — not a series of disconnected blurbs, and never more than ONE sentence, two at the absolute most, per group.
+This is NOT a mechanical, second-by-second description of each image, and it is NOT a features list — it should read like someone who toured the home and mentioned what was actually worth noting about each room in passing, tastefully, in a warm, professional, conversational tone. The segments together should feel like one continuous, cohesive walkthrough — each one can build on the last — not a series of disconnected blurbs.
 
 Rules:
 - Third person only (never "I" or "my listing").
 - Never invent square footage, bedroom/bathroom counts, or amenities not visible in the photos.
-- ONE sentence per group. Two only if both are short. This is the single most important constraint — a segment that tries to name the room, list what's in it, AND editorialize about value will not fit its window and will get cut off mid-sentence. Pick the one detail that matters most and say only that.
+- Sentence count scales with the word target given (see above) — a small target gets one sentence, a larger multi-photo target gets two or three. This is the single most important constraint either way: a segment that tries to cram more detail than its OWN target allows — regardless of how many sentences that takes — will not fit its window and will get cut off mid-sentence. Match your length to the number actually given, not to some other feeling from the photos.
 - Each group's word target is a HARD CEILING, not a suggestion. There is no correction step after this — whatever you write plays at natural pace in exactly the time given. Going even slightly over means the audio gets cut off mid-word, which sounds like a broken, amateur edit. When in doubt, write UNDER the target, never over it — a slightly short segment just means a beat of natural silence, which is fine; an over-budget one is a real, audible defect.
 - Vary how each segment opens. Do NOT start consecutive (or most) segments with the same phrase (e.g. "Here we have," "This room features") — that reads as a stutter when segments play back to back. Vary sentence structure across the whole script the way a real person naturally would, not a template being refilled per room.
 - THE OPENING GROUP IS DIFFERENT FROM AN ORDINARY GROUP: a video needs a strong opening. It must (1) give one real, grounded observation about the room or exterior actually shown — same as any other group — combined naturally with (2) a brief, warm welcome that references the property's general LOCATION (city, or street + city informally — e.g. "Welcome to Main Street in Roseville," or "This beautiful Roseville home..."). Keep it informal and brief — do NOT recite the complete formal address (street number, city, state, zip) as if reading a mailing label here; that full, precise address belongs only at the close (see below), not here.
@@ -297,7 +372,7 @@ Rules:
     }, (res) => {
       let data = "";
       res.on("data", (c) => (data += c));
-      res.on("end", () => {
+      res.on("end", async () => {
         try {
           const parsed = JSON.parse(data);
           const text = parsed?.content?.find((b) => b.type === "text")?.text;
@@ -338,6 +413,60 @@ Rules:
           // them with our own fixed, always-correct address sentence
           // built earlier in this function. Every other segment is
           // untouched, using its "text" field exactly as before.
+          // NEW (this session) — enforce the word ceiling Claude was told
+          // to respect but consistently didn't (see enforceWordCeiling's
+          // header comment for the real evidence). Matches by ARRAY
+          // POSITION against wordTargets, computed above from the same
+          // segments/availableWindow data the prompt itself used — same
+          // position-based-matching convention generateNarration() below
+          // already uses for the equivalent reason (never trust a model
+          // to correctly echo back an index we handed it).
+          //
+          // Two layers: first, ONE targeted retry call asking for a real
+          // rewrite of just the over-budget segments (better output when
+          // it works — preserves grammar instead of chopping a sentence
+          // mid-clause). Then mechanical enforceWordCeiling/
+          // enforceCombinedWordCeiling runs regardless, on whatever came
+          // out of that, as the actual guarantee — the retry is a quality
+          // improvement attempt, never the thing the timing constraint
+          // depends on holding.
+          const overBudgetIndices = [];
+          const overBudgetPayload = [];
+          segmentsOut.forEach((entry, i) => {
+            const maxWords = wordTargets[i];
+            if (maxWords === undefined) return;
+            const textWords = (entry.text || "").trim().split(/\s+/).filter(Boolean).length;
+            const closingWords = typeof entry.closing === "string" ? entry.closing.trim().split(/\s+/).filter(Boolean).length : 0;
+            if (textWords + closingWords > maxWords) {
+              overBudgetIndices.push(i);
+              overBudgetPayload.push({ text: entry.text, closing: entry.closing, maxWords });
+            }
+          });
+
+          if (overBudgetIndices.length > 0) {
+            const rewritten = await regenerateOverBudgetSegments(overBudgetPayload, apiKey);
+            if (rewritten) {
+              overBudgetIndices.forEach((idx, j) => {
+                segmentsOut[idx].text = rewritten[j].text;
+                if (typeof segmentsOut[idx].closing === "string" && typeof rewritten[j].closing === "string") {
+                  segmentsOut[idx].closing = rewritten[j].closing;
+                }
+              });
+            }
+          }
+
+          segmentsOut.forEach((entry, i) => {
+            const maxWords = wordTargets[i];
+            if (maxWords === undefined) return; // more entries than segments sent — shouldn't happen, but not this function's problem to solve
+            if (typeof entry.closing === "string") {
+              const { text, closing } = enforceCombinedWordCeiling(entry.text, entry.closing, maxWords);
+              entry.text = text;
+              entry.closing = closing;
+            } else if (typeof entry.text === "string") {
+              entry.text = enforceWordCeiling(entry.text, maxWords);
+            }
+          });
+
           if (segmentsOut.length > 0) {
             const last = segmentsOut[segmentsOut.length - 1];
             if (typeof last.closing === "string") {
@@ -359,7 +488,73 @@ Rules:
   });
 }
 
-// ── PER-SEGMENT TTS (ElevenLabs) ─────────────────────────────────────────
+// One retry attempt for segments that came back over their word budget —
+// tries to preserve grammar/tone by asking for a genuine rewrite rather
+// than a mechanical truncation, which is the better outcome when it
+// works. Batches every over-budget segment into ONE follow-up call
+// (not one call per segment) to keep latency/cost bounded regardless of
+// how many segments overshot. If this call fails outright (network,
+// parse error, anything), the caller's own mechanical enforcement still
+// runs afterward regardless — this is a quality improvement attempt, not
+// a dependency the timing guarantee relies on.
+function regenerateOverBudgetSegments(overBudget, apiKey) {
+  return new Promise((resolve) => {
+    const listText = overBudget.map((o, i) =>
+      `${i + 1}. (target ${o.maxWords} words max) Original: "${o.closing !== undefined ? `${o.text} [CLOSING:] ${o.closing}` : o.text}"`
+    ).join("\n");
+
+    const promptText = `Each of these narration lines came in over its word budget and needs a tighter rewrite that keeps the same meaning, tone, and specific detail — just shorter. Preserve complete sentences; don't just chop words off the end yourself, actually rewrite more concisely.
+
+${listText}
+
+Return ONLY a JSON array, nothing else — no markdown fences, no prose before or after. Exactly ${overBudget.length} entries, in the same order shown, one per line above. Each entry: {"text": "..."} normally, or {"text": "...", "closing": "..."} for any line that had a [CLOSING:] part — keep that same two-field shape, don't merge them.`;
+
+    const bodyStr = JSON.stringify({
+      model: "claude-sonnet-4-6",
+      max_tokens: 1000,
+      messages: [{ role: "user", content: [{ type: "text", text: promptText }] }],
+    });
+
+    const req = https.request({
+      hostname: "api.anthropic.com",
+      path: "/v1/messages",
+      method: "POST",
+      headers: {
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(bodyStr),
+      },
+    }, (res) => {
+      let data = "";
+      res.on("data", (c) => (data += c));
+      res.on("end", () => {
+        try {
+          const parsed = JSON.parse(data);
+          const text = parsed?.content?.find((b) => b.type === "text")?.text || "";
+          const cleaned = text.trim().replace(/^```(json)?/i, "").replace(/```$/, "").trim();
+          const start = cleaned.indexOf("[");
+          const end = cleaned.lastIndexOf("]");
+          if (start === -1 || end === -1) throw new Error("no JSON array in retry response");
+          const rewritten = JSON.parse(cleaned.slice(start, end + 1));
+          if (!Array.isArray(rewritten) || rewritten.length !== overBudget.length) throw new Error("retry response shape mismatch");
+          resolve(rewritten);
+        } catch (e) {
+          console.error(`[narration retry] Rewrite attempt failed (${e.message}) — falling back to mechanical trim for these segments.`);
+          resolve(null);
+        }
+      });
+    });
+    req.on("error", (e) => {
+      console.error(`[narration retry] Request failed (${e.message}) — falling back to mechanical trim for these segments.`);
+      resolve(null);
+    });
+    req.write(bodyStr);
+    req.end();
+  });
+}
+
+
 // speed is optional — omitted on the first attempt (ElevenLabs' own
 // default, 1.0). See generateNarration's correction pass below for when
 // a second call with an adjusted speed is actually needed.
