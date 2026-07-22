@@ -38,15 +38,23 @@ const AUTO_PRESETS = {
 // types specifically needed more headroom than the flat bump gave them.
 // Kitchen/dining/exterior/living aren't in REUSABLE_ROOM_TYPES (rarely
 // duplicated per listing), so they're unaffected and left as-is.
+// STANDARDIZED to a flat 6.0s (this session — Sam's request: match AI
+// Motion/LTX parity across every room type, removing the per-room
+// variability that was itself flagged above as needing "more headroom"
+// for narration — dining's old 4.7s in particular was the single
+// tightest window in the whole system, and the most frequent source of
+// narration needing to be trimmed. A single standard duration also makes
+// clip-duration math predictable when planning narration budgets, same
+// reasoning as the Room Reveal continuation change in assemble.js.
 const DEFAULT_DURATIONS = {
-  exterior: 6.2,
-  living:   6.2,
-  kitchen:  5.2,
-  dining:   4.7,
-  bedroom:  6.8,
-  bathroom: 5.2,
-  flex:     6.2,
-  default:  6.5,
+  exterior: 6.0,
+  living:   6.0,
+  kitchen:  6.0,
+  dining:   6.0,
+  bedroom:  6.0,
+  bathroom: 6.0,
+  flex:     6.0,
+  default:  6.0,
 };
 
 // All valid preset names — must match motionRenderer.py choices exactly.
