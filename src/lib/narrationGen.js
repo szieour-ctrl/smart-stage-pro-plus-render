@@ -213,6 +213,29 @@ function groupContiguousByRoom(localFrames, framePaths, timeline) {
 // period — better than mid-word ElevenLabs audio truncation either way,
 // but a sentence-boundary trim sounds like a deliberate edit rather than
 // a cutoff.
+// Trailing function words that should never be the last word of a
+// mechanically-trimmed segment — confirmed from real render evidence
+// (the loft segment landed on "...with its own window and.", earlier
+// renders landed on "...to the." and "...with natural."). Stranding one
+// of these at the end reads as an obviously broken cutoff even when the
+// word count and punctuation rules above are otherwise satisfied; backing
+// up past it to the last real content word reads as an intentional,
+// if abrupt, ending instead.
+const TRAILING_STOPWORDS = new Set([
+  "a", "an", "the", "and", "or", "but", "to", "with", "in", "on", "at",
+  "for", "from", "of", "near", "through", "into", "onto", "over", "under",
+  "between", "toward", "towards", "beside", "above", "below", "by", "as",
+]);
+
+function stripTrailingStopwords(text) {
+  const words = text.replace(/[.!?]+$/, "").trim().split(/\s+/).filter(Boolean);
+  while (words.length > 1 && TRAILING_STOPWORDS.has(words[words.length - 1].toLowerCase())) {
+    words.pop();
+  }
+  const rejoined = words.join(" ");
+  return /[.!?]$/.test(rejoined) ? rejoined : rejoined + ".";
+}
+
 function enforceWordCeiling(text, maxWords) {
   if (!text) return text;
   const words = text.trim().split(/\s+/).filter(Boolean);
@@ -230,9 +253,9 @@ function enforceWordCeiling(text, maxWords) {
   // comma-boundary trim reads as a deliberate pause, not a stumble.
   const lastCommaIdx = trimmed.lastIndexOf(",");
   if (lastCommaIdx > trimmed.length * 0.4) {
-    return trimmed.slice(0, lastCommaIdx) + ".";
+    return stripTrailingStopwords(trimmed.slice(0, lastCommaIdx));
   }
-  return /[.!?]$/.test(trimmed) ? trimmed : trimmed + ".";
+  return stripTrailingStopwords(trimmed);
 }
 
 // For the final group specifically: "text" and "closing" share ONE
@@ -280,7 +303,17 @@ function generateSegmentedScript(address, segments, apiKey) {
     // code, after generation (see the resolve() call below) — there's
     // nothing left for Claude to get right or wrong about it, because
     // it's never asked to touch it at all, not even via a token.
-    const addressSentence = address ? `This is ${address}.` : "";
+    // CHANGED (this session — Sam's request: the CTA should only ever say
+    // the street address, never city or state). Splits on the first comma
+    // — every address seen in this codebase so far follows "123 Street,
+    // City, State" formatting, so the street portion is reliably
+    // everything before that first comma. Also directly helps the CTA's
+    // real timing problem (see NARRATION_OUTRO_PADDING_SECONDS in
+    // renderPipeline.js and the CTA-specific pace note below): a shorter
+    // fixed sentence means more of the segment's real budget is available
+    // for Claude's own writing.
+    const streetOnly = address ? address.split(",")[0].trim() : "";
+    const addressSentence = streetOnly ? `This is ${streetOnly}.` : "";
     const addressWordCount = addressSentence ? addressSentence.split(/\s+/).filter(Boolean).length : 0;
 
     // NEW (this session) — computed once, used for BOTH the prompt text
@@ -290,9 +323,27 @@ function generateSegmentedScript(address, segments, apiKey) {
     // said "hard ceiling" but nothing ever verified that ceiling was
     // respected. See enforceWordCeiling's own comment for why that
     // mattered (real render evidence: it wasn't).
+    // NEW (this session — real evidence across multiple renders): the
+    // final/CTA segment consistently measures a SLOWER real spoken pace
+    // than ordinary room narration — 115-124 wpm vs 140-165 for typical
+    // descriptive segments, every time, not a one-off. This makes sense:
+    // it's the one segment with a street number, an address, and other
+    // numbers/proper nouns, which TTS models generally speak more
+    // deliberately than casual descriptive prose. Budgeting it at the
+    // same 130wpm as everything else was mathematically correct (the
+    // enforcement hit its target exactly) but still overran, because the
+    // ASSUMPTION itself didn't match this segment's real content type.
+    // Confirmed on a real render: 29 words at the general 130wpm rate
+    // "should" take 13.4s: it actually took 15.07s — matches 115wpm
+    // almost exactly. This is content-aware, not a blanket rate change —
+    // ordinary segments keep the real observed ~140-165wpm average
+    // headroom SPEAKING_RATE_WORDS_PER_MINUTE(130) already reflects.
+    const CTA_SPEAKING_RATE_WORDS_PER_MINUTE = 115;
     const wordTargets = segments.map((s, i) => {
       const isFinal = i === segments.length - 1;
-      const rawWordTarget = wordBudgetForSegment(s.availableWindow);
+      const rawWordTarget = isFinal
+        ? Math.max(MIN_SEGMENT_WORDS, Math.round((s.availableWindow / 60) * CTA_SPEAKING_RATE_WORDS_PER_MINUTE))
+        : wordBudgetForSegment(s.availableWindow);
       return isFinal ? Math.max(10, rawWordTarget - addressWordCount) : rawWordTarget;
     });
 
