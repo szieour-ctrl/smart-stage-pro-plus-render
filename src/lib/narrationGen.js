@@ -258,46 +258,78 @@ function enforceWordCeiling(text, maxWords) {
   return stripTrailingStopwords(trimmed);
 }
 
-// For the final group specifically: "text" and "closing" share ONE
-// combined budget, and Claude decides the split between them itself — so
-// enforcement has to trim from the COMBINED total, not each field
-// independently against the full budget (which would let a 20-word
-// budget become 40 words if both fields separately "fit" 20 each). Trims
-// "closing" first (the CTA is the more replaceable, boilerplate-ish half
-// — the room detail in "text" is the one real observation this segment
-// exists to make), then "text" only if closing alone can't absorb enough.
-// For the CTA/"closing" field specifically — asymmetric from
-// enforceWordCeiling on purpose. An ordinary room segment always needs
-// SOME narration (silence over a room reads as an error), so that
-// function always returns something even via a raw word-count fallback.
-// The closing line is different: it's a decorative payoff on top of the
-// address sentence right before it, which already stands alone as a
-// complete, correct way to end the video ("This is 5935 Quilter St." is
-// a fine sentence with or without a CTA after it). Real evidence: "This
-// one truly needs." — a raw fallback cutoff landing right after a verb
-// that needed an object — is a worse outcome than just not having a CTA
-// line at all. Only returns trimmed text when a genuinely clean boundary
-// (sentence-ending punctuation, or a comma with real content on both
-// sides) exists within budget; otherwise drops the line entirely.
+// FIX (this session — real render evidence: script was "The home glows
+// beautifully at dusk. This is 234 Bent Tree Ct." — address spoken, then
+// silence, on a 14s clip with real time to spare). Root cause was this
+// function's own prior design: when the CTA had no clean sentence/comma
+// boundary within its trimmed budget, it dropped the line ENTIRELY rather
+// than risk a fragment — "no CTA" was being treated as better than a
+// slightly-awkward CTA. Real evidence says the opposite: a 14s clip
+// landing completely silent after the address is a much more noticeable
+// defect than a CTA that reads a little quickly. Sam's fix (July 23,
+// 2026): before ever trimming or dropping, try keeping the CTA WHOLE and
+// asking Eleven v3 to deliver it faster via an inline audio tag instead —
+// v3 supports directorial tags like [rushed]/[fast-paced]/[rapid-fire]
+// (NOT a `speed` API param — confirmed elsewhere in this file that speed
+// does nothing on v3; this is a text-embedded delivery cue the model
+// interprets, not a hard timing guarantee). Only falls through to
+// trim/drop logic if the CTA is too long even for a generously tagged
+// budget.
+//
+// CLOSING_PACE_TAG / PACE_TAG_BUDGET_MULTIPLIER are deliberately
+// conservative: a tag is a suggestion to the model, not a guaranteed
+// speedup, and ElevenLabs' own docs note Professional Voice Clones (the
+// voice this codebase uses) aren't fully optimized for v3 yet — so this
+// should be watched against real measured-wpm logs (see [narration wpm]
+// below) before trusting it for a bigger multiplier. 1.35x is intentionally
+// modest: enough to rescue a CTA that's only somewhat over budget, not a
+// license to write arbitrarily long closings.
+// Combined tag, not just a pace cue alone (Sam's addition) — v3 supports
+// layering multiple delivery tags together (documented pattern: e.g.
+// "[frustrated] ... [interjecting]"). [fast-paced] alone risks the CTA
+// sounding thin/hurried once sped up; pairing it with [confident] keeps
+// the assured, inviting tone while still buying back real time. Space-
+// separated bracket tags, both applied as a prefix to the line.
+const CLOSING_PACE_TAG = process.env.CLOSING_PACE_TAG || "[fast-paced] [confident]";
+const PACE_TAG_BUDGET_MULTIPLIER = 1.35;
+// Absolute last resort — used only when Claude's own CTA can't be
+// salvaged even with the pace tag AND has no clean trim boundary. A real,
+// generic CTA beats dead air every time; this is intentionally short so
+// it fits almost any remaining window.
+const FALLBACK_CLOSING_LINE = process.env.FALLBACK_CLOSING_LINE || "Reach out today to schedule your private showing.";
+
 function enforceClosingWordCeiling(text, maxWords) {
   if (!text) return text;
   const words = text.trim().split(/\s+/).filter(Boolean);
   if (words.length <= maxWords) return text.trim();
 
+  // NEW — try the whole line, tagged for faster delivery, before trimming
+  // anything. Real timing isn't guaranteed by the tag, so this is capped
+  // at a modest multiplier rather than treated as truly unlimited room.
+  if (words.length <= Math.floor(maxWords * PACE_TAG_BUDGET_MULTIPLIER)) {
+    console.log(`[narration] Closing/CTA (${words.length} words) exceeds its ${maxWords}-word budget but fits within the ${PACE_TAG_BUDGET_MULTIPLIER}x pace-tag allowance — tagging ${CLOSING_PACE_TAG} instead of trimming.`);
+    return `${CLOSING_PACE_TAG} ${text.trim()}`;
+  }
+
   const trimmed = words.slice(0, maxWords).join(" ");
   const lastPunctIdx = Math.max(trimmed.lastIndexOf("."), trimmed.lastIndexOf("!"), trimmed.lastIndexOf("?"));
   if (lastPunctIdx > trimmed.length * 0.5) {
-    return trimmed.slice(0, lastPunctIdx + 1);
+    return `${CLOSING_PACE_TAG} ${trimmed.slice(0, lastPunctIdx + 1)}`;
   }
   const lastCommaIdx = trimmed.lastIndexOf(",");
   if (lastCommaIdx > trimmed.length * 0.4) {
     const clean = stripTrailingStopwords(trimmed.slice(0, lastCommaIdx));
     // Require a real amount of content survived the trim (not just "This
     // home,") — otherwise this is barely better than the raw fallback.
-    if (clean.split(/\s+/).filter(Boolean).length >= 4) return clean;
+    if (clean.split(/\s+/).filter(Boolean).length >= 4) return `${CLOSING_PACE_TAG} ${clean}`;
   }
-  console.log(`[narration] Closing/CTA line had no clean boundary within its ${maxWords}-word budget — dropping it rather than risk a broken fragment. The address sentence stands alone as the closing line for this render.`);
-  return "";
+  // CHANGED (this session) — previously dropped to "" here. Real evidence
+  // shows that produces a fully silent outro on a clip with real time to
+  // spare, which is worse than a generic-but-real CTA. Falls back to a
+  // fixed line instead of dead air; only reachable when even the pace-tag
+  // allowance and a clean-boundary trim both failed.
+  console.log(`[narration] Closing/CTA line had no clean boundary within its ${maxWords}-word budget even with the pace-tag allowance — using the fixed fallback CTA rather than leaving the outro silent.`);
+  return `${CLOSING_PACE_TAG} ${FALLBACK_CLOSING_LINE}`;
 }
 
 function enforceCombinedWordCeiling(text, closing, maxWords) {
@@ -310,11 +342,15 @@ function enforceCombinedWordCeiling(text, closing, maxWords) {
   if (closingWords >= excess) {
     return { text, closing: enforceClosingWordCeiling(closing, closingWords - excess) };
   }
-  // Trimming closing to nothing still isn't enough — trim text too.
-  // (closing itself gets dropped here too, same reasoning as above — it
-  // was already the first thing sacrificed, no reason to keep a fragment
-  // of it once text also needs cutting.)
-  return { text: enforceWordCeiling(text, Math.max(3, textWords - (excess - closingWords))), closing: "" };
+  // Trimming closing alone isn't enough — trim text too, but still run
+  // the closing through enforceClosingWordCeiling (pace tag / fallback
+  // line) rather than dropping it outright, for the same reason as above:
+  // a CTA that needs both fields squeezed is still better delivered than
+  // silent.
+  return {
+    text: enforceWordCeiling(text, Math.max(3, textWords - (excess - closingWords))),
+    closing: enforceClosingWordCeiling(closing, Math.max(4, closingWords - excess)),
+  };
 }
 
 
