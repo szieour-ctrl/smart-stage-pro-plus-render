@@ -25,7 +25,7 @@
 // changes are needed for this feature at all.
 //
 // ── FEATURE FLAG — KILL SWITCH ──────────────────────────────────────────
-// Set END_FRAME_ENABLED=true (or leave unset) in Railway's environment
+// Set END_FRAME_ENABLED=false (or leave unset) in Railway's environment
 // to disable this instantly — no code change or redeploy needed, just an
 // env var flip + restart. Defaults OFF until Sam confirms it's ready to
 // leave on for real jobs. When off, applyEndFrame() is a pure no-op that
@@ -142,13 +142,23 @@ function downloadToFile(url, destPath) {
 // Flux-edited image and .endFrameApplied: true (informational, not read
 // by billing since this is unmetered).
 async function applyEndFrame({ frame, address, workDir, jobId }) {
-  if (!isEndFrameEnabled()) return frame;
-  if (!frame || !frame.localPath) return frame;
+  if (!isEndFrameEnabled()) {
+    console.log(`[${jobId}] End Frame: skipped — END_FRAME_ENABLED is not "true" in this environment.`);
+    return frame;
+  }
+  if (!frame || !frame.localPath) {
+    console.log(`[${jobId}] End Frame: skipped — no frame/localPath available to edit.`);
+    return frame;
+  }
+
+  console.log(`[${jobId}] End Frame: enabled, starting Flux edit on closing frame (${frame.localPath})...`);
 
   try {
     const sourceUrl = await uploadFrameToCloudinary(frame.localPath);
+    console.log(`[${jobId}] End Frame: uploaded source frame to Cloudinary (${sourceUrl}).`);
     const prompt = buildCtaPrompt(address);
     const editedUrl = await submitFluxEdit(sourceUrl, prompt);
+    console.log(`[${jobId}] End Frame: Flux edit complete (${editedUrl}), downloading...`);
 
     const editedLocalPath = path.join(workDir, `end-frame-${Date.now()}.jpg`);
     await downloadToFile(editedUrl, editedLocalPath);
