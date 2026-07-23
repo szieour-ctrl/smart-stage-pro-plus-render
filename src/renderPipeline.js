@@ -131,7 +131,15 @@ async function processRenderJob(job) {
     // phrase (~7 words) on top of a real 25-word opener and the intro
     // needs to cover ~32 words, not meaningfully less than the outro's
     // load — hence landing at the same order of magnitude.
-    const NARRATION_INTRO_PADDING_SECONDS = 9;
+    // LOWERED to 6 (this session — Sam's explicit request: take 3s away
+    // from intro and give it to the CTA, confirming the rebalancing
+    // flagged as an option two rounds ago. Sam's own real-world
+    // comparison showed the intro consistently finishing narration with
+    // ~6s of unused time before the next clip started, while the outro
+    // kept needing more room across several rounds of fixes — this
+    // moves 3 of that surplus over rather than growing total video
+    // length further.
+    const NARRATION_INTRO_PADDING_SECONDS = 6;
     // RAISED to 15 (July 18, 2026 — Sam's call: stop budgeting the two
     // frames that matter most — the user's chosen opening and closing
     // shots — against average-case timing math, and give them enough
@@ -158,7 +166,25 @@ async function processRenderJob(job) {
     // words. At SPEAKING_RATE_WORDS_PER_MINUTE (130), that's ~7.8s of
     // real extra speech, plus a small margin — not a full re-derivation
     // of the whole segment's duration from zero.
-    const NARRATION_OUTRO_PADDING_SECONDS = 9;
+    // RAISED to 10.5 (this session — Sam's explicit request: +1.5s more
+    // for the CTA specifically, on top of everything else this segment
+    // already gets — the address-shortening (street only, no city/state)
+    // and the CTA-specific pace correction in narrationGen.js's
+    // wordTargets computation). All three land together: less content to
+    // say, a more realistic pace assumption for that content, and more
+    // real time to say it in.
+    // RAISED to 12 (this session — Sam's explicit request, second round:
+    // +1.5s more again, on top of the previous +1.5s raise. Sam's own
+    // real-world comparison: the intro (9s padding) finishes narration
+    // with ~6s of unused time before the next clip starts, while the
+    // outro has been consistently tight across multiple rounds of fixes
+    // (address shortening, CTA-specific pace correction, dropping
+    // unfittable closing lines) — the two are not currently symmetric,
+    // and outro genuinely needs more room, not just better budgeting.
+    // RAISED to 17 (this session — Sam's explicit request: +5s more,
+    // paired with -3s taken from intro above — a real rebalance, not
+    // just growing both numbers independently).
+    const NARRATION_OUTRO_PADDING_SECONDS = 17;
     if (job.wantsNarration && localFrames.length > 0) {
       const first = localFrames[0];
       first.durationSeconds = resolveDuration(first) + NARRATION_INTRO_PADDING_SECONDS;
