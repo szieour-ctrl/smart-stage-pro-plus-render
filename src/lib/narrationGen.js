@@ -502,7 +502,9 @@ IMPORTANT — exterior accuracy: for any group whose room label suggests an EXTE
 Write ONE narration segment per GROUP (not per frame) — but how MUCH you write should scale with that group's own word target above, not be the same terse length regardless of group size. A group made of several photos of the same space (a multi-angle primary suite, a multi-room open-plan area) has a bigger combined word target for a real reason — the viewer spends more time there, and it deserves a fuller description covering more of what actually makes that space work, not the same single one-liner a quick single-photo shot gets. Leaving most of a large group's available time as silence just to stay brief is not the goal here; using the time you're actually given to say more about a space that earned more coverage is.
 - A single-photo group with a small word target (roughly 10-15 words): ONE sentence, one specific detail, exactly as before.
 - A multi-photo group with a meaningfully larger word target (roughly 20+ words): write TWO to THREE sentences covering genuinely different aspects of the space — not padding the same observation with filler, but naming two or three distinct real things worth mentioning (e.g. the sightline AND a standout finish AND how the space connects to what's next), the way someone giving an unhurried, attentive tour of a space they lingered in would actually talk about it.
+- IMPORTANT — when a space appears as a multi-photo group (two, sometimes three photos of the same room or area), that is not incidental: the client chose to showcase THAT specific space more than the others. Treat it as a deliberate spotlight, not a technical curiosity to smooth over. When the extra photos are genuinely just different angles of the SAME view with nothing new to observe (not every multi-photo group has three distinct things to say): do NOT invent a second or third "aspect" that isn't really there just to hit a sentence count, and do NOT default to a short, vague, generic line either — that wastes the real time this room earned by being chosen for extra coverage. Instead, go DEEPER on the one real, specific, worthwhile feature or benefit the space does offer — the kind of detail an attentive tour guide would actually elaborate on when they lingered somewhere the client clearly wanted highlighted (why the layout works, what makes the finish or the light or the proportions genuinely good) — and use close to the full word target saying that well, rather than settling for a thin summary. A merged group's narration should feel like it filled the time this room earned, through depth on something real if not through breadth across several things — this room was chosen to stand out, so the narration should make it stand out.
 Regardless of length: pick real, grounded observations — not a list, not room type plus finishes plus layout plus a value statement. Grounded observations (a material, a light quality, a standout feature) said naturally, not an inventory of the room. Say the room's name once when you start describing it — don't re-announce it for every frame that's clearly still the same space — but if the group turns out to span more than one real room (see above), make sure narration reflects that rather than silently describing only one of them.
+- When a group's label is a generic/umbrella term (e.g. "Open Plan," "Living Area") rather than a specific single room, and the frames actually show multiple RECOGNIZABLE distinct areas (a kitchen island, a dining table, a living room seating arrangement) — name each recognizable area you can actually identify, one clause per area, rather than writing one blended impression that never differentiates them (e.g. "a waterfall-edge island anchors the kitchen, an adjacent dining nook catches morning light, and the living area opens beyond it" — not "the open-plan space features great finishes and natural light throughout"). This is what makes multi-room umbrella groups read as covering genuinely different spaces instead of one vague impression stretched across three photos.
 
 This is NOT a mechanical, second-by-second description of each image, and it is NOT a features list — it should read like someone who toured the home and mentioned what was actually worth noting about each room in passing, tastefully, in a warm, professional, conversational tone. The segments together should feel like one continuous, cohesive walkthrough — each one can build on the last — not a series of disconnected blurbs.
 
@@ -519,7 +521,27 @@ Rules:
 - Return ONLY a JSON array, nothing else — no markdown fences, no prose before or after. Every entry except the final group uses {"index": N, "text": "..."}; the final group entry uses {"index": N, "text": "...", "closing": "..."} as described above. Exactly ${segments.length} entries, one per group, in the order shown.`;
 
     const content = [{ type: "text", text: promptText }];
+    // FIX (this session — real render evidence: Claude's returned array
+    // came back one entry short of the group count, cascading a
+    // misalignment where a later group's narration played during an
+    // earlier group's clip, and the true final group got no narration at
+    // all). Root cause: every image from every group used to be pushed
+    // into ONE flat, undifferentiated sequence, with group boundaries
+    // existing ONLY in the text description above (frame counts per
+    // group) — Claude had to correctly COUNT through a long unlabeled
+    // image stream to know which images belonged to which group, with no
+    // structural reinforcement at all. With several similar-looking
+    // consecutive images (e.g. two bedroom angles, then a bath, then a
+    // closet), miscounting by even one image is exactly the kind of thing
+    // that produces a merged/skipped group. Now each group's images are
+    // preceded by their own explicit text marker, so group membership is
+    // structural — never dependent on Claude counting correctly through
+    // an undifferentiated blob.
     segments.forEach((s, i) => {
+      content.push({
+        type: "text",
+        text: `--- Images for Group ${i + 1}: "${s.roomLabel}" (${s.framePaths.length} frame(s)) ---`,
+      });
       s.framePaths.forEach((framePath) => {
         const imageData = fs.readFileSync(framePath).toString("base64");
         content.push({
