@@ -89,15 +89,24 @@ async function uploadFrameToCloudinary(localPath) {
   return result.secure_url;
 }
 
-// ── buildCtaPrompt — street address only, no city/state, per Sam's
-// existing narration CTA rule (kept consistent so the visual and audio
-// closing line never contradict each other). Template is an env var so
-// Sam can tune the exact copy without a code deploy.
+// ── buildCtaPrompt — full address (street + city/state), unlike the
+// narration CTA which deliberately drops city/state for spoken-audio
+// reasons (awkward to hear read aloud). That rule doesn't apply here —
+// this is TEXT ON AN IMAGE, meant to be read, not heard, and Sam's
+// reference design (End_Frame.jpg, this session) shows the full address.
+// Template is an env var so Sam can tune the exact copy/styling without
+// a code deploy.
+//
+// REVISED (this session — real test result was "really generic," missing
+// the CTA line entirely): the original one-line prompt ("add text near
+// the bottom") was too vague for Flux to reproduce a specific design.
+// This version explicitly describes the two-line layout, gradient scrim,
+// weight, and position from Sam's reference image, rather than leaving
+// the treatment up to the model's own judgment.
 function buildCtaPrompt(address) {
   const template = process.env.END_FRAME_CTA_TEMPLATE ||
-    'Add clean, legible, professionally-kerned text overlay reading "{address}" and "Schedule Your Private Tour Today" near the bottom of the image, in a modern real estate marketing style. Do not alter the architecture, lighting, or existing content of the photo.';
-  const street = (address || "").split(",")[0].trim();
-  return template.replace("{address}", street);
+    'Add a dark semi-transparent gradient overlay across the bottom third of the image, fading from transparent to dark at the very bottom edge. Over that gradient, add two lines of bold white sans-serif text, left-aligned with consistent left margin: the first line, larger and bolder, reads "{address}"; the second line, directly below it and slightly smaller, reads "Schedule Your Private Tour Today". Keep both lines legible, clean, professionally kerned, and positioned in the bottom-left area of the frame. Do not alter the architecture, lighting, sky, or any other content of the photo.';
+  return template.replace("{address}", address || "This Home");
 }
 
 // ── submitFluxEdit — fal.subscribe() handles submit + poll + fetch
