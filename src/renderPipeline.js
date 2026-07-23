@@ -22,6 +22,11 @@ const { assembleVideo, buildRevealClip, REVEAL_PRESETS, REVEAL_OPENER_DURATION, 
 const { generateNarration, groupContiguousByRoom } = require("./lib/narrationGen");
 const { uploadToCloudinary } = require("./lib/cloudinaryUpload");
 const { notifyWebhook } = require("./lib/notify");
+// NEW (this session) — End Frame: replaces the closing shot with a
+// Flux-edited version (address + CTA baked into the image itself).
+// Feature-flagged and unbilled — see lib/endFrame.js's header comment
+// for the full kill-switch/billing/fallback reasoning.
+const { applyEndFrame } = require("./lib/endFrame");
 
 // ── NARRATION VOICE LIBRARY ───────────────────────────────────────────
 // MUST stay in sync with NARRATION_VOICES in build-video-demo.html.
@@ -89,6 +94,30 @@ async function processRenderJob(job) {
     // ── Step 1: Download all frame images to local disk ──────────────────
     const localFrames = await downloadFrames(job.frames, workDir);
     console.log(`[${job.jobId}] Downloaded ${localFrames.length} frames.`);
+
+    // ── Step 1.5: End Frame (this session) ────────────────────────────
+    // Replaces the LAST frame with a Flux-edited version (address + CTA
+    // baked into the image) before any motion/padding logic below reads
+    // localFrames — this way End Frame is invisible to every downstream
+    // step (Ken Burns, Kling, Reveal, narration padding all just see
+    // "a frame," same as before). Runs on whichever frame currently
+    // occupies the last position, regardless of whether it's a Reveal,
+    // Kling, or plain Ken Burns frame — applyEndFrame only swaps the
+    // source image file, it doesn't touch motion/preset fields.
+    //
+    // No-op (returns the frame unchanged) when END_FRAME_ENABLED isn't
+    // set to "true" in Railway's environment — see lib/endFrame.js for
+    // the kill-switch details. Unbilled either way; this never touches
+    // credits/quota.
+    if (localFrames.length > 0) {
+      const lastIndex = localFrames.length - 1;
+      localFrames[lastIndex] = await applyEndFrame({
+        frame: localFrames[lastIndex],
+        address: job.address || null,
+        workDir,
+        jobId: job.jobId,
+      });
+    }
 
     // NEW (narration grouping + intro/outro build): when narration is on,
     // clip 1 and the last clip in the queue get extra duration so there's
