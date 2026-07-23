@@ -903,7 +903,8 @@ function escapeDrawtext(text) {
   return text.replace(/\\/g, "\\\\\\\\").replace(/:/g, "\\:").replace(/'/g, "\u2019");
 }
 
-// ── CLOSING CARD (Sam's idea, rebuilt July 16, 2026) ────────────────────
+// ── CLOSING CARD (Sam's idea, rebuilt July 16, 2026; revived + restyled
+// this session) ─────────────────────────────────────────────────────
 // REPLACES the live-overlay version entirely, which hung THREE separate
 // times despite three different targeted fixes (duration cap, font
 // family, no font at all) — the last fix (removing the font parameter)
@@ -920,16 +921,48 @@ function escapeDrawtext(text) {
 // transition in this video without issue all session. Reuses working
 // code instead of patching the same fragile filter graph a fourth time.
 //
-// Trade-off, accepted explicitly: this adds real seconds to the video
-// (a genuine new clip) rather than reusing the narration-end buffer
-// window the old version tried to blend into. The text still fades in
-// right as the card begins — which, since the card is appended AFTER
-// the main video already finished narration + its buffer, lands at the
-// same perceptual moment ("right as narration ends") the original spec
-// asked for, just via a clean transition into a new clip instead of a
-// live blend on top of continuing footage.
-const CLOSING_CARD_DURATION_SECONDS = 4.0;
-const CLOSING_CARD_FADE_SECONDS = 0.6;
+// REVIVED (this session): this whole system existed and even had
+// assembleVideo's own call-site logic ready, but was never actually
+// invoked — renderPipeline.js never passed a closingCard object in. Now
+// it is (see renderPipeline.js Step 4), using the actual last room
+// photo as the background instead of a placeholder.
+//
+// RESTYLED (this session, Sam's explicit ask): was a flat whole-frame
+// darken (eq=brightness=-0.28) — replaced with a real stacked-band
+// gradient (see buildGradientBandFilters) so the photo reads through
+// clearly outside the text band instead of the entire frame dimming.
+// Text color is now configurable (END_FRAME_TEXT_COLOR), not hardcoded
+// white. Duration cut from 4.0s to 2.5s per Sam's "2-3s max."
+const CLOSING_CARD_DURATION_SECONDS = 2.5;
+const CLOSING_CARD_FADE_SECONDS = 0.5;
+const CLOSING_CARD_TEXT_COLOR = process.env.END_FRAME_TEXT_COLOR || "white";
+const CLOSING_CARD_GRADIENT_STEPS = 16;
+const CLOSING_CARD_GRADIENT_PEAK_ALPHA = 0.55;
+const CLOSING_CARD_BAND_Y_START_FRAC = 0.35;
+const CLOSING_CARD_BAND_HEIGHT_FRAC = 0.30;
+
+// Same stacked-band soft-fade approach as endFrame.js's overlay builder —
+// ffmpeg has no simple single-filter "soft gradient box," and N thin
+// bands with a half-cosine alpha curve is a plain, well-understood
+// primitive rather than a fragile geq expression. Kept local to this
+// function (not imported from endFrame.js) since this file has no
+// dependency on that one and the two are simple enough not to warrant a
+// shared module for four lines of math.
+function buildCardGradientFilters(bandY, bandH, inputLabel) {
+  const filters = [];
+  let prevLabel = inputLabel;
+  for (let i = 0; i < CLOSING_CARD_GRADIENT_STEPS; i++) {
+    const sliceY = bandY + Math.round((bandH * i) / CLOSING_CARD_GRADIENT_STEPS);
+    const sliceH = Math.ceil(bandH / CLOSING_CARD_GRADIENT_STEPS) + 1;
+    const posInBand = (i + 0.5) / CLOSING_CARD_GRADIENT_STEPS;
+    const alpha = (CLOSING_CARD_GRADIENT_PEAK_ALPHA * (1 - Math.cos(posInBand * Math.PI * 2))) / 2;
+    const alphaClamped = Math.max(0, Math.min(CLOSING_CARD_GRADIENT_PEAK_ALPHA, alpha)).toFixed(3);
+    const outLabel = `cg${i}`;
+    filters.push(`[${prevLabel}]drawbox=x=0:y=${sliceY}:w=1920:h=${sliceH}:color=black@${alphaClamped}:t=fill[${outLabel}]`);
+    prevLabel = outLabel;
+  }
+  return { filters, outLabel: prevLabel };
+}
 
 function renderClosingCardClip(stillImagePath, addressLine, ctaLine, workDir, fps) {
   return new Promise((resolve, reject) => {
@@ -949,6 +982,18 @@ function renderClosingCardClip(stillImagePath, addressLine, ctaLine, workDir, fp
     // narration timing at all anymore, since the card only ever starts
     // after the main video (narration + its buffer) has already ended.
     const alphaExpr = `min(1,t/${CLOSING_CARD_FADE_SECONDS})`;
+    const bandY = Math.round(1080 * CLOSING_CARD_BAND_Y_START_FRAC);
+    const bandH = Math.round(1080 * CLOSING_CARD_BAND_HEIGHT_FRAC);
+
+    // scale+crop handles native-resolution source photos correctly
+    // regardless of their real dimensions (this part was already right
+    // in the original build) — the fix this session is everything after
+    // it: a real gradient instead of a flat darken.
+    const { filters: gradientFilters, outLabel: gradientOut } = buildCardGradientFilters(bandY, bandH, "scaled");
+    const filterParts = [
+      `[0:v]scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080[scaled]`,
+      ...gradientFilters,
+    ];
 
     // FIX (July 17, 2026 — real render, first card ever seen on screen):
     // was one drawtext with address + CTA jammed into a single line at a
@@ -959,22 +1004,14 @@ function renderClosingCardClip(stillImagePath, addressLine, ctaLine, workDir, fp
     // center — CTA is the action we actually want taken, so it gets the
     // visual weight. Degrades gracefully to a single centered CTA line
     // (old single-line layout) when there's no address at all.
-    const filterParts = [
-      // Fill-crop to the standard frame size, then darken directly on
-      // the pixel values (eq=brightness) rather than the old alpha-
-      // blend-over-a-second-stream approach — simpler, and there's
-      // nothing else in this clip for it to blend against.
-      `[0:v]scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,eq=brightness=-0.28[dimmed]`,
-    ];
-
     if (addressLine) {
       filterParts.push(
-        `[dimmed]drawtext=text='${escapeDrawtext(addressLine)}':fontcolor=white:fontsize=42:borderw=2:bordercolor=black@0.6:x=(w-text_w)/2:y=(h/2)-60:alpha='${alphaExpr}'[with_addr]`,
-        `[with_addr]drawtext=text='${escapeDrawtext(ctaLine)}':fontcolor=white:fontsize=68:borderw=3:bordercolor=black@0.6:x=(w-text_w)/2:y=(h/2)+10:alpha='${alphaExpr}'[outv]`
+        `[${gradientOut}]drawtext=text='${escapeDrawtext(addressLine)}':fontcolor=${CLOSING_CARD_TEXT_COLOR}:fontsize=42:borderw=2:bordercolor=black@0.6:x=(w-text_w)/2:y=(h/2)-60:alpha='${alphaExpr}'[with_addr]`,
+        `[with_addr]drawtext=text='${escapeDrawtext(ctaLine)}':fontcolor=${CLOSING_CARD_TEXT_COLOR}:fontsize=68:borderw=3:bordercolor=black@0.6:x=(w-text_w)/2:y=(h/2)+10:alpha='${alphaExpr}'[outv]`
       );
     } else {
       filterParts.push(
-        `[dimmed]drawtext=text='${escapeDrawtext(ctaLine)}':fontcolor=white:fontsize=68:borderw=3:bordercolor=black@0.6:x=(w-text_w)/2:y=(h-text_h)/2:alpha='${alphaExpr}'[outv]`
+        `[${gradientOut}]drawtext=text='${escapeDrawtext(ctaLine)}':fontcolor=${CLOSING_CARD_TEXT_COLOR}:fontsize=68:borderw=3:bordercolor=black@0.6:x=(w-text_w)/2:y=(h-text_h)/2:alpha='${alphaExpr}'[outv]`
       );
     }
 
