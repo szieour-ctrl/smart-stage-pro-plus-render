@@ -25,7 +25,7 @@
 // changes are needed for this feature at all.
 //
 // ── FEATURE FLAG — KILL SWITCH ──────────────────────────────────────────
-// Set END_FRAME_ENABLED=false (or leave unset) in Railway's environment
+// Set END_FRAME_ENABLED=true (or leave unset) in Railway's environment
 // to disable this instantly — no code change or redeploy needed, just an
 // env var flip + restart. Defaults OFF until Sam confirms it's ready to
 // leave on for real jobs. When off, applyEndFrame() is a pure no-op that
