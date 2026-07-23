@@ -98,12 +98,38 @@ async function processRenderJob(job) {
     // ── Step 1.5: End Frame (this session) ────────────────────────────
     // Replaces the LAST frame with a Flux-edited version (address + CTA
     // baked into the image) before any motion/padding logic below reads
-    // localFrames — this way End Frame is invisible to every downstream
-    // step (Ken Burns, Kling, Reveal, narration padding all just see
-    // "a frame," same as before). Runs on whichever frame currently
-    // occupies the last position, regardless of whether it's a Reveal,
-    // Kling, or plain Ken Burns frame — applyEndFrame only swaps the
-    // source image file, it doesn't touch motion/preset fields.
+    // localFrames.
+    //
+    // FIX (July 23, 2026 — real render, End Frame silently never
+    // appeared): the comment this replaces claimed applyEndFrame "only
+    // swaps the source image file" and is invisible to Kling/Reveal/LTX
+    // downstream — that was wrong. Confirmed against a real log (frame 4,
+    // room: exterior): Kling doesn't read frame.localPath at all — it
+    // fetches frame.remoteImageUrl/remoteBeforeUrl directly from
+    // Cloudinary (klingMotion.js's own comment: "Kling fetches images
+    // itself from a public URL, not the local disk paths"), and
+    // applyEndFrame only ever updates localPath, never the remote URL.
+    // Kling's continuation-motion step doesn't use localPath either — it
+    // extracts KLING'S OWN last rendered frame instead (see
+    // klingMotion.js's applyContinuationMotion: "Kling's actual last
+    // frame, not the original staged image"). Net effect: the entire
+    // Flux edit was thrown away, not mangled — Kling and its continuation
+    // never saw it in the first place. The Reveal branch and standalone
+    // LTX also regenerate the image via an AI model, which risks actually
+    // distorting the baked-in text even if they DID read localPath (the
+    // "deferred, not resolved" risk from last session's handoff).
+    //
+    // Real fix: the ONLY branch in the loop below that reads
+    // frame.localPath directly, with no AI regeneration, is the plain
+    // Ken Burns fallback (the final `else` — applyMotionPreset(frame,
+    // ...)). So once End Frame has actually been applied, force this one
+    // frame down that path — skip Kling/Reveal/LTX eligibility entirely
+    // for it — guaranteeing the exact Flux pixels play untouched instead
+    // of hoping an AI motion model preserves text it was never told about.
+    // This does mean the closing shot loses whatever Kling/Reveal/LTX
+    // motion it would have otherwise gotten in favor of a Ken Burns
+    // pan/zoom — an intentional tradeoff: a plain-but-correct closing
+    // shot beats a fancier one that silently doesn't show your CTA.
     //
     // No-op (returns the frame unchanged) when END_FRAME_ENABLED isn't
     // set to "true" in Railway's environment — see lib/endFrame.js for
@@ -117,6 +143,21 @@ async function processRenderJob(job) {
         workDir,
         jobId: job.jobId,
       });
+      if (localFrames[lastIndex].endFrameApplied) {
+        const before = {
+          useAiMotion: localFrames[lastIndex].useAiMotion,
+          useRevealEffect: localFrames[lastIndex].useRevealEffect,
+          ltxMotionPreset: localFrames[lastIndex].ltxMotionPreset,
+        };
+        localFrames[lastIndex].useAiMotion = false;
+        localFrames[lastIndex].useRevealEffect = false;
+        localFrames[lastIndex].ltxMotionPreset = null;
+        console.log(
+          `[${job.jobId}] End Frame: forcing closing frame to plain Ken Burns (was useAiMotion=${before.useAiMotion}, ` +
+          `useRevealEffect=${before.useRevealEffect}, ltxMotionPreset=${before.ltxMotionPreset || "none"}) ` +
+          `so the Flux-edited image actually plays instead of being bypassed by Kling/Reveal/LTX.`
+        );
+      }
     }
 
     // NEW (narration grouping + intro/outro build): when narration is on,
