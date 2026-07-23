@@ -26,7 +26,7 @@ const { notifyWebhook } = require("./lib/notify");
 // Flux-edited version (address + CTA baked into the image itself).
 // Feature-flagged and unbilled — see lib/endFrame.js's header comment
 // for the full kill-switch/billing/fallback reasoning.
-const { applyEndFrame } = require("./lib/endFrame");
+const { isEndFrameEnabled } = require("./lib/endFrame");
 
 // ── NARRATION VOICE LIBRARY ───────────────────────────────────────────
 // MUST stay in sync with NARRATION_VOICES in build-video-demo.html.
@@ -95,70 +95,20 @@ async function processRenderJob(job) {
     const localFrames = await downloadFrames(job.frames, workDir);
     console.log(`[${job.jobId}] Downloaded ${localFrames.length} frames.`);
 
-    // ── Step 1.5: End Frame (this session) ────────────────────────────
-    // Replaces the LAST frame with a Flux-edited version (address + CTA
-    // baked into the image) before any motion/padding logic below reads
-    // localFrames.
-    //
-    // FIX (July 23, 2026 — real render, End Frame silently never
-    // appeared): the comment this replaces claimed applyEndFrame "only
-    // swaps the source image file" and is invisible to Kling/Reveal/LTX
-    // downstream — that was wrong. Confirmed against a real log (frame 4,
-    // room: exterior): Kling doesn't read frame.localPath at all — it
-    // fetches frame.remoteImageUrl/remoteBeforeUrl directly from
-    // Cloudinary (klingMotion.js's own comment: "Kling fetches images
-    // itself from a public URL, not the local disk paths"), and
-    // applyEndFrame only ever updates localPath, never the remote URL.
-    // Kling's continuation-motion step doesn't use localPath either — it
-    // extracts KLING'S OWN last rendered frame instead (see
-    // klingMotion.js's applyContinuationMotion: "Kling's actual last
-    // frame, not the original staged image"). Net effect: the entire
-    // Flux edit was thrown away, not mangled — Kling and its continuation
-    // never saw it in the first place. The Reveal branch and standalone
-    // LTX also regenerate the image via an AI model, which risks actually
-    // distorting the baked-in text even if they DID read localPath (the
-    // "deferred, not resolved" risk from last session's handoff).
-    //
-    // Real fix: the ONLY branch in the loop below that reads
-    // frame.localPath directly, with no AI regeneration, is the plain
-    // Ken Burns fallback (the final `else` — applyMotionPreset(frame,
-    // ...)). So once End Frame has actually been applied, force this one
-    // frame down that path — skip Kling/Reveal/LTX eligibility entirely
-    // for it — guaranteeing the exact Flux pixels play untouched instead
-    // of hoping an AI motion model preserves text it was never told about.
-    // This does mean the closing shot loses whatever Kling/Reveal/LTX
-    // motion it would have otherwise gotten in favor of a Ken Burns
-    // pan/zoom — an intentional tradeoff: a plain-but-correct closing
-    // shot beats a fancier one that silently doesn't show your CTA.
-    //
-    // No-op (returns the frame unchanged) when END_FRAME_ENABLED isn't
-    // set to "true" in Railway's environment — see lib/endFrame.js for
-    // the kill-switch details. Unbilled either way; this never touches
-    // credits/quota.
-    if (localFrames.length > 0) {
-      const lastIndex = localFrames.length - 1;
-      localFrames[lastIndex] = await applyEndFrame({
-        frame: localFrames[lastIndex],
-        address: job.address || null,
-        workDir,
-        jobId: job.jobId,
-      });
-      if (localFrames[lastIndex].endFrameApplied) {
-        const before = {
-          useAiMotion: localFrames[lastIndex].useAiMotion,
-          useRevealEffect: localFrames[lastIndex].useRevealEffect,
-          ltxMotionPreset: localFrames[lastIndex].ltxMotionPreset,
-        };
-        localFrames[lastIndex].useAiMotion = false;
-        localFrames[lastIndex].useRevealEffect = false;
-        localFrames[lastIndex].ltxMotionPreset = null;
-        console.log(
-          `[${job.jobId}] End Frame: forcing closing frame to plain Ken Burns (was useAiMotion=${before.useAiMotion}, ` +
-          `useRevealEffect=${before.useRevealEffect}, ltxMotionPreset=${before.ltxMotionPreset || "none"}) ` +
-          `so the Flux-edited image actually plays instead of being bypassed by Kling/Reveal/LTX.`
-        );
-      }
-    }
+    // ── Step 1.5 REMOVED (this session, real architecture correction) ──
+    // Previously this step replaced the LAST ROOM FRAME's image with an
+    // edited version and forced it onto a plain Ken Burns path, skipping
+    // whatever motion it would naturally get. Sam's explicit correction:
+    // the last room clip is the MOST IMPORTANT clip in the video and must
+    // never be replaced, motion-downgraded, or otherwise treated
+    // differently — it plays exactly as it would with End Frame disabled
+    // entirely, including its own normal narration and spoken CTA. The
+    // address/CTA card is now a genuinely separate, additional clip
+    // appended AFTER the main video finishes (narration and all) — see
+    // the `closingCard` param on the assembleVideo call in Step 4 below,
+    // and lib/endFrame.js's kill-switch check (isEndFrameEnabled) used
+    // there. Nothing in this frame-processing loop touches End Frame at
+    // all anymore.
 
     // NEW (narration grouping + intro/outro build): when narration is on,
     // clip 1 and the last clip in the queue get extra duration so there's
@@ -736,19 +686,38 @@ async function processRenderJob(job) {
     console.log(`[${job.jobId}] Music ready: ${musicPath}`);
 
     // ── Step 4: Assemble clips + music (+ optional narration) into final formats
-    // NOTE (July 16, 2026): the automated closing-card feature (live
-    // ffmpeg overlay/append) has been removed entirely — it caused 4
-    // separate real bugs across this session (hangs, an fps mismatch)
-    // despite repeated targeted fixes. Superseded by a standalone
-    // downloadable closing-card image (generate-closing-card.js, Netlify
-    // side) the user generates once and adds as their own last photo —
-    // no special-casing needed here at all, it's just an ordinary frame.
+    // CHANGE (this session, real architecture correction): the closing
+    // card is back — but not as the old live-overlay version this
+    // comment used to describe (which really was removed for causing
+    // hangs). This is assembleVideo's own already-built closingCard
+    // path (see appendClosingCardWithAudio in assemble.js), which existed
+    // in code but was never actually invoked because nothing passed this
+    // param in. It runs fully decoupled from the main mix (after mixAudio,
+    // in isolation, with its own short music-only stinger) — exactly the
+    // "after the last clip and its narration finish, separate card, music
+    // only" behavior Sam asked for. Uses the ORIGINAL last frame's own
+    // photo as the card's background (localFrames is never mutated for
+    // End Frame anymore — the last room clip plays completely normally,
+    // untouched, with its own narration and spoken CTA intact).
+    const lastFrame = localFrames[localFrames.length - 1];
+    const closingCard = (isEndFrameEnabled() && job.address && lastFrame)
+      ? {
+          stillImagePath: lastFrame.localPath,
+          addressLine: job.address,
+          ctaLine: process.env.END_FRAME_CTA_TEXT || "Schedule Your Private Showing",
+        }
+      : null;
+    if (isEndFrameEnabled() && !closingCard) {
+      console.log(`[${job.jobId}] End Frame: skipped — ${!job.address ? "no address available" : "no frames to build a card from"}.`);
+    }
+
     const outputs = await assembleVideo({
       clipPaths,
       musicPath,
       narrationSegments,
       formats: job.formats || ["16x9", "9x16"],
       workDir,
+      closingCard,
     });
     console.log(`[${job.jobId}] Assembled ${Object.keys(outputs).length} formats.`);
 
