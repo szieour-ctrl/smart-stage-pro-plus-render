@@ -241,19 +241,62 @@ function enforceWordCeiling(text, maxWords) {
   const words = text.trim().split(/\s+/).filter(Boolean);
   if (words.length <= maxWords) return text.trim();
 
-  let trimmed = words.slice(0, maxWords).join(" ");
-  const lastPunctIdx = Math.max(trimmed.lastIndexOf("."), trimmed.lastIndexOf("!"), trimmed.lastIndexOf("?"));
-  if (lastPunctIdx > trimmed.length * 0.5) {
-    return trimmed.slice(0, lastPunctIdx + 1);
+  // NEW (this session — Sam's explicit direction after a real render: "31
+  // words is definitely 2 clips [worth of content] — Claude needs to
+  // attempt reframing before chopping at a '.' or ','. The other option
+  // is [fast-pace]."). Before EVER cutting content, try keeping the
+  // WHOLE script — tagged for brisker delivery — as long as it's only
+  // modestly over budget. A multi-photo group that wrote a genuinely
+  // fuller two-sentence script (one clip's worth each) losing the entire
+  // second sentence to a mechanical trim is a worse outcome than both
+  // surviving at a slightly quicker pace. Same caveat as the CTA's tag:
+  // this is a directorial suggestion to Eleven v3, not a guaranteed
+  // speedup — the [narration wpm] log below shows whether it's actually
+  // landing faster on the real voice; if it isn't, this multiplier should
+  // come back down rather than staying at 1.35x.
+  if (words.length <= Math.floor(maxWords * PACE_TAG_BUDGET_MULTIPLIER)) {
+    console.log(`[narration] Segment (${words.length} words) exceeds its ${maxWords}-word budget but fits within the ${PACE_TAG_BUDGET_MULTIPLIER}x pace-tag allowance — tagging ${SEGMENT_PACE_TAG} instead of trimming content.`);
+    return `${SEGMENT_PACE_TAG} ${text.trim()}`;
   }
-  // No sentence-ending punctuation within budget (the common case — most
-  // segments are a single sentence per the prompt's own instruction).
+
+  let trimmed = words.slice(0, maxWords).join(" ");
+
+  // FIX (this session — real render: "At the far end." played as its own
+  // segment, a grammatically complete-LOOKING but semantically empty
+  // fragment — a dependent clause punctuated like a full sentence). OLD
+  // behavior only used a real sentence-ending period if it fell past the
+  // halfway point of the trimmed slice — meaning a short-but-COMPLETE
+  // first sentence lost out to a comma-boundary cut of a second,
+  // INCOMPLETE sentence, exactly backwards. A genuinely complete sentence
+  // shorter than the target is a fine outcome (this codebase's own
+  // established philosophy: a short segment is just a beat of natural
+  // silence, not a defect) and should always be preferred over a
+  // fragment dressed up with a trailing period. Now gated on real content
+  // surviving (MIN_SEGMENT_WORDS), not on where the period happens to
+  // fall.
+  const lastPunctIdx = Math.max(trimmed.lastIndexOf("."), trimmed.lastIndexOf("!"), trimmed.lastIndexOf("?"));
+  if (lastPunctIdx > -1) {
+    const periodCut = trimmed.slice(0, lastPunctIdx + 1);
+    if (periodCut.split(/\s+/).filter(Boolean).length >= MIN_SEGMENT_WORDS) {
+      return periodCut;
+    }
+  }
+  // No usable sentence-ending punctuation within budget (either none
+  // exists, or the only one found was too short to be a real sentence).
   // Back up to the last comma instead, so the cut lands on a natural
-  // pause rather than mid-phrase — still an incomplete sentence, but a
-  // comma-boundary trim reads as a deliberate pause, not a stumble.
+  // pause rather than mid-phrase.
+  //
+  // FIX (this session) — require the same MIN_SEGMENT_WORDS floor here
+  // too, not just a minimum CHARACTER length. "At the far end," passed
+  // the old character-length check but is a dependent clause with no
+  // verb of its own; stripTrailingStopwords then adds a period, turning
+  // it into a sentence-shaped non-sequitur. Below the word floor, fall
+  // through to the raw cutoff instead of accepting a short, plausible-
+  // looking-but-empty phrase.
   const lastCommaIdx = trimmed.lastIndexOf(",");
   if (lastCommaIdx > trimmed.length * 0.4) {
-    return stripTrailingStopwords(trimmed.slice(0, lastCommaIdx));
+    const clean = stripTrailingStopwords(trimmed.slice(0, lastCommaIdx));
+    if (clean.split(/\s+/).filter(Boolean).length >= MIN_SEGMENT_WORDS) return clean;
   }
   return stripTrailingStopwords(trimmed);
 }
@@ -292,6 +335,15 @@ function enforceWordCeiling(text, maxWords) {
 // separated bracket tags, both applied as a prefix to the line.
 const CLOSING_PACE_TAG = process.env.CLOSING_PACE_TAG || "[fast-paced] [confident]";
 const PACE_TAG_BUDGET_MULTIPLIER = 1.35;
+// NEW (this session — Sam's explicit direction: a 2-clip multi-photo
+// group that wrote a genuinely fuller script, only to have it collapse
+// to a fragment of itself via mechanical trimming, is a worse outcome
+// than a slightly brisker delivery that keeps both real observations.
+// Reuses the same pace-tag rescue already proven for the CTA, generalized
+// to ordinary segments — see enforceWordCeiling below. Separate env var
+// from CLOSING_PACE_TAG since room narration doesn't need "[confident]"
+// the way a sales CTA does.
+const SEGMENT_PACE_TAG = process.env.SEGMENT_PACE_TAG || "[fast-paced]";
 // Absolute last resort — used only when Claude's own CTA can't be
 // salvaged even with the pace tag AND has no clean trim boundary. A real,
 // generic CTA beats dead air every time; this is intentionally short so
@@ -649,7 +701,9 @@ function regenerateOverBudgetSegments(overBudget, apiKey) {
       `${i + 1}. (target ${o.maxWords} words max) Original: "${o.closing !== undefined ? `${o.text} [CLOSING:] ${o.closing}` : o.text}"`
     ).join("\n");
 
-    const promptText = `Each of these narration lines came in over its word budget and needs a tighter rewrite that keeps the same meaning, tone, and specific detail — just shorter. Preserve complete sentences; don't just chop words off the end yourself, actually rewrite more concisely.
+    const promptText = `Each of these narration lines came in over its word budget. Rewrite each one to fit — this is a HARD ceiling, not a target to approach: count your words before responding, and the rewrite must be AT OR UNDER the number given, no exceptions.
+
+Reframe the content to fit, don't just delete words from the end of what you already wrote — if the original covers two distinct observations (e.g. two different clips' worth of detail), keep both but say each one more economically; cutting one of them entirely is only acceptable if there is truly no way to fit both, even briefly, within the ceiling. Preserve complete sentences and the original meaning/tone/specific detail — just tighter.
 
 ${listText}
 
