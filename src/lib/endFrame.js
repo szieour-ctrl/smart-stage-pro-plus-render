@@ -97,14 +97,24 @@ function buildCtaPrompt(address) {
   const template = process.env.END_FRAME_CTA_TEMPLATE ||
     'Add clean, legible, professionally-kerned text overlay reading "{address}" and "Schedule Your Private Tour Today" near the bottom of the image, in a modern real estate marketing style. Do not alter the architecture, lighting, or existing content of the photo.';
   const street = (address || "").split(",")[0].trim();
-  return template.replace("{address}", street || "This Home");
+  return template.replace("{address}", street);
 }
 
 // ── submitFluxEdit — fal.subscribe() handles submit + poll + fetch
 // internally; no manual queue/status/response URL plumbing needed.
+//
+// FIX (this session — real 422 "Unprocessable Entity" from a live test):
+// flux-2-pro/edit's actual input schema takes the source image as
+// image_urls (a PLURAL array), not image_url (a singular string) — this
+// model supports up to 9 reference images per its multi-reference design,
+// so even a single-image edit still goes through the array field.
+// Confirmed against fal's own published API example for this exact model.
+// The original singular image_url key silently doesn't match any known
+// field, which is exactly what surfaces as a 422 rather than a clearer
+// "unknown parameter" message.
 async function submitFluxEdit(imageUrl, prompt) {
   const result = await fal.subscribe("fal-ai/flux-2-pro/edit", {
-    input: { image_url: imageUrl, prompt },
+    input: { image_urls: [imageUrl], prompt },
     logs: false,
   });
   const outUrl = result?.data?.images?.[0]?.url;
@@ -148,6 +158,17 @@ async function applyEndFrame({ frame, address, workDir, jobId }) {
   }
   if (!frame || !frame.localPath) {
     console.log(`[${jobId}] End Frame: skipped — no frame/localPath available to edit.`);
+    return frame;
+  }
+  // NEW (this session — real gap found via live test): a null/empty
+  // address used to fall through to a generic "This Home" placeholder
+  // baked into the actual closing frame. Now skips entirely instead —
+  // video-job.js was fixed to always fetch the real address (previously
+  // gated behind wantsNarration), so hitting this path now should be
+  // rare and worth knowing about via a clear log line, not a silently
+  // wrong result on a real customer's video.
+  if (!address) {
+    console.log(`[${jobId}] End Frame: skipped — no address available (this shouldn't happen after the video-job.js fix; check the calling job's address field).`);
     return frame;
   }
 
