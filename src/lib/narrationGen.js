@@ -266,6 +266,40 @@ function enforceWordCeiling(text, maxWords) {
 // "closing" first (the CTA is the more replaceable, boilerplate-ish half
 // — the room detail in "text" is the one real observation this segment
 // exists to make), then "text" only if closing alone can't absorb enough.
+// For the CTA/"closing" field specifically — asymmetric from
+// enforceWordCeiling on purpose. An ordinary room segment always needs
+// SOME narration (silence over a room reads as an error), so that
+// function always returns something even via a raw word-count fallback.
+// The closing line is different: it's a decorative payoff on top of the
+// address sentence right before it, which already stands alone as a
+// complete, correct way to end the video ("This is 5935 Quilter St." is
+// a fine sentence with or without a CTA after it). Real evidence: "This
+// one truly needs." — a raw fallback cutoff landing right after a verb
+// that needed an object — is a worse outcome than just not having a CTA
+// line at all. Only returns trimmed text when a genuinely clean boundary
+// (sentence-ending punctuation, or a comma with real content on both
+// sides) exists within budget; otherwise drops the line entirely.
+function enforceClosingWordCeiling(text, maxWords) {
+  if (!text) return text;
+  const words = text.trim().split(/\s+/).filter(Boolean);
+  if (words.length <= maxWords) return text.trim();
+
+  const trimmed = words.slice(0, maxWords).join(" ");
+  const lastPunctIdx = Math.max(trimmed.lastIndexOf("."), trimmed.lastIndexOf("!"), trimmed.lastIndexOf("?"));
+  if (lastPunctIdx > trimmed.length * 0.5) {
+    return trimmed.slice(0, lastPunctIdx + 1);
+  }
+  const lastCommaIdx = trimmed.lastIndexOf(",");
+  if (lastCommaIdx > trimmed.length * 0.4) {
+    const clean = stripTrailingStopwords(trimmed.slice(0, lastCommaIdx));
+    // Require a real amount of content survived the trim (not just "This
+    // home,") — otherwise this is barely better than the raw fallback.
+    if (clean.split(/\s+/).filter(Boolean).length >= 4) return clean;
+  }
+  console.log(`[narration] Closing/CTA line had no clean boundary within its ${maxWords}-word budget — dropping it rather than risk a broken fragment. The address sentence stands alone as the closing line for this render.`);
+  return "";
+}
+
 function enforceCombinedWordCeiling(text, closing, maxWords) {
   const textWords = (text || "").trim().split(/\s+/).filter(Boolean).length;
   const closingWords = (closing || "").trim().split(/\s+/).filter(Boolean).length;
@@ -274,9 +308,12 @@ function enforceCombinedWordCeiling(text, closing, maxWords) {
 
   const excess = total - maxWords;
   if (closingWords >= excess) {
-    return { text, closing: enforceWordCeiling(closing, closingWords - excess) };
+    return { text, closing: enforceClosingWordCeiling(closing, closingWords - excess) };
   }
   // Trimming closing to nothing still isn't enough — trim text too.
+  // (closing itself gets dropped here too, same reasoning as above — it
+  // was already the first thing sacrificed, no reason to keep a fragment
+  // of it once text also needs cutting.)
   return { text: enforceWordCeiling(text, Math.max(3, textWords - (excess - closingWords))), closing: "" };
 }
 
@@ -388,7 +425,7 @@ Rules:
 - Each group's word target is a HARD CEILING, not a suggestion. There is no correction step after this — whatever you write plays at natural pace in exactly the time given. Going even slightly over means the audio gets cut off mid-word, which sounds like a broken, amateur edit. When in doubt, write UNDER the target, never over it — a slightly short segment just means a beat of natural silence, which is fine; an over-budget one is a real, audible defect.
 - Vary how each segment opens. Do NOT start consecutive (or most) segments with the same phrase (e.g. "Here we have," "This room features") — that reads as a stutter when segments play back to back. Vary sentence structure across the whole script the way a real person naturally would, not a template being refilled per room.
 - THE OPENING GROUP IS DIFFERENT FROM AN ORDINARY GROUP: a video needs a strong opening. It must (1) give one real, grounded observation about the room or exterior actually shown — same as any other group — combined naturally with (2) a brief, warm welcome that references the property's general LOCATION (city, or street + city informally — e.g. "Welcome to Main Street in Roseville," or "This beautiful Roseville home..."). Keep it informal and brief — do NOT recite the complete formal address (street number, city, state, zip) as if reading a mailing label here; that full, precise address belongs only at the close (see below), not here.
-- THE FINAL GROUP HAS A DIFFERENT RESPONSE SHAPE FROM EVERY OTHER GROUP — instead of one "text" field, it needs TWO fields: {"index": N, "text": "...", "closing": "..."}. "text" = one real, grounded observation about the room/exterior actually shown, same as any ordinary group — a single detail, not a list. "closing" = a strong, original call to action inviting a showing. NEITHER field should mention the address, street name, city, state, or any part of the location — say NOTHING about where the property is in either field. The complete, exact address gets inserted automatically BETWEEN "text" and "closing" after you respond (a separate, fixed sentence you never see or write) — so the two fields you write will be read as: [your text] + [inserted address sentence] + [your closing], and need to flow naturally into that gap without referencing it directly. Combined word count for "text" + "closing" together must stay within this group's target above.
+- THE FINAL GROUP HAS A DIFFERENT RESPONSE SHAPE FROM EVERY OTHER GROUP — instead of one "text" field, it needs TWO fields: {"index": N, "text": "...", "closing": "..."}. The CLOSING is the priority for this segment — it's the payoff of the entire video, not an equal partner with the room description. "text" = a BRIEF room/exterior mention, a few words at most (e.g. "The covered patio glows at twilight" is already enough — do not give this the same one-full-sentence treatment an ordinary group gets). "closing" = a strong, original call to action inviting a showing, and it should get the MAJORITY of this segment's word budget, not whatever's left over after a full room description. NEITHER field should mention the address, street name, city, state, or any part of the location — say NOTHING about where the property is in either field. The complete, exact address gets inserted automatically BETWEEN "text" and "closing" after you respond (a separate, fixed sentence you never see or write) — so the two fields you write will be read as: [your text] + [inserted address sentence] + [your closing], and need to flow naturally into that gap without referencing it directly. Combined word count for "text" + "closing" together must stay within this group's target above — and if anything has to give to make that fit, it should be "text" getting shorter, never "closing."
 - For the CTA ("closing" field) specifically: do NOT write the literal phrase "schedule your private showing" (or close variants like "schedule your private tour/viewing") — that exact instruction already appears as on-screen text on the closing card that follows this segment, so saying it verbatim here is pure repetition. Write something that earns the invitation instead — a genuine, warm reason to come see it in person, in your own words, not the boilerplate line the viewer is about to read anyway.
 - If the FINAL group's image looks like a branded closing card rather than an ordinary room/exterior photo — visible overlaid text (an address, a tagline), a darkened or gradient-scrimmed background rather than a naturally-lit room — do NOT describe it as if it were a normal room in the "text" field, and do NOT read the on-screen text aloud verbatim like you're narrating a sign. Instead, "text" can be a brief, natural transition line (no address, no room description) and "closing" the original CTA — the inserted address sentence between them still applies exactly the same way.
 - Return ONLY a JSON array, nothing else — no markdown fences, no prose before or after. Every entry except the final group uses {"index": N, "text": "..."}; the final group entry uses {"index": N, "text": "...", "closing": "..."} as described above. Exactly ${segments.length} entries, one per group, in the order shown.`;
