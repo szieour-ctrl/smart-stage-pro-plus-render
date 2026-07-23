@@ -92,21 +92,38 @@ async function uploadFrameToCloudinary(localPath) {
 // ── buildCtaPrompt — full address (street + city/state), unlike the
 // narration CTA which deliberately drops city/state for spoken-audio
 // reasons (awkward to hear read aloud). That rule doesn't apply here —
-// this is TEXT ON AN IMAGE, meant to be read, not heard, and Sam's
-// reference design (End_Frame.jpg, this session) shows the full address.
-// Template is an env var so Sam can tune the exact copy/styling without
-// a code deploy.
+// this is TEXT ON AN IMAGE, meant to be read, not heard.
 //
-// REVISED (this session — real test result was "really generic," missing
-// the CTA line entirely): the original one-line prompt ("add text near
-// the bottom") was too vague for Flux to reproduce a specific design.
-// This version explicitly describes the two-line layout, gradient scrim,
-// weight, and position from Sam's reference image, rather than leaving
-// the treatment up to the model's own judgment.
+// REVISED (this session, second pass) — Sam ran a hand-written prompt
+// directly in the fal.ai playground and confirmed it reliably produces
+// both the address AND the CTA line, with the gradient/typography look
+// he wants. That confirmed-working prompt is now the default template
+// below, verbatim in structure, just parameterized for {address} and
+// {cta}. The earlier "two lines, first line/second line" phrasing this
+// replaces was dropping the CTA line in testing — this version's much
+// more explicit gradient-opacity math and typography description is
+// almost certainly why it holds up where the shorter version didn't.
+//
+// END_FRAME_CTA_TEMPLATE and END_FRAME_CTA_TEXT remain env vars so Sam
+// can tune either the full prompt or just the CTA copy without a deploy.
 function buildCtaPrompt(address) {
+  const ctaText = process.env.END_FRAME_CTA_TEXT || "Schedule Your Private Showing";
   const template = process.env.END_FRAME_CTA_TEMPLATE ||
-    'Add a dark semi-transparent gradient overlay across the bottom third of the image, fading from transparent to dark at the very bottom edge. Over that gradient, add two lines of bold white sans-serif text, left-aligned with consistent left margin: the first line, larger and bolder, reads "{address}"; the second line, directly below it and slightly smaller, reads "Schedule Your Private Tour Today". Keep both lines legible, clean, professionally kerned, and positioned in the bottom-left area of the frame. Do not alter the architecture, lighting, sky, or any other content of the photo.';
-  return template.replace("{address}", address || "This Home");
+    'Enhance this real-estate exterior photo with a professional marketing overlay. ' +
+    'Preserve all architectural details, lighting, and landscaping exactly as captured. ' +
+    'Do not modify the home\u2019s structure, colors, or sky. ' +
+    'Add a soft dark gradient across the lower third of the image, fading upward ' +
+    'from roughly 80% opacity at the bottom to 0% at mid-frame. ' +
+    'Keep the gradient smooth and cinematic, ensuring natural light remains visible. ' +
+    'Overlay clean, modern sans-serif text centered within the gradient area: ' +
+    'Line 1: "{address}" \u2014 bold, white, crisp edges, balanced spacing. ' +
+    'Line 2: "{cta}" \u2014 regular weight, white, slightly smaller, ' +
+    'with refined letter spacing for a premium look. ' +
+    'Typography should appear professional and contemporary, evoking high-end ' +
+    'real-estate branding. Avoid decorative or serif styles. ' +
+    'Maintain full-frame composition and natural color grading. ' +
+    'Apply subtle warmth and contrast for a polished, inviting finish.';
+  return template.replace("{address}", address || "This Home").replace("{cta}", ctaText);
 }
 
 // ── submitFluxEdit — fal.subscribe() handles submit + poll + fetch
