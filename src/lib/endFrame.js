@@ -158,6 +158,22 @@ function renderTextOverlayPng(address, ctaText, workDir) {
 // everywhere outside the gradient band. No model in the loop, so there is
 // nothing left that can misspell, duplicate, or shift the text — it's
 // exactly the PNG renderTextOverlayPng() produced, every time.
+//
+// FIX (this session — real render: text appeared tiny, badly placed, and
+// flickered during playback). Root cause: the overlay PNG is rendered at
+// a fixed 1920x1080 canvas, but the source photo downloadFrames.js pulls
+// down is at its NATIVE resolution — often much larger (Sam's own test
+// image earlier this session was 6000x3996). The old overlay call
+// composited at fixed pixel coordinates 0:0 with no scaling step at all,
+// so on a 6000px-wide photo the 1920px overlay only covered a small
+// corner of the frame — "small" and "bad location" are the same bug.
+// Thin text rendered at that tiny a fraction of the real frame size is
+// also exactly the kind of fine, high-frequency detail that shimmers
+// under video compression, which explains the flicker too — almost
+// certainly one root cause producing all three symptoms, not three
+// separate bugs. Fixed with ffmpeg's scale2ref filter, which scales the
+// overlay to match the SECOND input's real dimensions in one step — no
+// separate ffprobe call needed to learn the photo's size first.
 function compositeOverlayOntoPhoto(photoPath, overlayPath, workDir) {
   return new Promise((resolve, reject) => {
     const outputPath = path.join(workDir, `end-frame-${Date.now()}.jpg`);
@@ -167,7 +183,13 @@ function compositeOverlayOntoPhoto(photoPath, overlayPath, workDir) {
     const command = ffmpeg()
       .input(photoPath)
       .input(overlayPath)
-      .complexFilter([`[0:v][1:v]overlay=0:0[outv]`]);
+      .complexFilter([
+        // scale2ref: input [1:v] (overlay) scaled to match [0:v]'s (photo)
+        // real width/height, output labeled [ovl] — the photo itself
+        // passes through unchanged as [ref].
+        `[1:v][0:v]scale2ref=w=iw:h=ih[ovl][ref]`,
+        `[ref][ovl]overlay=0:0[outv]`,
+      ]);
 
     const timeoutHandle = setTimeout(() => {
       if (settled) return;
