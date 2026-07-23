@@ -1,0 +1,164 @@
+// lib/endFrame.js — Railway
+//
+// PRO Plus "End Frame": replaces the LAST frame in a render with an
+// AI-edited version (fal-ai/flux-2-pro/edit) that bakes the property's
+// street address + a CTA line directly into the closing shot, so the
+// final clip does double duty as a title-card without needing a separate
+// ffmpeg overlay pass.
+//
+// REVISED (this session) — original draft hand-rolled a signed Cloudinary
+// multipart upload and a raw fal queue-submit/poll loop. package.json
+// already lists "cloudinary": "^2.3.0" and "@fal-ai/client": "^1.2.0" as
+// dependencies, so this version uses those SDKs directly instead —
+// simpler, less surface area for a signing bug, and fal.subscribe()
+// already does the submit/poll/fetch cycle internally. No new npm
+// dependency needed for this file.
+//
+// ── WHY THIS LIVES HERE, NOT AS A NETLIFY BACKGROUND FUNCTION ──────────
+// autoSelect (see autoSelect-background.js / check-autoSelect.js) needed
+// the dispatch/poll split because it runs at PLAN time, before a job
+// exists, from a synchronous Netlify function with a hard 26s ceiling.
+// End Frame runs DURING the actual render, on Railway, which already has
+// no such ceiling and already makes long-running calls in-process (Kling,
+// LTX, ElevenLabs, Claude Vision) — so this is just one more step in
+// processRenderJob, not a second job type. No Netlify or netlify.toml
+// changes are needed for this feature at all.
+//
+// ── FEATURE FLAG — KILL SWITCH ──────────────────────────────────────────
+// Set END_FRAME_ENABLED=false (or leave unset) in Railway's environment
+// to disable this instantly — no code change or redeploy needed, just an
+// env var flip + restart. Defaults OFF until Sam confirms it's ready to
+// leave on for real jobs. When off, applyEndFrame() is a pure no-op that
+// returns the original frame unchanged.
+//
+// ── BILLING ──────────────────────────────────────────────────────────
+// Deliberately NOT metered. No Image/video quota debit, no
+// narration_attempts-style audit row, nothing shown in the UI as a line
+// item. Cost is real (~$0.03-0.05/video at typical listing-photo
+// resolution via fal-ai/flux-2-pro/edit's per-megapixel pricing) but
+// small enough that Sam is absorbing it as a silent quality upgrade
+// rather than adding pricing-page complexity. If this changes later, the
+// hook point is here: this function would need to return a cost figure
+// for video-job.js to charge at download time, same pattern as Ken
+// Burns' flat 1-Image charge.
+//
+// ── FAILURE HANDLING ─────────────────────────────────────────────────
+// Any failure at any step (Cloudinary upload, fal call, download) falls
+// back to the ORIGINAL frame, untouched — the render always completes
+// with the plain closing shot rather than failing the whole job. Same
+// "fail loud, not fail hard" principle already used for Kling/LTX
+// fallbacks in renderPipeline.js.
+//
+// ── REQUIRES ─────────────────────────────────────────────────────────
+// - Railway env vars: CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY,
+//   CLOUDINARY_API_SECRET (already used elsewhere in this codebase),
+//   FAL_KEY (already confirmed present), END_FRAME_ENABLED (new — kill
+//   switch, add when ready to test).
+// - No new npm dependencies — cloudinary and @fal-ai/client are already
+//   in package.json.
+
+const fs = require("fs");
+const path = require("path");
+const axios = require("axios");
+const cloudinary = require("cloudinary").v2;
+const { fal } = require("@fal-ai/client");
+
+// Idempotent — safe to call even if another module (lib/cloudinaryUpload.js)
+// already configured cloudinary elsewhere in this process.
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key:    process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
+
+fal.config({ credentials: process.env.FAL_KEY });
+
+function isEndFrameEnabled() {
+  return String(process.env.END_FRAME_ENABLED || "").toLowerCase() === "true";
+}
+
+// ── uploadFrameToCloudinary — returns a public secure_url Flux can fetch.
+async function uploadFrameToCloudinary(localPath) {
+  const result = await cloudinary.uploader.upload(localPath, {
+    folder: "end-frame-source",
+    resource_type: "image",
+  });
+  if (!result || !result.secure_url) {
+    throw new Error("End Frame: Cloudinary upload did not return secure_url");
+  }
+  return result.secure_url;
+}
+
+// ── buildCtaPrompt — street address only, no city/state, per Sam's
+// existing narration CTA rule (kept consistent so the visual and audio
+// closing line never contradict each other). Template is an env var so
+// Sam can tune the exact copy without a code deploy.
+function buildCtaPrompt(address) {
+  const template = process.env.END_FRAME_CTA_TEMPLATE ||
+    'Add clean, legible, professionally-kerned text overlay reading "{address}" and "Schedule Your Private Tour Today" near the bottom of the image, in a modern real estate marketing style. Do not alter the architecture, lighting, or existing content of the photo.';
+  const street = (address || "").split(",")[0].trim();
+  return template.replace("{address}", street || "This Home");
+}
+
+// ── submitFluxEdit — fal.subscribe() handles submit + poll + fetch
+// internally; no manual queue/status/response URL plumbing needed.
+async function submitFluxEdit(imageUrl, prompt) {
+  const result = await fal.subscribe("fal-ai/flux-2-pro/edit", {
+    input: { image_url: imageUrl, prompt },
+    logs: false,
+  });
+  const outUrl = result?.data?.images?.[0]?.url;
+  if (!outUrl) {
+    throw new Error(`End Frame: fal edit returned no image URL (${JSON.stringify(result?.data)})`);
+  }
+  return outUrl;
+}
+
+function downloadToFile(url, destPath) {
+  return axios.get(url, { responseType: "stream", timeout: 30000 }).then(
+    (res) =>
+      new Promise((resolve, reject) => {
+        const writer = fs.createWriteStream(destPath);
+        res.data.pipe(writer);
+        writer.on("finish", resolve);
+        writer.on("error", reject);
+      })
+  );
+}
+
+// ── applyEndFrame — the only export most callers need.
+// frame: one entry from localFrames (must have .localPath — the file
+//        downloadFrames.js already pulled to disk).
+// address: job.address (already fetched by video-job.js when narration
+//        is on — same field, reused here; End Frame can run independently
+//        of narration, so pass whatever address is available, may be null).
+// workDir: the job's temp working directory (edited file is written here
+//        so it gets cleaned up by processRenderJob's existing finally
+//        block — no separate cleanup needed).
+// jobId: for logging only.
+//
+// Returns a frame object — either the original (flag off, missing data,
+// or any failure) or a shallow copy with .localPath repointed at the
+// Flux-edited image and .endFrameApplied: true (informational, not read
+// by billing since this is unmetered).
+async function applyEndFrame({ frame, address, workDir, jobId }) {
+  if (!isEndFrameEnabled()) return frame;
+  if (!frame || !frame.localPath) return frame;
+
+  try {
+    const sourceUrl = await uploadFrameToCloudinary(frame.localPath);
+    const prompt = buildCtaPrompt(address);
+    const editedUrl = await submitFluxEdit(sourceUrl, prompt);
+
+    const editedLocalPath = path.join(workDir, `end-frame-${Date.now()}.jpg`);
+    await downloadToFile(editedUrl, editedLocalPath);
+
+    console.log(`[${jobId}] End Frame applied — closing frame replaced with Flux-edited version.`);
+    return { ...frame, localPath: editedLocalPath, endFrameApplied: true };
+  } catch (err) {
+    console.error(`[${jobId}] End Frame failed (non-fatal — falling back to plain closing frame): ${err.message}`);
+    return frame;
+  }
+}
+
+module.exports = { applyEndFrame, isEndFrameEnabled };
