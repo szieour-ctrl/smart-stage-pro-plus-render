@@ -12,12 +12,65 @@ const express = require("express");
 const os = require("os");
 const path = require("path");
 const fs = require("fs");
+const crypto = require("crypto");
 const { processRenderJob } = require("./renderPipeline");
-const { processCorrectBatch } = require("./lib/correctPipeline");
+const { processCorrectBatch, correctOneImage } = require("./lib/correctPipeline");
 const { generateLtxContinuationClip } = require("./lib/ltxMotion");
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
+// Smart Correct's per-image upload route needs a bigger body limit than
+// every other route on this server — a single high-res iPhone photo's
+// base64 can run 15-30MB+. Scoped to just this one path rather than
+// raising the global 10mb limit for every route, most of which never
+// need it.
+app.use("/correct-image", express.json({ limit: "50mb" }));
+
+// ── SMART CORRECT DIRECT-UPLOAD TOKEN ───────────────────────────────────
+// FIX (this session — real bug: Smart Correct batches with typical iPhone
+// photos were failing with a generic "Failed to start batch correction"
+// error). Root cause: the old flow sent every photo in a batch as raw
+// base64 in ONE request to a Netlify Function — which, being a regular
+// (non-background) Netlify Function, is hard-capped by AWS Lambda at 6MB
+// per request (Netlify's platform, not something raiseable). Base64
+// overhead + a batch of a few full-res iPhone photos crosses that easily;
+// the failure surfaced as an unhelpful generic message because the
+// rejected response often isn't valid JSON, and the frontend's catch
+// block silently swallowed that parse failure.
+//
+// Fix: images no longer route through the Netlify Function's body at
+// all. The browser uploads each photo AS ITS OWN separate request,
+// directly to Railway (this server has no Lambda-style payload ceiling —
+// just the express.json limit set above). Netlify's dispatch function
+// now only mints a short-lived, single-use-per-batch token instead of
+// relaying any image bytes — see smart-correct-batch-dispatch.js.
+//
+// Explicitly NOT reusing RAILWAY_SECRET directly in the browser — that
+// secret must stay server-side only, or any real user could hit this
+// endpoint directly with a fabricated batchId. Instead this is a
+// stateless HMAC: Netlify signs `${batchId}:${expiresAt}` with
+// RAILWAY_SECRET (which both sides already share — see requireSecret
+// below), and Railway verifies the same computation. No token store,
+// no database, no extra round-trip to mint or look anything up —
+// verification is just recomputing one hash.
+const SMART_CORRECT_TOKEN_TTL_MS = 15 * 60 * 1000; // 15 minutes — generous for a real upload batch, short enough that a leaked/logged token isn't useful for long
+
+function verifySmartCorrectToken(batchId, expiresAt, token) {
+  if (!batchId || !expiresAt || !token) return false;
+  const expiresAtNum = Number(expiresAt);
+  if (!Number.isFinite(expiresAtNum) || Date.now() > expiresAtNum) return false;
+  const expected = crypto
+    .createHmac("sha256", process.env.RAILWAY_SECRET || "")
+    .update(`${batchId}:${expiresAtNum}`)
+    .digest("hex");
+  // Constant-time comparison — this is a real auth check, not just an
+  // internal sanity check, so it shouldn't leak timing information about
+  // how many leading characters matched.
+  const expectedBuf = Buffer.from(expected);
+  const providedBuf = Buffer.from(String(token));
+  if (expectedBuf.length !== providedBuf.length) return false;
+  return crypto.timingSafeEqual(expectedBuf, providedBuf);
+}
 
 const PORT = process.env.PORT || 3000;
 
@@ -140,12 +193,14 @@ app.post("/render", requireSecret, async (req, res) => {
     });
 });
 
-// ── SMART CORRECT BATCH ENDPOINT ──────────────────────────────────────────
+// ── SMART CORRECT BATCH ENDPOINT (SUPERSEDED for the browser-facing flow
+// — see /correct-image below) ─────────────────────────────────────────
 // Smart Connect™ — Module 1/2 deterministic image correction.
-// Same shape as /render: acknowledge fast (202), process in the background,
-// report the result via a webhook (SMART_CORRECT_WEBHOOK_URL, separate
-// from the video webhook so results never collide with jobId-shaped
-// video payloads on the Netlify side).
+// Kept in place (not deleted) in case anything else still calls it
+// server-to-server, but index.html's runSmartCorrectBatch() no longer
+// uses this route as of this session — see the fix note on
+// verifySmartCorrectToken above for why. New browser-facing traffic goes
+// to POST /correct-image instead, one photo per request.
 
 app.post("/correct-batch", requireSecret, async (req, res) => {
   const job = req.body;
@@ -168,6 +223,68 @@ app.post("/correct-batch", requireSecret, async (req, res) => {
     .finally(() => {
       activeJobs.delete(job.batchId);
     });
+});
+
+// ── SMART CORRECT — PER-IMAGE DIRECT UPLOAD (this session) ─────────────
+// Replaces the old combined-batch-in-one-request flow. The browser calls
+// this once per photo, in parallel across the whole batch — see the fix
+// note on verifySmartCorrectToken above for the full "why". Auth is the
+// short-lived HMAC token minted by Netlify's smart-correct-batch-dispatch,
+// NOT the permanent x-railway-secret (that must never reach the browser).
+//
+// Deliberately SYNCHRONOUS — unlike /render and /correct-batch, which
+// ack fast and report results later via webhook, this processes the one
+// image and returns its real result directly in the response. A single
+// image's OpenCV correction is fast enough (seconds, not the minutes a
+// video render takes) that there's no need for the extra job-store/
+// webhook/poll machinery /correct-batch used — the browser's own
+// Promise.allSettled across N parallel requests to this route IS the
+// "batch", with no server-side batch bookkeeping required at all.
+//
+// CORS: this is the first route on this server ever called directly
+// from a browser rather than server-to-server (Netlify → Railway) — the
+// video and old batch-correct routes never needed it. Scoped to just
+// this path, restricted to the real production origin (configurable via
+// SMART_CORRECT_ALLOWED_ORIGIN so preview/staging domains can be added
+// without a code change).
+const SMART_CORRECT_ALLOWED_ORIGIN = process.env.SMART_CORRECT_ALLOWED_ORIGIN || "https://smartstagepro.com";
+app.use("/correct-image", (req, res, next) => {
+  res.header("Access-Control-Allow-Origin", SMART_CORRECT_ALLOWED_ORIGIN);
+  res.header("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
+app.post("/correct-image", async (req, res) => {
+  const { batchId, expiresAt, token, id, imageBase64, mimeType } = req.body || {};
+
+  if (!verifySmartCorrectToken(batchId, expiresAt, token)) {
+    return res.status(401).json({ error: "Invalid or expired upload token" });
+  }
+  if (!id || !imageBase64) {
+    return res.status(400).json({ error: "Missing id or imageBase64" });
+  }
+
+  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), `smart-correct-${batchId}-`));
+  try {
+    const result = await correctOneImage({ id, imageBase64, mimeType }, workDir);
+    // correctOneImage never rejects (resolves with status:"error" on
+    // per-image failure) — so this always returns 200 with the real
+    // outcome in the body, never a 500 for a normal correction failure.
+    // The route itself only 4xx/5xxs for auth/request-shape problems.
+    res.json(result);
+  } catch (err) {
+    // Should be unreachable given correctOneImage's own contract, but
+    // fail loud rather than hang the request if something upstream
+    // (workDir creation, etc.) throws unexpectedly.
+    console.error(`[correct-image] ${batchId}/${id}: unexpected error: ${err.message}`);
+    res.status(500).json({ id, status: "error", error: err.message });
+  } finally {
+    fs.rm(workDir, { recursive: true, force: true }, (err) => {
+      if (err) console.error(`Cleanup failed for ${workDir}:`, err.message);
+    });
+  }
 });
 
 // ── TEMPORARY DIAGNOSTIC — TEST LTX ─────────────────────────────────────
