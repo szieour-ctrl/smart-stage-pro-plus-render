@@ -154,4 +154,4 @@ async function processCorrectBatch(job) {
   }
 }
 
-module.exports = { processCorrectBatch };
+module.exports = { processCorrectBatch, correctOneImage };
