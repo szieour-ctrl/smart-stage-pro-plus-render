@@ -104,6 +104,15 @@ async function downloadFrames(frames, workDir) {
       // NEW (July 14, 2026 — footage-grounded narration) — real display
       // name, not the small backend-coded vocabulary roomType uses.
       roomLabel: frame.roomLabel || null,
+      // NEW (Hero Shot B-Roll tagging) — ground truth from Smart Stage PRO
+      // (room.roomName at Generate Final time), carried through video_job_
+      // frames. narrationGen.js's wordBudgetForSegment needs isHeroShot to
+      // apply the tighter 5-7 word standalone ceiling instead of the normal
+      // duration-scaled budget. Named explicitly here on purpose — see this
+      // file's own history of fields silently dropped for exactly that
+      // reason (klingMotionPreset, addContinuationMotion, etc. above).
+      isHeroShot: !!frame.isHeroShot,
+      parentRoomLabel: frame.parentRoomLabel || null,
       motionPreset: frame.motionPreset || "auto",
       // FIX (July 2026): klingMotionPreset was never in this file's returned
       // object at all — same bug class as the continuation-motion fields
