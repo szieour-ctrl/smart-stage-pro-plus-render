@@ -41,6 +41,16 @@ const { probeDuration, NARRATION_END_BUFFER_SECONDS } = require("./assemble");
 // pessimistic floor that was manufacturing multi-second gaps.
 const SPEAKING_RATE_WORDS_PER_MINUTE = 130;
 const MIN_SEGMENT_WORDS = 6; // even a 3-second bathroom shot gets a real sentence, not one word
+// NEW (Hero Shot B-Roll tagging) — a standalone hero shot segment (no
+// parent room frame in this batch to merge into — see autoSelect.js's
+// applyHeroShotGrouping) is a short detail cutaway, not a room. The normal
+// duration-scaled wordBudgetForSegment() would hand it ~9 words at its 4s
+// clip length, and MIN_SEGMENT_WORDS's floor of 6 doesn't tighten that
+// down either — neither lands in Sam's 5-7 word spec, so this is a
+// separate, explicit range for this one case rather than a tweak to the
+// general-purpose room budget.
+const HERO_SHOT_MIN_WORDS = 5;
+const HERO_SHOT_MAX_WORDS = 7;
 // MIN_SPEED/MAX_SPEED removed (July 18, 2026) — were only ever used by
 // the now-removed speed-correction call, confirmed permanently inert on
 // eleven_v3. generateSegmentAudio() below still accepts an optional
@@ -117,6 +127,14 @@ function groupContiguousByRoom(localFrames, framePaths, timeline) {
     const prior = groups[groups.length - 1];
     if (prior && prior.roomLabel === roomLabel) {
       prior.framePaths.push(framePaths[i]);
+      // NEW (Hero Shot B-Roll tagging) — AND across every frame that
+      // merges into this group. A hero shot merged with its parent room's
+      // own (non-hero) frame is no longer "standalone" — it's part of a
+      // real room segment and should use the normal duration-scaled
+      // budget below, not the tighter standalone ceiling. Only a group
+      // made ENTIRELY of hero-shot frames (no parent present in this
+      // batch — see autoSelect.js's applyHeroShotGrouping) stays flagged.
+      prior.isHeroShot = prior.isHeroShot && !!localFrames[i].isHeroShot;
       // Group duration = span from the group's own start to the end of
       // its own last clip (used for the word-budget prompt below). This
       // is deliberately NOT the same as availableWindow (computed later
@@ -131,6 +149,7 @@ function groupContiguousByRoom(localFrames, framePaths, timeline) {
         framePaths: [framePaths[i]],
         startTime: timeline[i].startTime,
         duration: timeline[i].duration,
+        isHeroShot: !!localFrames[i].isHeroShot,
       });
     }
   }
@@ -466,6 +485,15 @@ function generateSegmentedScript(address, segments, apiKey) {
     const CTA_SPEAKING_RATE_WORDS_PER_MINUTE = 115;
     const wordTargets = segments.map((s, i) => {
       const isFinal = i === segments.length - 1;
+      // NEW (Hero Shot B-Roll tagging) — a standalone hero-shot-only group
+      // (isHeroShot survives groupContiguousByRoom's AND-reduction only
+      // when no parent room frame merged in) gets the tight 5-7 word
+      // ceiling regardless of its actual clip duration, overriding the
+      // normal duration-scaled/final-segment logic below. A hero shot that
+      // DID merge into its parent's group never reaches this branch —
+      // isHeroShot is false on that group, so it's just normal room
+      // narration with more frames, no special treatment needed.
+      if (s.isHeroShot) return HERO_SHOT_MAX_WORDS;
       const rawWordTarget = isFinal
         ? Math.max(MIN_SEGMENT_WORDS, Math.round((s.availableWindow / 60) * CTA_SPEAKING_RATE_WORDS_PER_MINUTE))
         : wordBudgetForSegment(s.availableWindow);
@@ -479,7 +507,9 @@ function generateSegmentedScript(address, segments, apiKey) {
           : i === 0 ? " — THIS IS THE OPENING GROUP" : (i === segments.length - 1 ? " — THIS IS THE CLOSING GROUP" : "");
         const isFinal = i === segments.length - 1;
         const wordTarget = wordTargets[i];
-        const targetNote = isFinal
+        const targetNote = s.isHeroShot
+          ? `this is a short B-roll detail cutaway, not a full room — target ${HERO_SHOT_MIN_WORDS}-${HERO_SHOT_MAX_WORDS} words, one short phrase naming the specific feature shown, not a full room description`
+          : isFinal
           ? `target ${wordTarget} words max combined across "text" and "closing" (a separate fixed address sentence gets inserted between them afterward — already accounted for, don't write about it)`
           : `target ${wordTarget} words max`;
         const photoNote = s.framePaths.length > 1 ? ` — MULTI-PHOTO GROUP (${s.framePaths.length} angles of this same space) — this is a bigger target for a real reason, write two or three sentences covering different real aspects of it, not one terse line` : "";
