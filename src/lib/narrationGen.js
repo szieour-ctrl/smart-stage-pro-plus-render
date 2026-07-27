@@ -51,6 +51,30 @@ const MIN_SEGMENT_WORDS = 6; // even a 3-second bathroom shot gets a real senten
 // general-purpose room budget.
 const HERO_SHOT_MIN_WORDS = 5;
 const HERO_SHOT_MAX_WORDS = 7;
+
+// NEW (Sam's request — Kling CTA carve-out) — mirrors klingMotion.js's
+// KLING_MOTION_TEMPLATES keys for the day/twilight/timelapse family
+// exactly (the only Kling presets still reachable on exterior frames as of
+// July 18, 2026's scope restriction — see that file's header). These are
+// the ONLY case where a clip's real rendered duration is deterministic
+// and known in advance, independent of anything narrationGen.js computes:
+// renderPipeline.js pads the last clip by NARRATION_OUTRO_PADDING_SECONDS
+// (17s) on top of the exterior base (6s) = 23s requested, but
+// klingMotion.js's generateKlingClip() hard-clamps to Kling's own 3-15s
+// API ceiling — so the real clip is ALWAYS exactly 15s when this preset
+// lands on the last frame with narration on, never anything else. Word
+// budgets elsewhere in this file already end up correct regardless
+// (they're computed from probeDuration() on the real rendered file, after
+// the clamp already happened) — this constant exists so the PROMPT can
+// say so explicitly and deliberately ("describe the scene, land the CTA,
+// you have exactly 15s") instead of Claude inferring purpose from generic
+// budget math after the fact.
+const KLING_TIMELAPSE_PRESETS = new Set([
+  "day_to_twilight_timelapse",
+  "twilight_to_day_timelapse",
+  "twilight_night_day_timelapse",
+]);
+const KLING_CTA_CAPPED_DURATION_SECONDS = 15;
 // MIN_SPEED/MAX_SPEED removed (July 18, 2026) — were only ever used by
 // the now-removed speed-correction call, confirmed permanently inert on
 // eleven_v3. generateSegmentAudio() below still accepts an optional
@@ -168,6 +192,18 @@ function groupContiguousByRoom(localFrames, framePaths, timeline) {
   if (groups.length > 0) {
     const lastGroup = groups[groups.length - 1];
     lastGroup.duration = Math.max(1, lastGroup.duration - NARRATION_END_BUFFER_SECONDS);
+
+    // NEW (Sam's request — Kling CTA carve-out). Only meaningful on the
+    // true final group, since renderPipeline.js's outro padding (and
+    // therefore Kling's 15s clamp) only ever applies to the LAST frame in
+    // the whole video, never an earlier one — a Kling timelapse preset
+    // used mid-video would just get its ordinary unpadded duration, no
+    // cap in play, nothing to flag.
+    const veryLastFrame = localFrames[localFrames.length - 1];
+    lastGroup.isKlingCtaCapped = !!(
+      veryLastFrame &&
+      KLING_TIMELAPSE_PRESETS.has(veryLastFrame.klingMotionPreset)
+    );
   }
 
   // Cap representative frames per group — a 5-angle primary bedroom
@@ -507,7 +543,9 @@ function generateSegmentedScript(address, segments, apiKey) {
           : i === 0 ? " — THIS IS THE OPENING GROUP" : (i === segments.length - 1 ? " — THIS IS THE CLOSING GROUP" : "");
         const isFinal = i === segments.length - 1;
         const wordTarget = wordTargets[i];
-        const targetNote = s.isHeroShot
+        const targetNote = s.isKlingCtaCapped
+          ? `this is a Kling Time-Lapse closing clip — the rendered video is HARD-CAPPED at exactly ${KLING_CTA_CAPPED_DURATION_SECONDS}s regardless of anything else, no exceptions. Describe the exterior scene briefly and land the call-to-action within that fixed window — target ${wordTarget} words max combined across "text" and "closing" (address sentence inserted afterward, already accounted for, don't write about it). Don't write toward more room than this — it does not exist.`
+          : s.isHeroShot
           ? `this is a short B-roll detail cutaway, not a full room — target ${HERO_SHOT_MIN_WORDS}-${HERO_SHOT_MAX_WORDS} words, one short phrase naming the specific feature shown, not a full room description`
           : isFinal
           ? `target ${wordTarget} words max combined across "text" and "closing" (a separate fixed address sentence gets inserted between them afterward — already accounted for, don't write about it)`
