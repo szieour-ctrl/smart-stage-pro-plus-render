@@ -201,7 +201,7 @@ def decode_standard(source_path):
     return img
 
 
-def apply_gain_map(base_bgr_uint8, gain_map_gray_uint8, headroom, target_display_headroom=2.0):
+def apply_gain_map(base_bgr_uint8, gain_map_gray_uint8, headroom, target_display_headroom=None):
     """
     hdr_rgb = sdr_rgb * (1.0 + (headroom - 1.0) * gainmap)      [all linear-light]
 
@@ -211,15 +211,37 @@ def apply_gain_map(base_bgr_uint8, gain_map_gray_uint8, headroom, target_display
     a self-check in main()).
 
     The result is a genuine linear-light HDR image that can exceed 1.0 —
-    correct, but not directly viewable as an 8-bit JPEG. `target_display_headroom`
-    simulates a display that can only show `target_display_headroom`x the
-    SDR white point (typical of a decent modern monitor) and tonemaps down
-    to that — this is what makes recovered highlight detail actually
-    visible in the output JPEG instead of just clipping again. This
-    tonemap curve is a simple clip-and-normalize, deliberately NOT the
-    "conservative tonemap function" planned for production — good enough
-    to confirm recovery is happening, not a finished product.
+    correct, but not directly viewable as an 8-bit JPEG.
+
+    `target_display_headroom` sets the display ceiling for the tonemap
+    clip-and-normalize step below. Left as None (the default), it's set to
+    the photo's OWN decoded `headroom` automatically — not a fixed
+    constant. This is a fix for a real problem found across the 4 real
+    test photos on July 30, 2026: with a fixed target of 2.0, the light-
+    fixture photo (headroom 3.44, 48.6% of the frame elevated above SDR
+    white) lost everything between 2.0 and 3.44 to hard clipping — nearly
+    half the image. The backlit-window photo (27% affected) looked fine
+    under the same fixed target purely because less area happened to sit
+    above the clip point. That's not really two photos needing different
+    treatment — it's one bug: a fixed ceiling loses more information the
+    more of the frame sits above it. Setting the ceiling to the photo's
+    actual headroom means nothing gets clipped away regardless of how much
+    of the frame is elevated, which is why this fix didn't need a second
+    "how much of the frame is affected" branch at all — it falls out of
+    getting the ceiling right in the first place.
+
+    A manual override is still accepted (e.g. to force a lower ceiling and
+    compare) — pass a number instead of None.
+
+    This is still a simple clip-and-normalize curve, not a proper
+    photographic tonemap operator (Reinhard, filmic, etc.) — good enough
+    to confirm recovery is happening correctly across varied scenes, not
+    a finished production tonemap. That's a separate, later refinement if
+    the adaptive ceiling alone doesn't look right on more real photos.
     """
+    if target_display_headroom is None:
+        target_display_headroom = headroom
+
     h, w = base_bgr_uint8.shape[:2]
     gain_map_resized = cv2.resize(gain_map_gray_uint8, (w, h), interpolation=cv2.INTER_LINEAR)
 
@@ -239,9 +261,11 @@ def apply_gain_map(base_bgr_uint8, gain_map_gray_uint8, headroom, target_display
     stats = {
         "headroomUsed": headroom,
         "targetDisplayHeadroom": target_display_headroom,
+        "targetWasAutomatic": target_display_headroom == headroom,
         "hdrLinearMax": float(np.max(hdr_linear)),
         "hdrLinearMean": float(np.mean(hdr_linear)),
         "fractionAboveSDRWhite": float(np.mean(hdr_linear > 1.0)),
+        "fractionClippedAtCeiling": float(np.mean(hdr_linear > target_display_headroom)),
     }
     return recovered_uint8, stats
 
@@ -266,7 +290,7 @@ def main():
     parser = argparse.ArgumentParser(description="Standalone HDR gain-map inspect/decode test — not wired into any production pipeline.")
     parser.add_argument("--source", required=True)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--target-display-headroom", type=float, default=2.0)
+    parser.add_argument("--target-display-headroom", type=float, default=None, help="Manual override for the tonemap ceiling. Omit to auto-use the photo's own decoded headroom (default, recommended).")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
