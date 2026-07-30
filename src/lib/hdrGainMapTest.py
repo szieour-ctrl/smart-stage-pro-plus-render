@@ -166,6 +166,21 @@ def rec709_eotf(v):
 
 # ── CORE DECODE ──────────────────────────────────────────────────────────
 
+def looks_like_heic(source_path):
+    """Quick signature check — HEIC/HEIF files start with an ftyp box
+    whose brand indicates HEIC, independent of file extension (which
+    can't be trusted; upload paths sometimes mislabel extensions)."""
+    try:
+        with open(source_path, "rb") as f:
+            head = f.read(12)
+        if len(head) < 12:
+            return False
+        brand = head[8:12]
+        return brand in (b"heic", b"heix", b"hevc", b"hevx", b"mif1", b"msf1")
+    except Exception:
+        return False
+
+
 def decode_standard(source_path):
     """Exactly what production's smartCorrect.py does today: cv2.imread()
     reads only the flattened base image, silently discarding XMP/MPF/gain
@@ -173,7 +188,16 @@ def decode_standard(source_path):
     with what's actually shipping."""
     img = cv2.imread(source_path)
     if img is None:
-        raise ValueError(f"cv2.imread could not read: {source_path}")
+        if looks_like_heic(source_path):
+            raise ValueError(
+                "This is a genuine HEIC/HEIF file, and cv2.imread() cannot decode HEIC at all "
+                "in this environment (OpenCV's standard build has no HEIF codec). This is NOT "
+                "specific to this test script — production's smartCorrect.py uses the exact same "
+                "cv2.imread() call and would fail identically on this file. Real HEIC support needs "
+                "a HEIC-capable decoder added (e.g. pillow-heif) before any gain-map recovery work "
+                "can even begin for this format."
+            )
+        raise ValueError(f"cv2.imread could not read: {source_path} (not a recognized HEIC file either — check the actual file signature)")
     return img
 
 
