@@ -51,8 +51,14 @@ function runHdrTest(image, targetDisplayHeadroom) {
       HDR_TEST_PY,
       "--source", sourcePath,
       "--output-dir", outDir,
-      "--target-display-headroom", String(targetDisplayHeadroom || 2.0),
     ];
+    // Only pass this flag when the caller explicitly set a value — leaving
+    // it off lets hdrGainMapTest.py use its own scene-aware default (the
+    // photo's actual decoded headroom) instead of being silently forced
+    // back to a fixed number here.
+    if (targetDisplayHeadroom !== undefined && targetDisplayHeadroom !== null && targetDisplayHeadroom !== "") {
+      args.push("--target-display-headroom", String(targetDisplayHeadroom));
+    }
     let stdout = "";
     let stderr = "";
 
