@@ -69,6 +69,14 @@ def read_metadata(source_path):
         return {}
 
 
+def read_aux_metadata(aux_image_path):
+    """Same as read_metadata but for the extracted auxiliary (gain map)
+    image, which per real-world validation carries its OWN separate XMP
+    block with HDRGainMapVersion/HDRGainMapHeadroom — this is often where
+    that metadata actually lives, not in the top-level file at all."""
+    return read_metadata(aux_image_path)
+
+
 def find_headroom(meta):
     """Returns (headroom_float, source_string) or (None, reason_string).
     Priority order per Apple's own documented methods, most direct first."""
@@ -240,14 +248,16 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     report = {"source": args.source, "gainMapPresent": False, "warnings": []}
 
-    # ── 1. Metadata inspection ──
+    # ── 1. Metadata inspection — TOP-LEVEL file first ──
+    # This alone is often NOT enough: real-world validation (community
+    # extraction thread, cited in the module docstring) found that
+    # HDRGainMapVersion/HDRGainMapHeadroom frequently live inside the
+    # auxiliary gain-map image's OWN XMP block, not the top-level file's.
+    # So this is a first pass, not the final answer — step 2 below always
+    # runs regardless of what this finds.
     meta = read_metadata(args.source)
     has_version, version_val = has_gain_map_version(meta)
     headroom, headroom_source = find_headroom(meta)
-    report["hdrGainMapVersion"] = version_val
-    report["headroom"] = headroom
-    report["headroomSource"] = headroom_source
-    report["gainMapPresent"] = bool(has_version or headroom)
 
     # ── 2. Standard decode (reproduces production's cv2.imread exactly) ──
     standard_path = os.path.join(args.output_dir, "standard.jpg")
@@ -260,24 +270,49 @@ def main():
         print(json.dumps(report))
         sys.exit(1)
 
-    # ── 3. Attempt recovery, only if metadata says a gain map exists ──
-    if not report["gainMapPresent"]:
-        report["warnings"].append("No gain map metadata found — skipping recovery attempt. This file has no recoverable HDR data through this path.")
-        print(json.dumps(report, indent=2))
-        return
-
-    if headroom is None:
-        report["warnings"].append("Gain map version tag present but no headroom value found — cannot compute recovery without it.")
-        print(json.dumps(report, indent=2))
-        return
-
+    # ── 3. ALWAYS attempt gain-map image extraction, regardless of what
+    # step 1 found — this is the fix for the real bug this line of
+    # comments is replacing: bailing out here on a top-level metadata
+    # miss was wrong, because the metadata frequently isn't there to find
+    # until AFTER extraction. ──
     workdir = tempfile.mkdtemp(prefix="hdrtest-")
     try:
         gain_map_path, tag_used, extract_err = extract_gain_map_image_bytes(args.source, workdir)
         report["gainMapImageExtraction"] = {"tagUsed": tag_used, "error": extract_err}
 
+        if gain_map_path:
+            # Check the EXTRACTED image's own metadata — this is the
+            # primary source of truth per real-world validation, not a
+            # fallback. Overrides the top-level result when it finds
+            # something the top-level pass didn't.
+            aux_meta = read_aux_metadata(gain_map_path)
+            aux_has_version, aux_version_val = has_gain_map_version(aux_meta)
+            aux_headroom, aux_headroom_source = find_headroom(aux_meta)
+
+            if aux_has_version or aux_headroom:
+                has_version = has_version or aux_has_version
+                version_val = version_val or aux_version_val
+                headroom = aux_headroom if aux_headroom is not None else headroom
+                headroom_source = (f"{aux_headroom_source} (found in extracted auxiliary image, not top-level file)"
+                                    if aux_headroom is not None else headroom_source)
+
+        report["hdrGainMapVersion"] = version_val
+        report["headroom"] = headroom
+        report["headroomSource"] = headroom_source
+        report["gainMapPresent"] = bool(has_version or headroom or gain_map_path)
+
+        if not report["gainMapPresent"]:
+            report["warnings"].append("No gain map metadata found in either the top-level file or (extraction attempted but failed/empty) the auxiliary image. This file has no recoverable HDR data through this path.")
+            print(json.dumps(report, indent=2))
+            return
+
         if not gain_map_path:
             report["warnings"].append(f"Gain map metadata present but auxiliary image bytes could not be extracted via exiftool MPImage tags: {extract_err}")
+            print(json.dumps(report, indent=2))
+            return
+
+        if headroom is None:
+            report["warnings"].append("Gain map version tag and/or auxiliary image present but no headroom value found anywhere — cannot compute recovery without it.")
             print(json.dumps(report, indent=2))
             return
 
