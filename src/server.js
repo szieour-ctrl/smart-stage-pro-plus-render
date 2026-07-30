@@ -16,6 +16,7 @@ const crypto = require("crypto");
 const { processRenderJob } = require("./renderPipeline");
 const { processCorrectBatch, correctOneImage } = require("./lib/correctPipeline");
 const { generateLtxContinuationClip } = require("./lib/ltxMotion");
+const { runHdrTest } = require("./lib/hdrTestPipeline");
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
@@ -25,6 +26,9 @@ app.use(express.json({ limit: "10mb" }));
 // raising the global 10mb limit for every route, most of which never
 // need it.
 app.use("/correct-image", express.json({ limit: "50mb" }));
+// Same story for the HDR gain-map test route — real iPhone HDR JPEGs run
+// large, and this route exists specifically to test real photos.
+app.use("/hdr-gainmap-test", express.json({ limit: "50mb" }));
 
 // ── SMART CORRECT DIRECT-UPLOAD TOKEN ───────────────────────────────────
 // FIX (this session — real bug: Smart Correct batches with typical iPhone
@@ -348,6 +352,59 @@ app.get("/test-ltx", requireSecret, async (req, res) => {
     // needs to confirm the real API call works and hand back fal.ai's
     // own hosted URL, not keep a local copy on this container.
     fs.rm(workDir, { recursive: true, force: true }, () => {});
+  }
+});
+
+// ── TEMPORARY DIAGNOSTIC — HDR GAIN-MAP TEST TOOL ───────────────────────
+// Added (July 29, 2026), per the July 28 architecture review's agreed
+// first step: a standalone test tool, fully decoupled from production
+// Smart Correct — inspect-only pass reporting HDR presence/type per
+// file, then attempt decode and output recovered-vs-standard-decode
+// side by side. This route, hdrTestPipeline.js, and hdrGainMapTest.py
+// are the only files involved — none of them import from or are
+// imported by correctPipeline.js / smartCorrect.py. No MLS guard, no
+// Mertens, no brightness lift touched.
+//
+// Auth: same permanent x-railway-secret pattern as /test-ltx — this is
+// Sam's own diagnostic tool, not browser-facing production traffic, so
+// the short-lived HMAC token machinery /correct-image needs doesn't
+// apply here. A companion static HTML page posts to this route with the
+// secret pasted in by hand.
+//
+// Usage (POST, JSON body):
+//   { imageBase64, mimeType, targetDisplayHeadroom? }
+//   header: x-railway-secret: <RAILWAY_SECRET>
+//
+// Remove this route once the HDR decode investigation is done and either
+// folded into production or abandoned.
+//
+// CORS: permissive on purpose. Unlike /correct-image (locked to the real
+// production origin because it has no other auth on top of a short-lived
+// token), this route is gated by the permanent x-railway-secret — origin
+// restriction would add nothing here, and the companion test page may be
+// opened from a local file, a Netlify preview, anywhere. Never make this
+// pattern permissive on a route that lacks its own real auth.
+app.use("/hdr-gainmap-test", (req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type, x-railway-secret");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
+app.post("/hdr-gainmap-test", requireSecret, async (req, res) => {
+  const { imageBase64, mimeType, targetDisplayHeadroom } = req.body || {};
+
+  if (!imageBase64) {
+    return res.status(400).json({ error: "Missing imageBase64" });
+  }
+
+  try {
+    const result = await runHdrTest({ imageBase64, mimeType }, targetDisplayHeadroom);
+    res.json(result);
+  } catch (err) {
+    console.error("[hdr-gainmap-test] unexpected error:", err.message);
+    res.status(500).json({ status: "error", error: err.message });
   }
 });
 
