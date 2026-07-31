@@ -190,18 +190,28 @@ def exterior_daylight_correction(img, intensity=1.0):
     should get a small shadow lift and nothing resembling the interior
     MLS Bright target (median luma 178 is appropriate for a room, not
     for deliberately-shaded concrete in daylight). Mild gamma lift only,
-    capped low, with a pre-blur on the luma channel specifically to
-    avoid amplifying JPEG block noise into visible banding when lifting
-    a large flat shadow area — the failure mode flagged on IMG_8311."""
+    capped low.
+
+    NO PRE-BLUR (patch, pending validation): an earlier version of this
+    function pre-blurred shadow regions to guard against banding on flat
+    concrete. Confirmed directly on a real photo (IMG_8311) that this
+    created a visible light streak instead — a pool-fence mesh panel has
+    a fine diagonal lattice pattern, and shadow-weighted blur smooths
+    that unevenly (dark mesh lines protected less than the lighter gaps
+    between them), which reads as an accentuated streak following the
+    lattice. Measured directly: max localized luma spike in that region
+    dropped from +24 to +5 once the pre-blur was removed, while the
+    concrete's own banding metric moved only marginally (4.435 -> 4.663,
+    essentially noise around the original photo's own 4.581) — nowhere
+    near the 5.394 the old interior-pipeline bug produced. Tried a
+    texture-aware version that only pre-blurred genuinely flat regions;
+    it didn't discriminate reliably, since the concrete itself has enough
+    natural aggregate texture to trip the same threshold as the mesh.
+    Removed rather than ship unproven complexity."""
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
     l = lab[:, :, 0]
     before_median = float(np.median(l))
-
-    # Small pre-blur specifically on luma, shadow-weighted, to reduce
-    # banding risk before any lift — does not affect chroma/detail.
-    l_smoothed = cv2.GaussianBlur(l, (0, 0), sigmaX=1.5)
-    shadow_weight = np.clip((90.0 - l) / 90.0, 0, 1) * 0.5
-    l_pre = l * (1.0 - shadow_weight) + l_smoothed * shadow_weight
+    l_pre = l
 
     normalized = np.clip(l_pre / 255.0, 0, 1)
     gamma = 1.0 - (0.05 * intensity)  # deliberately mild — no 178 target here
