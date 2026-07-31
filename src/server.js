@@ -372,7 +372,7 @@ app.get("/test-ltx", requireSecret, async (req, res) => {
 // secret pasted in by hand.
 //
 // Usage (POST, JSON body):
-//   { imageBase64, mimeType, targetDisplayHeadroom? }
+//   { imageBase64, mimeType, targetDisplayHeadroom?, highlightReserve? }
 //   header: x-railway-secret: <RAILWAY_SECRET>
 //
 // Remove this route once the HDR decode investigation is done and either
@@ -393,14 +393,14 @@ app.use("/hdr-gainmap-test", (req, res, next) => {
 });
 
 app.post("/hdr-gainmap-test", requireSecret, async (req, res) => {
-  const { imageBase64, mimeType, targetDisplayHeadroom } = req.body || {};
+  const { imageBase64, mimeType, targetDisplayHeadroom, highlightReserve } = req.body || {};
 
   if (!imageBase64) {
     return res.status(400).json({ error: "Missing imageBase64" });
   }
 
   try {
-    const result = await runHdrTest({ imageBase64, mimeType }, targetDisplayHeadroom);
+    const result = await runHdrTest({ imageBase64, mimeType }, targetDisplayHeadroom, highlightReserve);
     res.json(result);
   } catch (err) {
     console.error("[hdr-gainmap-test] unexpected error:", err.message);
