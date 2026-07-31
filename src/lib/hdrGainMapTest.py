@@ -201,7 +201,7 @@ def decode_standard(source_path):
     return img
 
 
-def apply_gain_map(base_bgr_uint8, gain_map_gray_uint8, headroom, target_display_headroom=None, highlight_reserve=0.15):
+def apply_gain_map(base_bgr_uint8, gain_map_gray_uint8, headroom, target_display_headroom=None, highlight_reserve=0.30):
     """
     hdr_rgb = sdr_rgb * (1.0 + (headroom - 1.0) * gainmap)      [all linear-light]
 
@@ -334,7 +334,7 @@ def main():
     parser.add_argument("--source", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--target-display-headroom", type=float, default=None, help="Manual override for the tonemap ceiling. Omit to auto-use the photo's own decoded headroom (default, recommended).")
-    parser.add_argument("--highlight-reserve", type=float, default=0.15, help="Fraction of output range (0-1) reserved for compressed highlights. Higher = more local contrast preserved in bright/boosted areas (e.g. shirt wrinkles), at the cost of a lower overall ceiling for those areas. Lower = punchier ceiling, flatter highlight detail. Tune by eye.")
+    parser.add_argument("--highlight-reserve", type=float, default=0.30, help="Fraction of output range (0-1) reserved for compressed highlights. Default 0.30, updated July 30, 2026 after every real test photo (portraits and a real backyard/sliding-door shot) needed more than the original 0.15 default to avoid flattening local contrast in bright/boosted areas (shirt wrinkles, sunlit foliage, curtain fabric). Tune by eye if a specific photo still looks off.")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
