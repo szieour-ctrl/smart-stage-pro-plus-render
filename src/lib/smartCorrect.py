@@ -78,6 +78,14 @@ import sys
 import cv2
 import numpy as np
 
+from hdrRecover import recover_hdr_if_present, looks_like_heic
+
+# Kill switch, matching the existing END_FRAME_ENABLED pattern in this
+# codebase — lets HDR recovery be disabled instantly via Railway env var
+# without a redeploy, in case something unexpected shows up on real
+# customer photos this investigation's test set didn't cover.
+HDR_RECOVERY_ENABLED = os.environ.get("HDR_RECOVERY_ENABLED", "true").lower() not in ("false", "0", "")
+
 
 def clamp01(x):
     return float(np.clip(x, 0.0, 1.0))
@@ -711,10 +719,40 @@ def main():
     args = parser.parse_args()
     intensity = float(np.clip(args.intensity, 0.6, 1.25))
 
-    img = cv2.imread(args.source)
+    # ── HDR gain-map recovery (added July 30, 2026) ─────────────────────
+    # Attempts to recover real highlight detail from an embedded Apple
+    # HDR gain map before any other correction runs, so every downstream
+    # step (white balance, brightness lift, etc.) works from the actual
+    # recovered image instead of the flattened, gain-map-discarded one
+    # cv2.imread() alone would produce. Falls through to plain cv2.imread()
+    # unchanged for the vast majority of photos with no gain map present —
+    # zero behavior change for those. See hdrRecover.py for the full
+    # validation history (ceiling, color, and gamut fixes, each confirmed
+    # against real photos before this integration).
+    hdr_report = {"gainMapPresent": False, "recoveryApplied": False, "enabled": HDR_RECOVERY_ENABLED}
+    img = None
+    if HDR_RECOVERY_ENABLED:
+        img, hdr_report = recover_hdr_if_present(args.source)
+        hdr_report["enabled"] = True
+
     if img is None:
-        print(json.dumps({"error": f"Could not read image: {args.source}"}), file=sys.stderr)
-        sys.exit(1)
+        try:
+            img = cv2.imread(args.source)
+            if img is None:
+                if looks_like_heic(args.source):
+                    print(json.dumps({
+                        "error": (
+                            "This is a genuine HEIC/HEIF file, which this pipeline cannot decode "
+                            "in its current form. Please re-select this photo from your Photos "
+                            "library (not a HEIC file transferred by cable/AirDrop) and try again."
+                        )
+                    }), file=sys.stderr)
+                else:
+                    print(json.dumps({"error": f"Could not read image: {args.source}"}), file=sys.stderr)
+                sys.exit(1)
+        except Exception as e:
+            print(json.dumps({"error": f"Could not read image: {args.source} ({e})"}), file=sys.stderr)
+            sys.exit(1)
 
     modules_applied = []
     skipped = ["color_uniformity_harmonization", "reflection_glare_reduction"]
@@ -722,20 +760,35 @@ def main():
     # ── Do-No-Harm gate ─────────────────────────────────────────────────
     guard = assess_professional_mls_bright(img)
     if guard["alreadyMLSBright"]:
-        if os.path.abspath(args.source) != os.path.abspath(args.output):
+        # If HDR recovery ran, `img` now holds the recovered image — NOT
+        # what's sitting in args.source on disk (that's still the
+        # original, gain-map-discarded-on-read file). Copying the raw
+        # source bytes here would silently throw away a successful
+        # recovery the moment the do-no-harm gate decides no further
+        # correction is needed — exactly backwards from the point of this
+        # integration. Only take the fast raw-copy path when recovery
+        # didn't apply; write the actual (possibly recovered) image
+        # otherwise.
+        if hdr_report.get("recoveryApplied"):
+            cv2.imwrite(args.output, img, [int(cv2.IMWRITE_JPEG_QUALITY), 94])
+        elif os.path.abspath(args.source) != os.path.abspath(args.output):
             shutil.copyfile(args.source, args.output)
         print(json.dumps({
             "output": args.output,
-            "modulesApplied": ["already_mls_bright_no_correction_applied"],
+            "modulesApplied": (["hdr_gain_map_recovery"] if hdr_report.get("recoveryApplied") else []) + ["already_mls_bright_no_correction_applied"],
             "modulesSkipped": skipped,
             "perspectiveCorrectionDegrees": 0.0,
             "denoiseStrength": 0,
             "histogramStats": guard["shadowHighlightStats"],
             "professionalMLSGuard": guard,
+            "hdrRecovery": hdr_report,
         }))
         return
 
     # ── Technical correction ────────────────────────────────────────────
+    if hdr_report.get("recoveryApplied"):
+        modules_applied.append("hdr_gain_map_recovery")
+
     img, wb_strength = white_balance_neutral_aware(img)
     if wb_strength >= 0.1:
         modules_applied.append("white_balance")
@@ -791,6 +844,7 @@ def main():
             "highlight_frac": histogram_stats["brightFraction"],
         },
         "professionalMLSGuard": guard,
+        "hdrRecovery": hdr_report,
         "metrics": {
             "whiteBalanceStrength": wb_strength,
             "lensCorrectionStrength": lens_strength,
