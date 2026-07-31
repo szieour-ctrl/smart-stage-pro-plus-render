@@ -300,6 +300,7 @@ def main():
     parser.add_argument("--source", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--target-display-headroom", type=float, default=None, help="Manual override for the tonemap ceiling. Omit to auto-use the photo's own decoded headroom (default, recommended).")
+    parser.add_argument("--highlight-reserve", type=float, default=0.15, help="Fraction of output range (0-1) reserved for compressed highlights. Higher = more local contrast preserved in bright/boosted areas (e.g. shirt wrinkles), at the cost of a lower overall ceiling for those areas. Lower = punchier ceiling, flatter highlight detail. Tune by eye.")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -382,7 +383,8 @@ def main():
         report["gainMapImage"] = {"width": int(gain_map_img.shape[1]), "height": int(gain_map_img.shape[0])}
 
         recovered_img, recovery_stats = apply_gain_map(
-            base_img, gain_map_img, headroom, target_display_headroom=args.target_display_headroom
+            base_img, gain_map_img, headroom, target_display_headroom=args.target_display_headroom,
+            highlight_reserve=args.highlight_reserve,
         )
         recovered_path = os.path.join(args.output_dir, "recovered.jpg")
         cv2.imwrite(recovered_path, recovered_img, [int(cv2.IMWRITE_JPEG_QUALITY), 94])
