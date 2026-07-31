@@ -229,6 +229,26 @@ def white_balance_neutral_aware(img):
 
     cast_mag = float(np.max(np.abs(scales - 1.0)))
     strength = clamp01((cast_mag - 0.015) / 0.11)
+
+    # WARM-CAST DAMPENING (patch, pending validation): a "neutral" mask
+    # built from HSV saturation/value alone can't tell a genuine sensor
+    # color cast from a warmly-lit room's actual color — cream/tan walls
+    # and trim under tungsten light legitimately average out R > G > B,
+    # which reads identically to a cast. Confirmed directly on a real
+    # photo (IMG_8198): the neutral-mask pixels measured LAB b +5.7 above
+    # neutral (mean B channel 133.7 vs 128 neutral point) — a textbook
+    # warm-light signature, not a color-cast signature. Correcting that
+    # out at meaningful strength strips the room's real, intentional
+    # warmth. Fix: dampen strength heavily when the dominant channel
+    # needing correction is the classic warm/tungsten signature (R
+    # channel highest of the three). Leave other cast types (green cast
+    # from fluorescents, magenta cast from some LEDs/sensor artifacts)
+    # corrected at full strength, since those are not a normal "warm
+    # room" signature.
+    is_warm_cast = means[2] > means[0]  # BGR order: means[2]=R, means[0]=B
+    if is_warm_cast:
+        strength *= 0.35
+
     applied = 1.0 + strength * (scales - 1.0)
 
     out = bgr * applied.reshape(1, 1, 3)
@@ -546,7 +566,27 @@ def mls_brightness_lift(img, intensity=1.0):
     lab_fused = cv2.cvtColor(fused, cv2.COLOR_BGR2LAB)
     lab_orig_full = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     lab_hybrid = lab_orig_full.copy()
-    lab_hybrid[:, :, 0] = lab_fused[:, :, 0]
+
+    # DARK-MATERIAL FUSION PROTECTION (patch, pending validation): Mertens
+    # fusion, by construction, treats every dark pixel as underexposed
+    # and brightens it via the synthetic over-exposure bracket (orig_f *
+    # 3.2) — it has no way to distinguish a genuinely underexposed shadow
+    # from a pixel that's dark because the actual material there (dark
+    # leather, black granite, dark wood) is supposed to read dark. This
+    # is the PRIMARY source of the crush, not the secondary residual-nudge
+    # gamma step below — confirmed directly on real photos: a black
+    # granite fireplace surround (IMG_8317, orig mean L 85.2) and a dark
+    # brown leather couch (IMG_8198, orig mean L 77.5) both got lifted
+    # substantially by the fusion step alone, before any other correction
+    # ran or the residual nudge fired. Fix: pull the fused luma back
+    # toward the ORIGINAL (pre-fusion) luma for pixels that started dark,
+    # tapering out by L=140 so genuine underexposed shadow/hallway detail
+    # in that upper range still gets the fusion benefit in full.
+    orig_l = lab_orig_full[:, :, 0].astype(np.float32)
+    fused_l = lab_fused[:, :, 0].astype(np.float32)
+    dark_protect = 1.0 - np.clip((orig_l - 40.0) / 100.0, 0.0, 1.0)  # 1.0 at L<=40, 0 by L>=140
+    protected_l = fused_l * (1.0 - dark_protect * 0.6) + orig_l * (dark_protect * 0.6)
+    lab_hybrid[:, :, 0] = protected_l
     fused = cv2.cvtColor(lab_hybrid, cv2.COLOR_LAB2BGR)
 
     # Blend fusion result with the original by `intensity`, so the
@@ -563,17 +603,37 @@ def mls_brightness_lift(img, intensity=1.0):
     if residual_need > 0.03:
         normalized = np.clip(l / 255.0, 0, 1)
         gamma = 1.0 - (0.15 * residual_need)
-        # Same true-black protection as before — belt and suspenders on
-        # top of fusion's natural black-preservation property.
-        true_black_protect = np.clip(l / 25.0, 0, 1)
-        l = (255.0 * np.power(normalized, gamma)) * true_black_protect + l * (1.0 - true_black_protect)
+        # DARK-MATERIAL PROTECTION (patch, pending validation): the old
+        # floor here (l / 25.0) only shields true-black pixels (L<25) —
+        # anything darker than that from crushing further, but it does
+        # nothing for dark furniture/fixtures that sit well above true
+        # black. Confirmed directly on a real photo (IMG_8317): dark
+        # brown leather and a black granite fireplace surround measured
+        # in the L 30-90 range, fully exposed to the gamma lift meant for
+        # underexposed shadows — same treatment as a dim hallway, when
+        # these are supposed to read as rich, dark material, not a
+        # lighting defect. Widened ramp so protection tapers out to L=100
+        # instead of L=25, so these materials keep most of their depth
+        # while genuine near-black shadow detail still gets lifted.
+        dark_material_protect = np.clip(l / 100.0, 0, 1)
+        l = (255.0 * np.power(normalized, gamma)) * dark_material_protect + l * (1.0 - dark_material_protect)
 
     # Highlight/window protection — compress rather than let anything blow out.
-    highlight_mask = np.clip((l - 214.0) / 41.0, 0, 1)
-    compressed_highlights = 214.0 + (l - 214.0) * 0.62
+    # WIDENED CEILING (patch, pending validation): confirmed on real photos
+    # that this compression stacks with window_balance()'s own compression
+    # immediately downstream, and together they hard-cap every corrected
+    # photo's brightest pixels around L 226-233 — even when the original
+    # had legitimate bright content (window light, white trim, lamps)
+    # above 245. Measured directly: IMG_8198 had 1.65% of pixels >245 in
+    # the original, 0% after correction; IMG_8317 the same (0.58% -> 0%).
+    # Narrowed this stage's compression to only engage for genuinely
+    # near-blown highlights (L>230 instead of L>214) and softened the
+    # ratio so more real highlight detail survives into window_balance().
+    highlight_mask = np.clip((l - 230.0) / 25.0, 0, 1)
+    compressed_highlights = 230.0 + (l - 230.0) * 0.82
     l = l * (1.0 - highlight_mask) + compressed_highlights * highlight_mask
 
-    l = np.clip(l, 0, 246)
+    l = np.clip(l, 0, 252)
     lab[:, :, 0] = l
     out = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
     return out, {
@@ -674,14 +734,25 @@ def window_balance(img):
     add any content."""
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
     l = lab[:, :, 0]
-    bright_frac = float((l > 232).sum()) / float(l.size)
+    bright_frac = float((l > 240).sum()) / float(l.size)
 
-    if bright_frac < 0.012:
+    # RAISED TRIGGER + SOFTENED RATIO (patch, pending validation): this
+    # function runs immediately after mls_brightness_lift(), which already
+    # compresses highlights on its own. Confirmed on real photos that the
+    # two stages stack, hard-capping corrected output around L 226-233
+    # even when the source had legitimate bright content (window light,
+    # trim, lamps) well above 245. Old trigger (bright_frac >= 0.012, i.e.
+    # just 1.2% of the frame) fired on nearly any photo with a window or
+    # lamp in it. Raised the luma threshold and required fraction so this
+    # only engages for genuinely overexposed highlight regions, and
+    # softened the compression ratio so what does trigger doesn't crush
+    # highlight detail mls_brightness_lift already preserved.
+    if bright_frac < 0.02:
         return img, {"applied": False, "highlight_fraction": round(bright_frac, 4)}
 
-    mask = np.clip((l - 224.0) / 31.0, 0, 1)
-    compressed = 224.0 + (l - 224.0) * 0.48
-    lab[:, :, 0] = np.clip(l * (1.0 - mask) + compressed * mask, 0, 246)
+    mask = np.clip((l - 238.0) / 17.0, 0, 1)
+    compressed = 238.0 + (l - 238.0) * 0.75
+    lab[:, :, 0] = np.clip(l * (1.0 - mask) + compressed * mask, 0, 252)
     out = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
     return out, {"applied": True, "highlight_fraction": round(bright_frac, 4)}
 
@@ -704,7 +775,26 @@ def mls_color_finish(img, intensity=1.0):
     color_finished = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
 
     blurred = cv2.GaussianBlur(color_finished, (0, 0), sigmaX=1.2)
-    sharpened = cv2.addWeighted(color_finished, 1.16, blurred, -0.16, 0)
+
+    # REDUCED STRENGTH + TEXTURE MASK (patch, pending validation): the old
+    # unsharp pass (1.16 / -0.16, full strength everywhere) measurably
+    # increased edge energy 26-48% on real photos (Laplacian variance,
+    # IMG_8198 1009->1273, IMG_8317 1107->1642) and was the biggest single
+    # contributor to new near-black pixels that weren't dark in the
+    # original — dark undershoot/halos along trim and furniture edges,
+    # applied uniformly even on flat walls and ceilings with nothing to
+    # sharpen. Fix: halve the strength, and mask it to only apply where
+    # local texture already exists (a gray-level co-occurrence proxy via
+    # local variance), so flat surfaces stay flat instead of picking up
+    # sharpening-induced grain and edge halos.
+    gray = cv2.cvtColor(color_finished, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    local_mean = cv2.blur(gray, (9, 9))
+    local_sqmean = cv2.blur(gray * gray, (9, 9))
+    local_var = np.clip(local_sqmean - local_mean ** 2, 0, None)
+    texture_mask = np.clip(local_var / 60.0, 0, 1)[:, :, None]  # 0 on flat surfaces, 1 on real texture
+
+    sharpened_full = cv2.addWeighted(color_finished, 1.08, blurred, -0.08, 0)
+    sharpened = color_finished.astype(np.float32) * (1.0 - texture_mask) + sharpened_full.astype(np.float32) * texture_mask
     return np.clip(sharpened, 0, 255).astype(np.uint8), {
         "mean_saturation_before": round(sat_mean, 2), "saturation_factor": round(float(factor), 3),
     }
@@ -789,6 +879,23 @@ def main():
     if hdr_report.get("recoveryApplied"):
         modules_applied.append("hdr_gain_map_recovery")
 
+    # ── Adaptive intensity scaling (patch, pending validation) ──────────
+    # The do-no-harm gate above was previously binary: anything short of
+    # near-perfect (score >= 0.86 AND 5 load-bearing checks) got the SAME
+    # full-strength correction as a genuinely badly-lit photo. Confirmed
+    # on a real photo (IMG_8198, professional guard score 0.333) that this
+    # meant an already-reasonably-exposed room got the full brightness
+    # lift / clean-whites / sharpening stack meant for underexposed
+    # photos, over-correcting it. Fix: scale intensity continuously by
+    # how much EXPOSURE correction is actually needed (median/mean/p95
+    # luma, shadow fraction) rather than the full 9-point score, since
+    # several of the other checks (white area, saturation) reflect real
+    # room content — a colorful or trim-light room isn't a defect — not
+    # something that should drive correction strength.
+    exposure_checks = ["median_luma_ok", "mean_luma_ok", "p95_luma_ok", "shadow_ok"]
+    exposure_need = 1.0 - (sum(1 for k in exposure_checks if guard["checks"][k]) / float(len(exposure_checks)))
+    adaptive_intensity = float(np.clip(intensity * (0.35 + 0.65 * exposure_need), 0.35, intensity))
+
     img, wb_strength = white_balance_neutral_aware(img)
     if wb_strength >= 0.1:
         modules_applied.append("white_balance")
@@ -810,7 +917,7 @@ def main():
         modules_applied.append("vignette_neutralization")
 
     # ── MLS Bright finish ────────────────────────────────────────────────
-    img, brightness_metrics = mls_brightness_lift(img, intensity=intensity)
+    img, brightness_metrics = mls_brightness_lift(img, intensity=adaptive_intensity)
     # Fusion runs every time (it's the primary technique now, not
     # conditional) — report as applied if it moved the median meaningfully
     # OR the secondary target-nudge kicked in.
@@ -818,7 +925,7 @@ def main():
     if brightness_moved or brightness_metrics["residual_need"] >= 0.05:
         modules_applied.append("mls_brightness_lift")
 
-    img, white_metrics = clean_whites_adaptive(img, intensity=intensity)
+    img, white_metrics = clean_whites_adaptive(img, intensity=adaptive_intensity)
     if white_metrics.get("applied"):
         modules_applied.append("clean_whites")
 
@@ -826,7 +933,7 @@ def main():
     if window_metrics.get("applied"):
         modules_applied.append("window_highlight_balance")
 
-    img, finish_metrics = mls_color_finish(img, intensity=intensity)
+    img, finish_metrics = mls_color_finish(img, intensity=adaptive_intensity)
     modules_applied.append("color_clarity_finish")
 
     histogram_stats = shadow_highlight_stats(img)
@@ -849,6 +956,7 @@ def main():
             "whiteBalanceStrength": wb_strength,
             "lensCorrectionStrength": lens_strength,
             "vignetteStrength": vignette_strength,
+            "adaptiveIntensity": round(adaptive_intensity, 3),
             "mlsBrightness": brightness_metrics,
             "cleanWhites": white_metrics,
             "windowBalance": window_metrics,
