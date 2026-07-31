@@ -278,12 +278,24 @@ def apply_gain_map(base_bgr_uint8, gain_map_gray_uint8, headroom, target_display
 
     color_scale = (luma_out / luma_safe)[..., np.newaxis]
     recovered_linear = hdr_linear * color_scale
-    # Safety clamp: an extremely saturated, extremely bright color (one
-    # channel far above luma) can still individually exceed 1.0 even after
-    # luminance-based scaling — clip only as a last resort, which mildly
-    # desaturates just that pixel rather than distorting hue globally the
-    # way v2 did everywhere.
-    recovered_linear = np.clip(recovered_linear, 0.0, 1.0)
+
+    # ── v3.1 (July 30, 2026) — residual desaturation fix ────────────────
+    # Luminance-based scaling (above) fixed the main hue-shift bug, but a
+    # real test photo (a saturated sky) still showed visible residual
+    # desaturation — expected, per the comment on this line before: an
+    # extremely saturated, extremely bright color can still have ONE
+    # channel individually exceed 1.0 even after luminance scaling. The
+    # previous fix clamped that one channel independently, which distorts
+    # the color ratio (exactly the same class of bug as v2, just rarer).
+    # Fix: when any channel would exceed 1.0, scale ALL THREE down
+    # together by the same factor (divide by the max channel) instead of
+    # clamping just the offending one. This preserves hue/saturation
+    # exactly — the pixel gets slightly dimmer, never shifts toward gray.
+    # Standard technique (gamut compression via max-channel normalization).
+    max_channel = np.max(recovered_linear, axis=-1, keepdims=True)
+    gamut_scale = np.where(max_channel > 1.0, 1.0 / np.maximum(max_channel, 1e-6), 1.0)
+    recovered_linear = recovered_linear * gamut_scale
+    recovered_linear = np.clip(recovered_linear, 0.0, 1.0)  # final safety net only
 
     recovered_srgb = srgb_oetf(recovered_linear)
     recovered_uint8 = np.clip(recovered_srgb * 255.0, 0, 255).astype(np.uint8)
