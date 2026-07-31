@@ -154,6 +154,73 @@ def shadow_highlight_stats(img):
     }
 
 
+def is_exterior_daylight(img):
+    """Detect backyard/patio/pool-style exterior daylight photos so the
+    interior-calibrated MLS Bright stack (target median luma 178,
+    clean-whites neutralization, window highlight compression) doesn't
+    get applied to them — those assumptions are all built for rooms.
+    Confirmed directly on a real photo (IMG_8311, pool/patio): running
+    the full interior pipeline pushed a deliberately-shaded foreground
+    concrete slab toward the same brightness as sunlit concrete, with
+    visible tonal banding in the shadow as a side effect.
+
+    PENDING VALIDATION — tuned against a single confirmed exterior photo
+    plus seven confirmed interior photos (including several with windows
+    showing sky/trees, to check for false positives on those). Vegetation
+    coverage was the most reliable signal: 0.164 on the real exterior
+    photo vs. 0.0-0.014 across every interior photo tested, including
+    window-heavy ones. A close-up patio/pool shot with little visible
+    plant life (rare in practice, but possible) would not be caught by
+    this heuristic — worth widening the test set before leaning on this
+    further."""
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    H, S, V = cv2.split(hsv)
+    green_mask = (H > 33) & (H < 85) & (S > 40) & (V > 40)
+    green_frac = float(green_mask.mean())
+    blue_sky_mask = (H > 95) & (H < 135) & (S > 45) & (V > 120)
+    sky_frac = float(blue_sky_mask.mean())
+    return bool(green_frac > 0.06 or (green_frac > 0.03 and sky_frac > 0.05)), {
+        "greenFraction": round(green_frac, 3), "skyFraction": round(sky_frac, 3),
+    }
+
+
+def exterior_daylight_correction(img, intensity=1.0):
+    """Restrained correction path for exterior daylight photos — per
+    Sam's review of a real over-corrected pool/patio photo, exteriors
+    should get a small shadow lift and nothing resembling the interior
+    MLS Bright target (median luma 178 is appropriate for a room, not
+    for deliberately-shaded concrete in daylight). Mild gamma lift only,
+    capped low, with a pre-blur on the luma channel specifically to
+    avoid amplifying JPEG block noise into visible banding when lifting
+    a large flat shadow area — the failure mode flagged on IMG_8311."""
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
+    l = lab[:, :, 0]
+    before_median = float(np.median(l))
+
+    # Small pre-blur specifically on luma, shadow-weighted, to reduce
+    # banding risk before any lift — does not affect chroma/detail.
+    l_smoothed = cv2.GaussianBlur(l, (0, 0), sigmaX=1.5)
+    shadow_weight = np.clip((90.0 - l) / 90.0, 0, 1) * 0.5
+    l_pre = l * (1.0 - shadow_weight) + l_smoothed * shadow_weight
+
+    normalized = np.clip(l_pre / 255.0, 0, 1)
+    gamma = 1.0 - (0.05 * intensity)  # deliberately mild — no 178 target here
+    lifted = 255.0 * np.power(normalized, gamma)
+
+    # Keep genuine deep shadow mostly as-is (that's real shade, not a
+    # defect) and don't touch bright highlights (sky/sunlit areas).
+    mid_mask = np.clip((l_pre - 30.0) / 60.0, 0, 1) * np.clip((200.0 - l_pre) / 60.0, 0, 1)
+    l_out = l_pre * (1.0 - mid_mask) + lifted * mid_mask
+
+    lab[:, :, 0] = np.clip(l_out, 0, 255)
+    out = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
+    return out, {
+        "before_median_luma": round(before_median, 2),
+        "after_median_luma": round(float(np.median(l_out)), 2),
+        "method": "exterior_mild_shadow_lift",
+    }
+
+
 # ── Do-No-Harm gate ─────────────────────────────────────────────────────────
 
 def assess_professional_mls_bright(img):
@@ -598,7 +665,7 @@ def mls_brightness_lift(img, intensity=1.0):
     # Secondary nudge toward the calibrated target, only if fusion alone
     # didn't reach it — mild, since fusion should do most of the work.
     fusion_median = float(np.median(l))
-    target_median = 178.0
+    target_median = 168.0
     residual_need = clamp01((target_median - fusion_median) / 100.0) * intensity
     if residual_need > 0.03:
         normalized = np.clip(l / 255.0, 0, 1)
@@ -691,11 +758,18 @@ def clean_whites_adaptive(img, intensity=1.0):
     # pass on top is redundant and risks exactly this compounding).
     majority_room_factor = clamp01((0.75 - white_fraction) / (0.75 - 0.50))
 
-    neutralize_strength = clamp01((cast_mag - 1.8) / (10.0 - 1.8)) * 0.55 * intensity * majority_room_factor
+    # REDUCED CEILING (patch, pending validation): report flagged a real
+    # photo (IMG_8301, hallway) as over-lifted and flattened even with
+    # adaptive intensity at max (a genuinely dim hallway correctly gets
+    # full intensity — the issue is this pass's own ceiling being too
+    # strong on top of that, not the do-no-harm gate). Lowered both
+    # multipliers modestly (0.55->0.46, 0.22->0.17) so already-white
+    # surfaces get corrected without pushing as hard toward flat/bright.
+    neutralize_strength = clamp01((cast_mag - 1.8) / (10.0 - 1.8)) * 0.46 * intensity * majority_room_factor
 
     target_l = 212.0
     l_gap = max(0.0, target_l - mean_l)
-    lift_strength = clamp01(l_gap / 38.0) * 0.22 * intensity * majority_room_factor
+    lift_strength = clamp01(l_gap / 38.0) * 0.17 * intensity * majority_room_factor
     if mean_l > 220.0:
         lift_strength *= 0.15
     elif mean_l > 212.0:
@@ -846,6 +920,57 @@ def main():
 
     modules_applied = []
     skipped = ["color_uniformity_harmonization", "reflection_glare_reduction"]
+
+    # ── Exterior daylight scene gate (patch, pending validation) ────────
+    # Confirmed directly on a real photo (IMG_8311, pool/patio) that the
+    # interior-calibrated MLS Bright stack — target median luma 178,
+    # clean-whites neutralization, window highlight compression — was
+    # being applied to an exterior daylight shot, pushing a deliberately
+    # shaded concrete slab toward sunlit brightness with visible tonal
+    # banding as a side effect. See is_exterior_daylight() docstring for
+    # detection method and known limitations.
+    is_exterior, exterior_signals = is_exterior_daylight(img)
+    if is_exterior:
+        img, wb_strength = white_balance_neutral_aware(img)
+        if wb_strength >= 0.1:
+            modules_applied.append("white_balance")
+        img, lens_strength = mild_mobile_lens_correction(img, args.lens_mode)
+        if lens_strength > 0:
+            modules_applied.append("lens_correction")
+        img, rotation_deg = deskew_perspective(img)
+        if rotation_deg != 0.0:
+            modules_applied.append("perspective_alignment")
+        img, denoise_strength = adaptive_denoise(img)
+        if denoise_strength > 2:
+            modules_applied.append("adaptive_noise_reduction")
+        img, exterior_metrics = exterior_daylight_correction(img, intensity=intensity)
+        if abs(exterior_metrics["after_median_luma"] - exterior_metrics["before_median_luma"]) >= 3:
+            modules_applied.append("exterior_daylight_shadow_lift")
+        skipped = skipped + ["mls_brightness_lift", "clean_whites", "window_highlight_balance",
+                              "vignette_neutralization"]
+
+        histogram_stats = shadow_highlight_stats(img)
+        cv2.imwrite(args.output, img, [int(cv2.IMWRITE_JPEG_QUALITY), 94])
+        print(json.dumps({
+            "output": args.output,
+            "modulesApplied": modules_applied,
+            "modulesSkipped": skipped,
+            "perspectiveCorrectionDegrees": round(rotation_deg, 2),
+            "denoiseStrength": denoise_strength,
+            "histogramStats": {
+                "shadow_frac": histogram_stats["shadowFraction"],
+                "highlight_frac": histogram_stats["brightFraction"],
+            },
+            "sceneProfile": "exterior_daylight",
+            "exteriorSignals": exterior_signals,
+            "hdrRecovery": hdr_report,
+            "metrics": {
+                "whiteBalanceStrength": wb_strength,
+                "lensCorrectionStrength": lens_strength,
+                "exteriorCorrection": exterior_metrics,
+            },
+        }))
+        return
 
     # ── Do-No-Harm gate ─────────────────────────────────────────────────
     guard = assess_professional_mls_bright(img)
