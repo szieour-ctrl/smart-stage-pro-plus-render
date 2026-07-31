@@ -129,28 +129,36 @@ def image_stats(img):
     }
 
 
-def white_surface_stats(img, exclusion_mask=None):
+def white_surface_stats(img, exclusion_weight=None):
     """Measure likely-white architectural surfaces (trim, cabinets,
     ceilings) without modifying pixels — used by the do-no-harm gate and
     by clean_whites_adaptive to decide whether/how much to correct.
 
-    exclusion_mask (Level 2, optional): a boolean (H,W) array of pixels
-    identified by the Vision pre-pass as furniture/floor — subtracted
-    from the white-surface candidate set before computing stats. Without
-    this, a light wood floor or cream sofa can measure as "white trim"
-    on LAB chroma+luma alone. None = no exclusion (original behavior,
-    e.g. when the gate calls this before Vision has run)."""
+    exclusion_weight (Level 2, optional): a float32 (H,W) array in [0,1]
+    — continuous, not boolean — from the Vision pre-pass, combining
+    furniture/floor AND dark-material regions. Multiplied in as a
+    continuous "keep" weight rather than a hard AND/subtract: an earlier
+    hard-boolean version produced a visible rectangular seam wherever a
+    coarse Vision box's edge fell in the middle of a continuous surface
+    (confirmed on a real photo — a box that didn't fully cover a large
+    rug left a visible corrected/uncorrected line with no photographic
+    basis). None = no exclusion (original behavior, e.g. when the gate
+    calls this before Vision has run)."""
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
     L, A, B = cv2.split(lab)
     chroma = np.sqrt((A - 128.0) ** 2 + (B - 128.0) ** 2)
     white_mask = (L > 145.0) & (chroma < 22.0)
     strong_white_mask = (L > 165.0) & (chroma < 16.0)
-    if exclusion_mask is not None:
-        white_mask = white_mask & ~exclusion_mask
-        strong_white_mask = strong_white_mask & ~exclusion_mask
 
-    white_fraction = float(np.mean(white_mask))
-    strong_fraction = float(np.mean(strong_white_mask))
+    white_w = white_mask.astype(np.float32)
+    strong_w = strong_white_mask.astype(np.float32)
+    if exclusion_weight is not None:
+        keep = np.clip(1.0 - exclusion_weight, 0.0, 1.0)
+        white_w = white_w * keep
+        strong_w = strong_w * keep
+
+    white_fraction = float(white_w.mean())
+    strong_fraction = float(strong_w.mean())
     if white_fraction < 0.003:
         return {
             "whiteFraction": round(white_fraction, 4),
@@ -161,10 +169,11 @@ def white_surface_stats(img, exclusion_mask=None):
             "meanWhiteB": 0.0,
         }
 
-    sample_mask = strong_white_mask if np.any(strong_white_mask) else white_mask
-    mean_l = float(np.mean(L[sample_mask]))
-    mean_a = float(np.mean(A[sample_mask]))
-    mean_b = float(np.mean(B[sample_mask]))
+    sample_w = strong_w if strong_w.sum() > 1.0 else white_w
+    total_w = float(sample_w.sum())
+    mean_l = float((L * sample_w).sum() / total_w)
+    mean_a = float((A * sample_w).sum() / total_w)
+    mean_b = float((B * sample_w).sum() / total_w)
     cast_mag = float(np.sqrt((mean_a - 128.0) ** 2 + (mean_b - 128.0) ** 2))
 
     return {
@@ -611,7 +620,8 @@ def vignette_correct(img):
 def mls_brightness_lift(img, intensity=1.0, dark_material_mask=None):
     """Interior-first MLS brightness pass.
 
-    dark_material_mask (Level 2, optional): boolean (H,W) array from the
+    dark_material_mask (Level 2, optional): float32 (H,W) array in [0,1]
+    — continuous, heavily-feathered soft mask, not boolean — from the
     Vision pre-pass marking regions identified as genuinely dark material
     (black countertops, dark leather, dark wood) rather than shadow. This
     is unioned into the existing luma-threshold protection below, which
@@ -748,7 +758,7 @@ def mls_brightness_lift(img, intensity=1.0, dark_material_mask=None):
         # genuine dark material, overriding the luma ramp's partial
         # protection in the L 40-100 range.
         if dark_material_mask is not None:
-            dark_material_protect = dark_material_protect * (~dark_material_mask).astype(np.float32)
+            dark_material_protect = dark_material_protect * (1.0 - dark_material_mask)
         l = (255.0 * np.power(normalized, gamma)) * dark_material_protect + l * (1.0 - dark_material_protect)
 
     # Highlight/window protection — compress rather than let anything blow out.
@@ -780,7 +790,7 @@ def mls_brightness_lift(img, intensity=1.0, dark_material_mask=None):
     }
 
 
-def clean_whites_adaptive(img, intensity=1.0, exclusion_mask=None):
+def clean_whites_adaptive(img, intensity=1.0, exclusion_weight=None):
     """Adaptive MLS Bright clean-whites pass — measures actual likely-white
     architectural surfaces (trim, cabinets, ceilings via LAB chroma+luma)
     and only neutralizes/lifts them if they measurably need it, feathered
@@ -788,34 +798,49 @@ def clean_whites_adaptive(img, intensity=1.0, exclusion_mask=None):
     and decor untouched — this targets only the surfaces a professional
     retoucher would target for "clean whites," not a global shift.
 
-    exclusion_mask (Level 2, optional): boolean (H,W) array from the
-    Vision pre-pass marking furniture/floor regions to subtract from the
-    white-surface candidate set BEFORE any stats/strength are computed.
-    This is the boundary-critical fix flagged in the Level 2 mask-test
-    session: without it, this function can misclassify a light wood
-    floor or cream sofa as "white trim" and desaturate its real color.
-    Padding is intentionally generous on the mask itself (see
-    level2_vision_regions.py) — over-excluding here only costs a little
-    legitimate trim near furniture; under-excluding is the actual risk."""
+    exclusion_weight (Level 2, optional): float32 (H,W) array in [0,1] —
+    continuous, not boolean — combining the Vision pre-pass's
+    furniture/floor AND dark-material regions. Multiplied in as a "keep"
+    weight, not subtracted as a hard AND.
+
+    Two real bugs this fixes, both confirmed on real photos:
+    1. Without ANY exclusion, this function can misclassify a light wood
+       floor, cream sofa, or a specular highlight on polished dark stone
+       (a fireplace surround) as "white trim" and desaturate its real
+       color -- the original boundary-critical case this was built for.
+    2. An earlier HARD-boolean version of the exclusion fixed (1) but
+       introduced a new bug: a coarse Vision box that doesn't fully cover
+       a large surface (e.g. a rug) creates a visible rectangular seam
+       right at the box edge -- corrected on one side, untouched on the
+       other, with no photographic basis for the line. Using a
+       continuous, heavily-feathered weight instead of a hard cutoff
+       (see level2_vision_regions.py's _boxes_to_mask) means a
+       partial-coverage box tapers off gradually instead of stopping
+       dead."""
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
     L, A, B = cv2.split(lab)
 
     chroma = np.sqrt((A - 128.0) ** 2 + (B - 128.0) ** 2)
     white_mask = (L > 145.0) & (chroma < 22.0)
     strong_white_mask = (L > 165.0) & (chroma < 16.0)
-    if exclusion_mask is not None:
-        white_mask = white_mask & ~exclusion_mask
-        strong_white_mask = strong_white_mask & ~exclusion_mask
 
-    white_fraction = float(np.mean(white_mask))
+    white_w = white_mask.astype(np.float32)
+    strong_w = strong_white_mask.astype(np.float32)
+    if exclusion_weight is not None:
+        keep = np.clip(1.0 - exclusion_weight, 0.0, 1.0)
+        white_w = white_w * keep
+        strong_w = strong_w * keep
+
+    white_fraction = float(white_w.mean())
     if white_fraction < 0.006:
         return img, {"applied": False, "whiteFraction": round(white_fraction, 4),
                       "reason": "insufficient_likely_white_surface"}
 
-    sample_mask = strong_white_mask if np.any(strong_white_mask) else white_mask
-    mean_a = float(np.mean(A[sample_mask]))
-    mean_b = float(np.mean(B[sample_mask]))
-    mean_l = float(np.mean(L[sample_mask]))
+    sample_w = strong_w if strong_w.sum() > 1.0 else white_w
+    total_w = float(sample_w.sum())
+    mean_a = float((A * sample_w).sum() / total_w)
+    mean_b = float((B * sample_w).sum() / total_w)
+    mean_l = float((L * sample_w).sum() / total_w)
     cast_mag = float(np.sqrt((mean_a - 128.0) ** 2 + (mean_b - 128.0) ** 2))
 
     # MAJORITY-WHITE-ROOM FIX (July 9, 2026): this function was designed
@@ -861,7 +886,7 @@ def clean_whites_adaptive(img, intensity=1.0, exclusion_mask=None):
                       "castMagnitude": round(cast_mag, 3), "meanWhiteLuma": round(mean_l, 2),
                       "majorityRoomFactor": round(majority_room_factor, 3), "reason": reason}
 
-    mask_u8 = white_mask.astype(np.uint8) * 255
+    mask_u8 = np.clip(white_w * 255.0, 0, 255).astype(np.uint8)
     mask_blur = cv2.GaussianBlur(mask_u8, (0, 0), sigmaX=5, sigmaY=5).astype(np.float32) / 255.0
 
     A_target = A - neutralize_strength * (A - 128.0)
@@ -879,7 +904,7 @@ def clean_whites_adaptive(img, intensity=1.0, exclusion_mask=None):
         "castMagnitude": round(cast_mag, 3), "meanWhiteLuma": round(mean_l, 2),
         "liftStrength": round(float(lift_strength), 3),
         "neutralizeStrength": round(float(neutralize_strength), 3),
-        "level2ExclusionApplied": exclusion_mask is not None,
+        "level2ExclusionApplied": exclusion_weight is not None,
     }
 
 
@@ -1150,9 +1175,27 @@ def main():
     if brightness_moved or brightness_metrics["residual_need"] >= 0.05:
         modules_applied.append("mls_brightness_lift")
 
+    # LEVEL 2 FIX (after real-photo test, Aug 2026): clean_whites_adaptive
+    # previously only received furniture_floor exclusion. Confirmed on a
+    # real photo that a polished black granite fireplace surround can
+    # trip white_mask's own L>145/chroma<22 threshold via specular
+    # highlight alone -- nothing to do with furniture or floor. Combine
+    # BOTH region categories into one continuous exclusion weight (max,
+    # since either category alone is sufficient reason to exclude a
+    # pixel from "clean whites" candidacy).
+    ff_weight = level2_regions.get("furniture_floor_mask")
+    dm_weight = level2_regions.get("dark_material_mask")
+    if ff_weight is not None or dm_weight is not None:
+        combined_exclusion_weight = np.maximum(
+            ff_weight if ff_weight is not None else 0.0,
+            dm_weight if dm_weight is not None else 0.0,
+        )
+    else:
+        combined_exclusion_weight = None
+
     img, white_metrics = clean_whites_adaptive(
         img, intensity=adaptive_intensity,
-        exclusion_mask=level2_regions.get("furniture_floor_mask"),
+        exclusion_weight=combined_exclusion_weight,
     )
     if white_metrics.get("applied"):
         modules_applied.append("clean_whites")
