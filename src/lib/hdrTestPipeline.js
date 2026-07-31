@@ -32,7 +32,7 @@ function fileToBase64(filePath) {
  * (recovered may be absent if no gain map was found or extraction failed
  * — that's a normal, reportable outcome, not an error).
  */
-function runHdrTest(image, targetDisplayHeadroom) {
+function runHdrTest(image, targetDisplayHeadroom, highlightReserve) {
   return new Promise((resolve) => {
     const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "hdr-test-"));
     const ext = base64ToExt(image.mimeType);
@@ -58,6 +58,9 @@ function runHdrTest(image, targetDisplayHeadroom) {
     // back to a fixed number here.
     if (targetDisplayHeadroom !== undefined && targetDisplayHeadroom !== null && targetDisplayHeadroom !== "") {
       args.push("--target-display-headroom", String(targetDisplayHeadroom));
+    }
+    if (highlightReserve !== undefined && highlightReserve !== null && highlightReserve !== "") {
+      args.push("--highlight-reserve", String(highlightReserve));
     }
     let stdout = "";
     let stderr = "";
