@@ -201,7 +201,7 @@ def decode_standard(source_path):
     return img
 
 
-def apply_gain_map(base_bgr_uint8, gain_map_gray_uint8, headroom, target_display_headroom=None):
+def apply_gain_map(base_bgr_uint8, gain_map_gray_uint8, headroom, target_display_headroom=None, highlight_reserve=0.15):
     """
     hdr_rgb = sdr_rgb * (1.0 + (headroom - 1.0) * gainmap)      [all linear-light]
 
@@ -210,34 +210,34 @@ def apply_gain_map(base_bgr_uint8, gain_map_gray_uint8, headroom, target_display
     gainmap=1.0 everywhere, output == headroom exactly (verified below in
     a self-check in main()).
 
-    The result is a genuine linear-light HDR image that can exceed 1.0 —
-    correct, but not directly viewable as an 8-bit JPEG.
+    ── TONEMAP, v2 (July 30, 2026) ──────────────────────────────────────
+    v1 divided the ENTIRE recovered image by target_display_headroom. That
+    fixed clipping (confirmed: 0% clipped on the real light-fixture photo,
+    up from 8% under the old fixed 2.0 ceiling) but broke something else,
+    caught on a real test photo: regions the gain map never touched at all
+    — most of a face, shadow areas, anything with gain≈0 — were ALSO
+    divided by the same ~3.44 factor for no reason, squeezing them down to
+    ~29% of their range. That's what produced the reported symptoms —
+    visibly different shadow rendering and washed-out color — on parts of
+    the image that were never supposed to change.
 
-    `target_display_headroom` sets the display ceiling for the tonemap
-    clip-and-normalize step below. Left as None (the default), it's set to
-    the photo's OWN decoded `headroom` automatically — not a fixed
-    constant. This is a fix for a real problem found across the 4 real
-    test photos on July 30, 2026: with a fixed target of 2.0, the light-
-    fixture photo (headroom 3.44, 48.6% of the frame elevated above SDR
-    white) lost everything between 2.0 and 3.44 to hard clipping — nearly
-    half the image. The backlit-window photo (27% affected) looked fine
-    under the same fixed target purely because less area happened to sit
-    above the clip point. That's not really two photos needing different
-    treatment — it's one bug: a fixed ceiling loses more information the
-    more of the frame sits above it. Setting the ceiling to the photo's
-    actual headroom means nothing gets clipped away regardless of how much
-    of the frame is elevated, which is why this fix didn't need a second
-    "how much of the frame is affected" branch at all — it falls out of
-    getting the ceiling right in the first place.
+    v2 fixes this with a proper knee curve instead of a global divide:
+      - hdr_linear <= 1.0 (i.e. NOT boosted by the gain map): passes
+        through nearly unchanged, scaled by only `highlight_reserve`
+        (default 15%) rather than the ~71% global cut v1 applied — this
+        reserved headroom is what makes room for compressed highlights
+        without clipping.
+      - hdr_linear > 1.0 (i.e. genuinely elevated by the gain map): the
+        excess above 1.0 is compressed smoothly (Reinhard-style, so it
+        never hard-clips) into that same reserved headroom.
+    Continuous at the boundary — both branches agree exactly at
+    hdr_linear == 1.0 — so there's no visible seam where the curve
+    switches behavior.
 
-    A manual override is still accepted (e.g. to force a lower ceiling and
-    compare) — pass a number instead of None.
-
-    This is still a simple clip-and-normalize curve, not a proper
-    photographic tonemap operator (Reinhard, filmic, etc.) — good enough
-    to confirm recovery is happening correctly across varied scenes, not
-    a finished production tonemap. That's a separate, later refinement if
-    the adaptive ceiling alone doesn't look right on more real photos.
+    This is a real photographic knee/shoulder curve now, not a linear
+    stretch — still simpler than a full filmic operator (ACES etc.), but
+    the core problem (rescaling regions the gain map never touched) is
+    fixed, not just papered over.
     """
     if target_display_headroom is None:
         target_display_headroom = headroom
@@ -253,8 +253,16 @@ def apply_gain_map(base_bgr_uint8, gain_map_gray_uint8, headroom, target_display
 
     hdr_linear = base_linear * (1.0 + (headroom - 1.0) * gain_linear)
 
-    # Tonemap: clip to target_display_headroom, normalize, re-encode sRGB.
-    recovered_linear = np.clip(hdr_linear, 0.0, target_display_headroom) / target_display_headroom
+    unboosted_scale = 1.0 - highlight_reserve
+    max_excess = max(target_display_headroom - 1.0, 1e-6)
+    excess = np.maximum(hdr_linear - 1.0, 0.0)
+    compressed_excess = highlight_reserve * excess / (excess + max_excess)
+    recovered_linear = np.where(
+        hdr_linear <= 1.0,
+        hdr_linear * unboosted_scale,
+        unboosted_scale + compressed_excess,
+    )
+
     recovered_srgb = srgb_oetf(recovered_linear)
     recovered_uint8 = np.clip(recovered_srgb * 255.0, 0, 255).astype(np.uint8)
 
@@ -262,6 +270,7 @@ def apply_gain_map(base_bgr_uint8, gain_map_gray_uint8, headroom, target_display
         "headroomUsed": headroom,
         "targetDisplayHeadroom": target_display_headroom,
         "targetWasAutomatic": target_display_headroom == headroom,
+        "highlightReserve": highlight_reserve,
         "hdrLinearMax": float(np.max(hdr_linear)),
         "hdrLinearMean": float(np.mean(hdr_linear)),
         "fractionAboveSDRWhite": float(np.mean(hdr_linear > 1.0)),
