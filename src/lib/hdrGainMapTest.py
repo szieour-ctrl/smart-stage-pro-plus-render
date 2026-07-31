@@ -253,15 +253,37 @@ def apply_gain_map(base_bgr_uint8, gain_map_gray_uint8, headroom, target_display
 
     hdr_linear = base_linear * (1.0 + (headroom - 1.0) * gain_linear)
 
+    # ── COLOR FIX, v3 (July 30, 2026) ──────────────────────────────────
+    # v2 applied the knee curve to each B/G/R channel independently. That
+    # broke saturated colors — caught on a real photo where a blue sky
+    # washed out toward white. Reason: for a saturated blue, the B channel
+    # starts much higher than R and G, so it gets compressed harder
+    # (it's closer to the ceiling) than the other two — the three channels
+    # converge toward each other, which is literally what desaturation is.
+    # Fix: compute one luminance value per pixel, tonemap ONLY that, then
+    # scale the original R/G/B by the resulting luminance ratio. This
+    # preserves hue and saturation exactly — a color gets brighter/dimmer,
+    # never shifts toward gray — while still protecting highlights
+    # everywhere. Standard fix for this exact class of bug in HDR tonemap
+    # pipelines; not something specific to this script.
+    # Note: channel order is BGR (OpenCV convention), not RGB.
+    luma = 0.0722 * hdr_linear[..., 0] + 0.7152 * hdr_linear[..., 1] + 0.2126 * hdr_linear[..., 2]
+    luma_safe = np.maximum(luma, 1e-6)
+
     unboosted_scale = 1.0 - highlight_reserve
     max_excess = max(target_display_headroom - 1.0, 1e-6)
-    excess = np.maximum(hdr_linear - 1.0, 0.0)
+    excess = np.maximum(luma - 1.0, 0.0)
     compressed_excess = highlight_reserve * excess / (excess + max_excess)
-    recovered_linear = np.where(
-        hdr_linear <= 1.0,
-        hdr_linear * unboosted_scale,
-        unboosted_scale + compressed_excess,
-    )
+    luma_out = np.where(luma <= 1.0, luma * unboosted_scale, unboosted_scale + compressed_excess)
+
+    color_scale = (luma_out / luma_safe)[..., np.newaxis]
+    recovered_linear = hdr_linear * color_scale
+    # Safety clamp: an extremely saturated, extremely bright color (one
+    # channel far above luma) can still individually exceed 1.0 even after
+    # luminance-based scaling — clip only as a last resort, which mildly
+    # desaturates just that pixel rather than distorting hue globally the
+    # way v2 did everywhere.
+    recovered_linear = np.clip(recovered_linear, 0.0, 1.0)
 
     recovered_srgb = srgb_oetf(recovered_linear)
     recovered_uint8 = np.clip(recovered_srgb * 255.0, 0, 255).astype(np.uint8)
