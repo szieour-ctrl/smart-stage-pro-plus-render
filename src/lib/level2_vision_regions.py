@@ -118,12 +118,30 @@ def _call_vision_api(image_b64: str, media_type: str, w: int, h: int) -> dict:
     return json.loads(text.strip())
 
 
-def _boxes_to_mask(boxes, shape, pad_frac=DEFAULT_PAD_FRAC):
-    """Rasterize [x1,y1,x2,y2] boxes into a boolean mask, padding each box
-    by pad_frac of its own size on every side -- generously padded, not
-    tight, per the design note above."""
+def _boxes_to_mask(boxes, shape, pad_frac=DEFAULT_PAD_FRAC, feather_frac=0.035, feather_min_px=18):
+    """Rasterize [x1,y1,x2,y2] boxes into a SOFT (H,W) float32 mask in
+    [0,1], not a hard boolean.
+
+    FEATHERING (added after first real-photo test, Aug 2026): the first
+    version returned a hard binary mask. Confirmed directly on real
+    photos that this creates a visible artificial seam wherever a box
+    edge falls in the middle of a large continuous surface it doesn't
+    fully cover -- e.g. Vision's furniture_floor box for a large area
+    rug didn't reach the rug's actual edges, so the rug got corrected
+    (neutralized/lifted) right up to the box boundary and untouched
+    inside it, producing a visible rectangular seam with no photographic
+    basis (nothing in the room actually changes at that line). Same
+    mechanism produced a visible streak where a box edge crossed window
+    glass. A box is a coarse routing signal, not a tight boundary (see
+    level2_vision_regions.py's own design notes) -- treating its edge as
+    a hard cutoff was the bug, not the box itself.
+
+    Fix: rasterize the (already padded) hard box, then apply a Gaussian
+    blur wide enough that the box's own edges become a gradual falloff
+    rather than a step. feather_frac scales the blur sigma to image size
+    so this behaves consistently across different photo resolutions."""
     h, w = shape[:2]
-    mask = np.zeros((h, w), dtype=bool)
+    hard = np.zeros((h, w), dtype=np.float32)
     for box in boxes:
         x1, y1, x2, y2 = box
         bw, bh = x2 - x1, y2 - y1
@@ -133,21 +151,29 @@ def _boxes_to_mask(boxes, shape, pad_frac=DEFAULT_PAD_FRAC):
         x2c = min(w, int(round(x2 + pad_x)))
         y2c = min(h, int(round(y2 + pad_y)))
         if x2c > x1c and y2c > y1c:
-            mask[y1c:y2c, x1c:x2c] = True
-    return mask
+            hard[y1c:y2c, x1c:x2c] = 1.0
+
+    if not np.any(hard):
+        return hard
+
+    sigma = max(feather_min_px, feather_frac * max(h, w))
+    soft = cv2.GaussianBlur(hard, (0, 0), sigmaX=sigma, sigmaY=sigma)
+    return np.clip(soft, 0.0, 1.0)
 
 
 def get_level2_regions(img):
     """Returns (regions, report).
 
     regions = {
-        "furniture_floor_mask": bool (H,W) ndarray or None,
-        "dark_material_mask": bool (H,W) ndarray or None,
+        "furniture_floor_mask": float32 (H,W) ndarray in [0,1], or None,
+        "dark_material_mask": float32 (H,W) ndarray in [0,1], or None,
     }
-    Masks are None when disabled, unconfigured, or the call failed --
-    callers must treat None as "no exclusion/no extra protection," i.e.
-    fall back to current heuristic-only behavior. This function never
-    raises; every failure mode is caught and reported instead.
+    These are SOFT masks (heavily feathered, see _boxes_to_mask) -- treat
+    as a continuous weight, not a boolean. Multiply, don't index/AND.
+    None means disabled/unconfigured/failed -- callers must treat None as
+    "no exclusion/no extra protection," i.e. fall back to current
+    heuristic-only behavior. This function never raises; every failure
+    mode is caught and reported instead.
     """
     report = {"enabled": LEVEL2_VISION_MASKS_ENABLED, "called": False, "error": None}
 
@@ -186,8 +212,8 @@ def get_level2_regions(img):
         report["error"] = f"malformed_box_data: {type(e).__name__}: {e}"
         return {"furniture_floor_mask": None, "dark_material_mask": None}, report
 
-    ff_mask = _boxes_to_mask(ff_boxes, img.shape) if ff_boxes else np.zeros((h, w), dtype=bool)
-    dm_mask = _boxes_to_mask(dm_boxes, img.shape) if dm_boxes else np.zeros((h, w), dtype=bool)
+    ff_mask = _boxes_to_mask(ff_boxes, img.shape) if ff_boxes else np.zeros((h, w), dtype=np.float32)
+    dm_mask = _boxes_to_mask(dm_boxes, img.shape) if dm_boxes else np.zeros((h, w), dtype=np.float32)
 
     report["furnitureFloorBoxCount"] = len(ff_boxes)
     report["darkMaterialBoxCount"] = len(dm_boxes)
