@@ -75,6 +75,28 @@ import os
 import shutil
 import sys
 
+# ── Thread-pool ceiling (added Aug 2026) ────────────────────────────────
+# MUST run before `import cv2` / `import numpy as np` below -- OpenBLAS
+# reads these env vars once, at library load time, not per-call. Setting
+# them after numpy/cv2 are already imported has no effect.
+#
+# Real crash seen on Railway: OpenBLAS auto-detected 48 cores and tried
+# to spawn 48 threads for a SINGLE image's math, inside a container whose
+# process/thread ceiling is much lower. correctPipeline.js spawns one
+# Python process PER IMAGE, so under concurrent batch processing this
+# multiplies -- N images in flight each independently trying to grab up
+# to 48 threads -- and blows the limit fast ("pthread_create failed...
+# Resource temporarily unavailable").
+#
+# Fix: force single-threaded BLAS/OMP math per process. The real
+# parallelism in this pipeline is ACROSS images (multiple processes),
+# not within one image's numpy calls, so this costs negligible per-image
+# throughput. setdefault(), not direct assignment, so an explicit Railway
+# env var (if someone later wants a different value) still wins.
+for _var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS",
+             "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+    os.environ.setdefault(_var, "1")
+
 import cv2
 import numpy as np
 
