@@ -79,6 +79,7 @@ import cv2
 import numpy as np
 
 from hdrRecover import recover_hdr_if_present, looks_like_heic
+from level2_vision_regions import get_level2_regions
 
 # Kill switch, matching the existing END_FRAME_ENABLED pattern in this
 # codebase — lets HDR recovery be disabled instantly via Railway env var
@@ -106,15 +107,25 @@ def image_stats(img):
     }
 
 
-def white_surface_stats(img):
+def white_surface_stats(img, exclusion_mask=None):
     """Measure likely-white architectural surfaces (trim, cabinets,
     ceilings) without modifying pixels — used by the do-no-harm gate and
-    by clean_whites_adaptive to decide whether/how much to correct."""
+    by clean_whites_adaptive to decide whether/how much to correct.
+
+    exclusion_mask (Level 2, optional): a boolean (H,W) array of pixels
+    identified by the Vision pre-pass as furniture/floor — subtracted
+    from the white-surface candidate set before computing stats. Without
+    this, a light wood floor or cream sofa can measure as "white trim"
+    on LAB chroma+luma alone. None = no exclusion (original behavior,
+    e.g. when the gate calls this before Vision has run)."""
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
     L, A, B = cv2.split(lab)
     chroma = np.sqrt((A - 128.0) ** 2 + (B - 128.0) ** 2)
     white_mask = (L > 145.0) & (chroma < 22.0)
     strong_white_mask = (L > 165.0) & (chroma < 16.0)
+    if exclusion_mask is not None:
+        white_mask = white_mask & ~exclusion_mask
+        strong_white_mask = strong_white_mask & ~exclusion_mask
 
     white_fraction = float(np.mean(white_mask))
     strong_fraction = float(np.mean(strong_white_mask))
@@ -575,8 +586,17 @@ def vignette_correct(img):
 
 # ── MLS Bright finish layer (calibrated against real MLS Bright photos) ────
 
-def mls_brightness_lift(img, intensity=1.0):
+def mls_brightness_lift(img, intensity=1.0, dark_material_mask=None):
     """Interior-first MLS brightness pass.
+
+    dark_material_mask (Level 2, optional): boolean (H,W) array from the
+    Vision pre-pass marking regions identified as genuinely dark material
+    (black countertops, dark leather, dark wood) rather than shadow. This
+    is unioned into the existing luma-threshold protection below, which
+    on its own can't tell a medium-dark wood table (L~110, outside the
+    L<40 taper-to-L=140 window's strongest protection) from ordinary
+    midtone content that should lift normally. None = original
+    luma-only behavior, unchanged.
 
     REDESIGNED (July 8, 2026) after Sam directly flagged that a single
     global gamma curve didn't achieve real "professional balance" between
@@ -662,6 +682,13 @@ def mls_brightness_lift(img, intensity=1.0):
     orig_l = lab_orig_full[:, :, 0].astype(np.float32)
     fused_l = lab_fused[:, :, 0].astype(np.float32)
     dark_protect = 1.0 - np.clip((orig_l - 40.0) / 100.0, 0.0, 1.0)  # 1.0 at L<=40, 0 by L>=140
+    # LEVEL 2: the luma ramp alone gives only partial protection to a
+    # dark material sitting mid-range (e.g. L~110 medium-dark wood table
+    # gets ~0.3, not enough to stop a visible lift). Where Vision has
+    # identified the pixel as a genuine dark material, force full
+    # protection (1.0) regardless of where it falls on the luma ramp.
+    if dark_material_mask is not None:
+        dark_protect = np.maximum(dark_protect, dark_material_mask.astype(np.float32))
     protected_l = fused_l * (1.0 - dark_protect * 0.6) + orig_l * (dark_protect * 0.6)
     lab_hybrid[:, :, 0] = protected_l
     fused = cv2.cvtColor(lab_hybrid, cv2.COLOR_LAB2BGR)
@@ -693,6 +720,13 @@ def mls_brightness_lift(img, intensity=1.0):
         # instead of L=25, so these materials keep most of their depth
         # while genuine near-black shadow detail still gets lifted.
         dark_material_protect = np.clip(l / 100.0, 0, 1)
+        # LEVEL 2: same fix as the fusion stage above, applied to this
+        # ramp's inverse convention (0 = fully protected/no lift here).
+        # Force to 0 -- full protection -- wherever Vision identified a
+        # genuine dark material, overriding the luma ramp's partial
+        # protection in the L 40-100 range.
+        if dark_material_mask is not None:
+            dark_material_protect = dark_material_protect * (~dark_material_mask).astype(np.float32)
         l = (255.0 * np.power(normalized, gamma)) * dark_material_protect + l * (1.0 - dark_material_protect)
 
     # Highlight/window protection — compress rather than let anything blow out.
@@ -720,22 +754,36 @@ def mls_brightness_lift(img, intensity=1.0):
         "target_median_luma": target_median,
         "residual_need": round(float(residual_need), 3),
         "method": "synthetic_exposure_fusion",
+        "level2DarkMaterialMaskApplied": dark_material_mask is not None,
     }
 
 
-def clean_whites_adaptive(img, intensity=1.0):
+def clean_whites_adaptive(img, intensity=1.0, exclusion_mask=None):
     """Adaptive MLS Bright clean-whites pass — measures actual likely-white
     architectural surfaces (trim, cabinets, ceilings via LAB chroma+luma)
     and only neutralizes/lifts them if they measurably need it, feathered
     with a blurred mask so there's no hard edge. Leaves walls, wood floors,
     and decor untouched — this targets only the surfaces a professional
-    retoucher would target for "clean whites," not a global shift."""
+    retoucher would target for "clean whites," not a global shift.
+
+    exclusion_mask (Level 2, optional): boolean (H,W) array from the
+    Vision pre-pass marking furniture/floor regions to subtract from the
+    white-surface candidate set BEFORE any stats/strength are computed.
+    This is the boundary-critical fix flagged in the Level 2 mask-test
+    session: without it, this function can misclassify a light wood
+    floor or cream sofa as "white trim" and desaturate its real color.
+    Padding is intentionally generous on the mask itself (see
+    level2_vision_regions.py) — over-excluding here only costs a little
+    legitimate trim near furniture; under-excluding is the actual risk."""
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
     L, A, B = cv2.split(lab)
 
     chroma = np.sqrt((A - 128.0) ** 2 + (B - 128.0) ** 2)
     white_mask = (L > 145.0) & (chroma < 22.0)
     strong_white_mask = (L > 165.0) & (chroma < 16.0)
+    if exclusion_mask is not None:
+        white_mask = white_mask & ~exclusion_mask
+        strong_white_mask = strong_white_mask & ~exclusion_mask
 
     white_fraction = float(np.mean(white_mask))
     if white_fraction < 0.006:
@@ -809,6 +857,7 @@ def clean_whites_adaptive(img, intensity=1.0):
         "castMagnitude": round(cast_mag, 3), "meanWhiteLuma": round(mean_l, 2),
         "liftStrength": round(float(lift_strength), 3),
         "neutralizeStrength": round(float(neutralize_strength), 3),
+        "level2ExclusionApplied": exclusion_mask is not None,
     }
 
 
@@ -1051,8 +1100,27 @@ def main():
     if vignette_strength >= 0.1:
         modules_applied.append("vignette_neutralization")
 
+    # ── Level 2 Vision pre-pass (added Aug 2026) ─────────────────────────
+    # Called HERE, not earlier: every geometric correction (lens, deskew,
+    # crop-after-rotate) has already run, so the boxes Vision returns are
+    # in the same pixel coordinate space `img` is in for the rest of the
+    # pipeline. Calling this before deskew would misalign the masks by
+    # however much the photo got rotated/cropped.
+    #
+    # READ-ONLY, routing-signal-only, per level2_vision_regions.py's own
+    # docstring -- this does not touch pixels and does not compromise
+    # this file's "no generative model" rule (see top docstring). If it
+    # fails or is disabled, both masks are None and every downstream call
+    # below falls back to its original heuristic-only behavior, unchanged.
+    level2_regions, level2_report = get_level2_regions(img)
+    if level2_report.get("called") and not level2_report.get("error"):
+        modules_applied.append("level2_vision_regions")
+
     # ── MLS Bright finish ────────────────────────────────────────────────
-    img, brightness_metrics = mls_brightness_lift(img, intensity=adaptive_intensity)
+    img, brightness_metrics = mls_brightness_lift(
+        img, intensity=adaptive_intensity,
+        dark_material_mask=level2_regions.get("dark_material_mask"),
+    )
     # Fusion runs every time (it's the primary technique now, not
     # conditional) — report as applied if it moved the median meaningfully
     # OR the secondary target-nudge kicked in.
@@ -1060,7 +1128,10 @@ def main():
     if brightness_moved or brightness_metrics["residual_need"] >= 0.05:
         modules_applied.append("mls_brightness_lift")
 
-    img, white_metrics = clean_whites_adaptive(img, intensity=adaptive_intensity)
+    img, white_metrics = clean_whites_adaptive(
+        img, intensity=adaptive_intensity,
+        exclusion_mask=level2_regions.get("furniture_floor_mask"),
+    )
     if white_metrics.get("applied"):
         modules_applied.append("clean_whites")
 
@@ -1087,6 +1158,7 @@ def main():
         },
         "professionalMLSGuard": guard,
         "hdrRecovery": hdr_report,
+        "level2Vision": level2_report,
         "metrics": {
             "whiteBalanceStrength": wb_strength,
             "lensCorrectionStrength": lens_strength,
