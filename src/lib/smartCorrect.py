@@ -1163,15 +1163,37 @@ def main():
             cv2.imwrite(args.output, img, [int(cv2.IMWRITE_JPEG_QUALITY), 94])
         elif os.path.abspath(args.source) != os.path.abspath(args.output):
             shutil.copyfile(args.source, args.output)
+
+        # ── Stage 4: Vision QC (added Aug 2026, LOG-ONLY) ────────────────
+        # Only worth calling if HDR recovery actually changed pixels here
+        # -- otherwise `img` is byte-identical to the original and a QC
+        # comparison would be a wasted Vision call with a guaranteed-false
+        # result. If recovery didn't apply, report a clear "not needed"
+        # status rather than silently omitting the field (see missing-
+        # level0Scene bug this same branch had, found via real testing).
+        if hdr_report.get("recoveryApplied"):
+            qc = qc_check(original_img_for_qc, img)
+            if qc.get("looksArtificial") is True:
+                modules_applied_gate_tag = ["qc_flagged_possible_artifact"]
+            else:
+                modules_applied_gate_tag = []
+        else:
+            qc = {"looksArtificial": None, "confidence": None, "issue": None,
+                  "location": None, "enabled": None,
+                  "called": False, "error": "not_needed_no_pixels_changed"}
+            modules_applied_gate_tag = []
+
         print(json.dumps({
             "output": args.output,
-            "modulesApplied": (["hdr_gain_map_recovery"] if hdr_report.get("recoveryApplied") else []) + ["already_mls_bright_no_correction_applied"],
+            "modulesApplied": (["hdr_gain_map_recovery"] if hdr_report.get("recoveryApplied") else []) + ["already_mls_bright_no_correction_applied"] + modules_applied_gate_tag,
             "modulesSkipped": skipped,
             "perspectiveCorrectionDegrees": 0.0,
             "denoiseStrength": 0,
             "histogramStats": guard["shadowHighlightStats"],
             "professionalMLSGuard": guard,
             "hdrRecovery": hdr_report,
+            "level0Scene": scene,
+            "level4QC": qc,
         }))
         return
 
