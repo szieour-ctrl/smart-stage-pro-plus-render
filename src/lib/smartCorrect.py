@@ -103,6 +103,7 @@ import numpy as np
 from hdrRecover import recover_hdr_if_present, looks_like_heic
 from level2_vision_regions import get_level2_regions
 from level2_diagnosis import diagnose as level2_diagnose
+from level0_scene_classifier import resolve_scene_type
 
 # Kill switch, matching the existing END_FRAME_ENABLED pattern in this
 # codebase — lets HDR recovery be disabled instantly via Railway env var
@@ -1036,7 +1037,24 @@ def main():
     # shaded concrete slab toward sunlit brightness with visible tonal
     # banding as a side effect. See is_exterior_daylight() docstring for
     # detection method and known limitations.
-    is_exterior, exterior_signals = is_exterior_daylight(img)
+    is_exterior_hsv, exterior_signals = is_exterior_daylight(img)
+
+    # ── Level 0: Vision scene classification (added Aug 2026) ───────────
+    # Runs before Stage 1 diagnosis and before any correction path is
+    # chosen. Ships in shadow mode by default (LEVEL0_SHADOW_MODE=true):
+    # `is_exterior` below still resolves to the HSV heuristic's answer
+    # until a real batch of logged disagreements has been reviewed and
+    # LEVEL0_SHADOW_MODE is flipped to false. See level0_scene_classifier.py
+    # docstring for the full rollout plan and why this exists (IMG_8305
+    # false negative on a close-up driveway/stucco exterior).
+    _, encoded_for_vision = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+    scene = resolve_scene_type(encoded_for_vision.tobytes(), is_exterior_hsv)
+    is_exterior = scene["isExterior"]
+    if scene["disagreement"]:
+        modules_applied.append(
+            f"scene_disagreement_hsv-{'ext' if is_exterior_hsv else 'int'}"
+            f"_vision-{scene['visionResult'].get('sceneType')}"
+        )
 
     # ── Level 2 Stage 1: Vision diagnosis (added Aug 2026, LOG-ONLY) ─────
     # Prototype from the same design session as the Level 2 region masks
