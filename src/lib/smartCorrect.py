@@ -111,6 +111,7 @@ from hdrRecover import recover_hdr_if_present, looks_like_heic
 from level2_vision_regions import get_level2_regions
 from level2_diagnosis import diagnose as level2_diagnose
 from level0_scene_classifier import resolve_scene_type
+from level2_qc import qc_check
 
 # Kill switch, matching the existing END_FRAME_ENABLED pattern in this
 # codebase — lets HDR recovery be disabled instantly via Railway env var
@@ -1036,6 +1037,14 @@ def main():
     modules_applied = []
     skipped = ["color_uniformity_harmonization", "reflection_glare_reduction"]
 
+    # ── Stage 4 QC snapshot (added Aug 2026) ─────────────────────────────
+    # Captured here, before any correction touches `img`, so Stage 4's
+    # QC pass (level2_qc.py) has a real "before" to compare against --
+    # by the time main() reaches its output blocks, `img` has already
+    # been reassigned through the correction chain (white balance, lens,
+    # deskew, denoise, brightness lift, etc.) and the original is gone.
+    original_img_for_qc = img.copy()
+
     # ── Exterior daylight scene gate (patch, pending validation) ────────
     # Confirmed directly on a real photo (IMG_8311, pool/patio) that the
     # interior-calibrated MLS Bright stack — target median luma 178,
@@ -1104,6 +1113,16 @@ def main():
                               "vignette_neutralization"]
 
         histogram_stats = shadow_highlight_stats(img)
+
+        # ── Stage 4: Vision QC (added Aug 2026, LOG-ONLY) ────────────────
+        # See level2_qc.py docstring. Compares original_img_for_qc (pre-
+        # correction) against the final `img` (post-correction). Result
+        # is included in the JSON output but never blocks or changes
+        # what's returned -- purely observational until reviewed.
+        qc = qc_check(original_img_for_qc, img)
+        if qc.get("looksArtificial") is True:
+            modules_applied.append("qc_flagged_possible_artifact")
+
         cv2.imwrite(args.output, img, [int(cv2.IMWRITE_JPEG_QUALITY), 94])
         print(json.dumps({
             "output": args.output,
@@ -1118,6 +1137,7 @@ def main():
             "sceneProfile": "exterior_daylight",
             "exteriorSignals": exterior_signals,
             "level0Scene": scene,
+            "level4QC": qc,
             "hdrRecovery": hdr_report,
             "metrics": {
                 "whiteBalanceStrength": wb_strength,
@@ -1258,6 +1278,16 @@ def main():
 
     histogram_stats = shadow_highlight_stats(img)
 
+    # ── Stage 4: Vision QC (added Aug 2026, LOG-ONLY) ────────────────────
+    # See level2_qc.py docstring. Compares original_img_for_qc (pre-
+    # correction) against the final `img` (post-correction, full interior
+    # MLS Bright stack applied). Result is included in the JSON output
+    # but never blocks or changes what's returned -- purely observational
+    # until reviewed against real photo volume.
+    qc = qc_check(original_img_for_qc, img)
+    if qc.get("looksArtificial") is True:
+        modules_applied.append("qc_flagged_possible_artifact")
+
     cv2.imwrite(args.output, img, [int(cv2.IMWRITE_JPEG_QUALITY), 94])
 
     print(json.dumps({
@@ -1275,6 +1305,7 @@ def main():
         "level2Vision": level2_report,
         "level2Diagnosis": diagnosis_report,
         "level0Scene": scene,
+        "level4QC": qc,
         "metrics": {
             "whiteBalanceStrength": wb_strength,
             "lensCorrectionStrength": lens_strength,
