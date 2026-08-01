@@ -85,13 +85,22 @@ function correctOneImage(image, workDir) {
       try {
         const parsed = JSON.parse(stdout.trim());
         const correctedBase64 = fs.readFileSync(outputPath).toString("base64");
+        // Previously hand-picked six fields (modulesApplied, modulesSkipped,
+        // perspectiveCorrectionDegrees) and silently dropped everything
+        // else smartCorrect.py computes -- including level0Scene and
+        // level4QC, which meant neither ever reached the browser despite
+        // being correctly generated on every request. Spread the full
+        // parsed object instead so nothing gets dropped; `output` is
+        // excluded since it's just a local file path on this container,
+        // not useful to the client. id/status/correctedBase64 are set
+        // after the spread so they always win over anything (unexpected)
+        // with the same key in `parsed`.
+        const { output: _localOutputPath, ...restOfParsed } = parsed;
         resolve({
+          ...restOfParsed,
           id: image.id,
           status: "done",
           correctedBase64,
-          modulesApplied: parsed.modulesApplied,
-          modulesSkipped: parsed.modulesSkipped,
-          perspectiveCorrectionDegrees: parsed.perspectiveCorrectionDegrees,
         });
       } catch (err) {
         console.error(`[correctOneImage] ${image.id}: failed to read/parse output. stdout: ${stdout.slice(0, 300)} | err: ${err.message}`);
