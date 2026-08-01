@@ -1054,8 +1054,7 @@ def main():
     # LEVEL0_SHADOW_MODE is flipped to false. See level0_scene_classifier.py
     # docstring for the full rollout plan and why this exists (IMG_8305
     # false negative on a close-up driveway/stucco exterior).
-    _, encoded_for_vision = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-    scene = resolve_scene_type(encoded_for_vision.tobytes(), is_exterior_hsv)
+    scene = resolve_scene_type(img, is_exterior_hsv)
     is_exterior = scene["isExterior"]
     if scene["disagreement"]:
         modules_applied.append(
