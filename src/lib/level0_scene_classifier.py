@@ -85,6 +85,19 @@ indoor surfaces (walls, ceiling, floor, furniture) dominate the frame. A \
 close-up of a driveway, garage door, stucco wall, patio, pool deck, or \
 building facade is EXTERIOR, even with little sky or grass visible.
 
+WATCH FOR THIS SPECIFIC TRAP: covered outdoor spaces — patios, breezeways, \
+covered balconies, verandas, covered walkways — often have a finished \
+ceiling, recessed can lighting, and tile or concrete flooring that can look \
+"indoor" at a glance. Do NOT classify based on ceiling finish, lighting \
+fixtures, or floor material alone. Instead, look for OPEN AIR: a railing, \
+column, or open edge with unobstructed depth beyond it (distant rooftops, \
+trees, sky, or yard visible past that edge, even out of focus or in a thin \
+sliver). If that open-air depth is present, this is a COVERED EXTERIOR \
+space, not an interior room — classify it as exterior. True interiors have \
+walls (not railings) closing off the space, and anything visible through a \
+window is a distinct, framed view rather than open depth running past an \
+open edge.
+
 Respond with ONLY strict JSON, no markdown fences, no preamble, no \
 explanation outside the JSON:
 {"sceneType": "interior" | "exterior", "confidence": "high" | "medium" | "low", "reasoning": "<one sentence>"}"""
