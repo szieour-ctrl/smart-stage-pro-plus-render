@@ -102,6 +102,7 @@ import numpy as np
 
 from hdrRecover import recover_hdr_if_present, looks_like_heic
 from level2_vision_regions import get_level2_regions
+from level2_diagnosis import diagnose as level2_diagnose
 
 # Kill switch, matching the existing END_FRAME_ENABLED pattern in this
 # codebase — lets HDR recovery be disabled instantly via Railway env var
@@ -1036,6 +1037,29 @@ def main():
     # banding as a side effect. See is_exterior_daylight() docstring for
     # detection method and known limitations.
     is_exterior, exterior_signals = is_exterior_daylight(img)
+
+    # ── Level 2 Stage 1: Vision diagnosis (added Aug 2026, LOG-ONLY) ─────
+    # Prototype from the same design session as the Level 2 region masks
+    # above. Runs a single Vision call combining the photo with the
+    # pipeline's own real computed stats (image_stats, white_surface_stats,
+    # shadow_highlight_stats) to get a qualitative read on WHAT KIND of
+    # correction this photo needs -- e.g. distinguishing a backlit photo
+    # (needs targeted shadow lift, protect the highlights) from an evenly
+    # underexposed one (safe for a more uniform lift), which the numeric
+    # thresholds alone can't tell apart.
+    #
+    # DELIBERATELY NOT ACTING ON THIS YET: the diagnosis is logged into
+    # the JSON output and as a readable tag below, but does not change
+    # any correction behavior in this version. This is so real diagnoses
+    # can be reviewed across real photo volume before trusting this to
+    # drive routing decisions -- see level2_diagnosis.py's own docstring
+    # for the full reasoning and status.
+    diagnosis, diagnosis_report = level2_diagnose(
+        img, image_stats(img), white_surface_stats(img), shadow_highlight_stats(img), is_exterior,
+    )
+    if diagnosis is not None:
+        modules_applied.append(f"ai_diagnosis_{diagnosis.get('diagnosis', 'unknown')}")
+
     if is_exterior:
         img, wb_strength = white_balance_neutral_aware(img)
         if wb_strength >= 0.1:
@@ -1224,6 +1248,7 @@ def main():
         "professionalMLSGuard": guard,
         "hdrRecovery": hdr_report,
         "level2Vision": level2_report,
+        "level2Diagnosis": diagnosis_report,
         "metrics": {
             "whiteBalanceStrength": wb_strength,
             "lensCorrectionStrength": lens_strength,
