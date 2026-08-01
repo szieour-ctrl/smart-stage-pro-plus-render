@@ -139,7 +139,14 @@ def _call_vision_api(image_b64: str, media_type: str) -> dict:
         text = text.strip("`")
         if text.lower().startswith("json"):
             text = text[4:]
-    return json.loads(text.strip())
+    text = text.strip()
+
+    # Use raw_decode rather than a plain json.loads: models occasionally
+    # append trailing text after a complete, valid JSON object despite
+    # being told not to (confirmed failure mode in level2_qc.py's
+    # identical parsing logic -- "Extra data: line 2 column 1"). This
+    # parses just the first valid JSON value and ignores anything after.
+    return json.JSONDecoder().raw_decode(text)[0]
 
 
 def classify_scene(img) -> SceneClassification:
