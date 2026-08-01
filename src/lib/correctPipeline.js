@@ -70,6 +70,18 @@ function correctOneImage(image, workDir) {
           error: `smartCorrect.py failed (exit ${code}): ${stderr.slice(0, 500)}`,
         });
       }
+      // Even on success, smartCorrect.py may have written Python
+      // logging.warning()/error() output to stderr (e.g. a degraded
+      // Vision call in level0_scene_classifier.py or level2_diagnosis.py
+      // that failed gracefully rather than crashing the process). That
+      // output was previously discarded entirely on the success path --
+      // log it (truncated) so it shows up in Railway's logs instead of
+      // silently vanishing. Not using console.error here since this
+      // isn't necessarily an error; a truly failed correction still hits
+      // the `code !== 0` branch above.
+      if (stderr.trim()) {
+        console.log(`[correctOneImage] ${image.id}: stderr (non-fatal): ${stderr.trim().slice(0, 800)}`);
+      }
       try {
         const parsed = JSON.parse(stdout.trim());
         const correctedBase64 = fs.readFileSync(outputPath).toString("base64");
