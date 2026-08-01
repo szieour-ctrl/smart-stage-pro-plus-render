@@ -99,6 +99,13 @@ for _var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS",
 
 import cv2
 import numpy as np
+import logging
+
+# Without this, logger.info() calls anywhere in the process (e.g.
+# level0_scene_classifier.py's "disabled"/"disagreement" messages) are
+# silently dropped by Python's default root logger level (WARNING).
+# Writes to stderr, matching correctPipeline.js's stderr capture.
+logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
 
 from hdrRecover import recover_hdr_if_present, looks_like_heic
 from level2_vision_regions import get_level2_regions
@@ -1111,6 +1118,7 @@ def main():
             },
             "sceneProfile": "exterior_daylight",
             "exteriorSignals": exterior_signals,
+            "level0Scene": scene,
             "hdrRecovery": hdr_report,
             "metrics": {
                 "whiteBalanceStrength": wb_strength,
@@ -1267,6 +1275,7 @@ def main():
         "hdrRecovery": hdr_report,
         "level2Vision": level2_report,
         "level2Diagnosis": diagnosis_report,
+        "level0Scene": scene,
         "metrics": {
             "whiteBalanceStrength": wb_strength,
             "lensCorrectionStrength": lens_strength,
