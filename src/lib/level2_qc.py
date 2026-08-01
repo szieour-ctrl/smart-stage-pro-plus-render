@@ -121,7 +121,15 @@ def _call_vision_api(original_b64: str, corrected_b64: str, media_type: str) -> 
         text = text.strip("`")
         if text.lower().startswith("json"):
             text = text[4:]
-    return json.loads(text.strip())
+    text = text.strip()
+
+    # Use raw_decode rather than a plain json.loads: despite the prompt
+    # saying "ONLY JSON, no prose", models occasionally append a trailing
+    # sentence after a complete, valid JSON object (confirmed on a real
+    # response here -- "Extra data: line 2 column 1"). raw_decode parses
+    # just the first valid JSON value and ignores anything after it,
+    # rather than failing the whole call over trailing chatter.
+    return json.JSONDecoder().raw_decode(text)[0]
 
 
 def _encode_for_vision(img) -> Optional[str]:
