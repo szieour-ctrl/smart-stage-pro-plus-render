@@ -107,7 +107,7 @@ import logging
 # Writes to stderr, matching correctPipeline.js's stderr capture.
 logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
 
-from hdrRecover import recover_hdr_if_present, looks_like_heic
+from hdrRecover import recover_hdr_if_present, looks_like_heic, decode_standard
 from level2_vision_regions import get_level2_regions
 from level2_diagnosis import diagnose as level2_diagnose
 from level0_scene_classifier import resolve_scene_type
@@ -1037,13 +1037,36 @@ def main():
     modules_applied = []
     skipped = ["color_uniformity_harmonization", "reflection_glare_reduction"]
 
-    # ── Stage 4 QC snapshot (added Aug 2026) ─────────────────────────────
-    # Captured here, before any correction touches `img`, so Stage 4's
-    # QC pass (level2_qc.py) has a real "before" to compare against --
-    # by the time main() reaches its output blocks, `img` has already
-    # been reassigned through the correction chain (white balance, lens,
-    # deskew, denoise, brightness lift, etc.) and the original is gone.
-    original_img_for_qc = img.copy()
+    # ── Stage 4 QC snapshot (added Aug 2026; FIXED Aug 2, 2026) ──────────
+    # BUG FOUND (Aug 2, 2026, via real photo IMG_8311): this used to be
+    # `img.copy()` taken here -- but by this point `img` has ALREADY been
+    # through HDR gain-map recovery (see recover_hdr_if_present() above),
+    # if a gain map was present. That meant "original_img_for_qc" was
+    # never actually the camera-original -- it was the post-HDR-recovery
+    # image. Any artifact HDR recovery itself introduced (e.g. the
+    # gain-map/base-photo gradient-covariance streak documented in
+    # hdrRecover.py's module docstring) was already baked into BOTH sides
+    # of every qc_check() comparison below, since nothing downstream of
+    # HDR recovery removes it. QC was structurally incapable of catching
+    # this entire class of bug, independent of prompt quality or model
+    # choice -- confirmed on IMG_8311: a real, visible amber streak on
+    # the pool-deck concrete produced looksArtificial=false at HIGH
+    # confidence, because from QC's point of view nothing had changed in
+    # that region between the two images it was actually shown.
+    #
+    # Fix: build the QC baseline from decode_standard(args.source) -- the
+    # SAME raw-decode function recover_hdr_if_present() calls internally
+    # for its own base_img, so this is guaranteed to be the true
+    # pre-HDR-recovery original, decoded the identical way. Falls back to
+    # img.copy() only if that raw decode fails for some reason HDR
+    # recovery's own error handling didn't already catch (shouldn't
+    # happen in practice -- by this point `img` exists, so some decode
+    # already succeeded).
+    try:
+        original_img_for_qc = decode_standard(args.source)
+    except Exception as e:
+        print(f"[smartCorrect] Could not build raw QC baseline, falling back to post-HDR img: {e}", file=sys.stderr)
+        original_img_for_qc = img.copy()
 
     # ── Exterior daylight scene gate (patch, pending validation) ────────
     # Confirmed directly on a real photo (IMG_8311, pool/patio) that the
