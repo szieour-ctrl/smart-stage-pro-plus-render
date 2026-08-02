@@ -934,7 +934,43 @@ def mls_brightness_lift(img, intensity=1.0, dark_material_mask=None, regions=Non
     # unchanged or improved vs. the uncorrected original).
     fusion_median = float(np.median(l))
     target_median = 168.0
-    gap = target_median - fusion_median
+
+    # ── WhiteFraction-adjusted effective target (Aug 2, 2026) ────────────
+    # Confirmed on a real photo (IMG_8317, original whiteFraction 0.504 --
+    # cream walls, white mantle/ceiling, nearly half the frame already
+    # light-colored) that forcing the SAME universal 168 target used for
+    # genuinely dark rooms produces something Sam flagged as "bordering
+    # on too much white" -- and measurement confirmed it wasn't literal
+    # clipping (near-blown/blown pixel fractions actually DROPPED vs. the
+    # original), it was band CONCENTRATION: the [220,240) luma band grew
+    # from 9.7% to 21.9% of the entire frame, more than doubling, because
+    # a room with this much already-light surface has less real headroom
+    # to absorb the same push before a large fraction of the frame
+    # compresses into one narrow near-white range.
+    #
+    # Fix: a room whose whiteFraction exceeds a normal baseline (~0.30 --
+    # typical trim/ceiling/some walls) gets a proportionally lower
+    # target, so it settles wherever fusion's own natural output already
+    # lands instead of being force-pushed further. K=35 chosen because it
+    # empirically reproduces exactly this: at IMG_8317's real
+    # whiteFraction (0.504), effective_target lands at ~161 -- right at
+    # the point where the residual solve's own gap>3.0 gate naturally
+    # stops firing, letting fusion's unforced result (median 160, band
+    # occupancy 0.349/0.101) stand, which is nearly IDENTICAL to the
+    # ORIGINAL photo's own band occupancy (0.349/0.097) -- i.e. no
+    # compression effect at all, while still keeping a real +6 lift over
+    # the source. Rooms below the baseline (IMG_8315 at 0.236, IMG_8301
+    # at 0.309) are effectively unaffected -- confirmed both still land
+    # within a point of the full 168 target, since the formula only
+    # engages once whiteFraction exceeds 0.30.
+    WHITE_FRACTION_TARGET_BASELINE = 0.30
+    WHITE_FRACTION_TARGET_K = 35.0
+    white_fraction = white_surface_stats(img)["whiteFraction"]
+    effective_target_median = target_median - max(
+        0.0, white_fraction - WHITE_FRACTION_TARGET_BASELINE
+    ) * WHITE_FRACTION_TARGET_K
+
+    gap = effective_target_median - fusion_median
     residual_need = clamp01(gap / 100.0)  # kept for the metrics/report field
 
     # Regional protect/boost still applies here -- a SEPARATE, legitimate
@@ -953,7 +989,7 @@ def mls_brightness_lift(img, intensity=1.0, dark_material_mask=None, regions=Non
     if gap > 3.0:
         normalized = np.clip(l / 255.0, 0, 1)
         fusion_median_norm = np.clip(fusion_median / 255.0, 1e-4, 0.999)
-        target_norm = np.clip(target_median / 255.0, 1e-4, 0.999)
+        target_norm = np.clip(effective_target_median / 255.0, 1e-4, 0.999)
         gamma_solved = float(np.log(target_norm) / np.log(fusion_median_norm))
         # Blend between "no change" (gamma=1.0) and the full solve, per
         # pixel, via residual_apply_map -- a protected region stays near
@@ -1006,6 +1042,8 @@ def mls_brightness_lift(img, intensity=1.0, dark_material_mask=None, regions=Non
         "before_mean_luma": round(before_mean, 2),
         "after_fusion_median_luma": round(fusion_median, 2),
         "target_median_luma": target_median,
+        "effectiveTargetMedianLuma": round(effective_target_median, 2),
+        "whiteFractionAtCorrectionTime": round(white_fraction, 4),
         "residual_need": round(float(residual_need), 3),
         "method": "synthetic_exposure_fusion",
         "level2DarkMaterialMaskApplied": dark_material_mask is not None,
