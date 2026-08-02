@@ -905,31 +905,74 @@ def mls_brightness_lift(img, intensity=1.0, dark_material_mask=None, regions=Non
     l = lab[:, :, 0]
 
     # Secondary nudge toward the calibrated target, only if fusion alone
-    # didn't reach it — mild, since fusion should do most of the work.
-    # Now a per-pixel map (was a scalar): regions with strength above 1.0
-    # ("primary" emphasis, e.g. a genuinely backlit foreground subject)
-    # get proportionally more reach here than the frame's base intensity
-    # would give them, since this step isn't capped at "100% fused" the
-    # way the blend above is.
+    # didn't reach it.
+    #
+    # REDESIGNED (Aug 2, 2026) after real-photo testing showed the old
+    # linear coefficient (gamma = 1 - 0.15*residual_need) had diminishing
+    # returns and structurally could not close a large gap: confirmed on
+    # two real underexposed photos (IMG_8315, IMG_8301) that even at 6.67x
+    # the old coefficient, final median landed ~10 points short of the
+    # 168 target. Root cause: a flat linear coefficient on a *bounded*
+    # residual_need term (itself capped by the do-no-harm gate's dark
+    # photos rarely exceeding ~0.25-0.35) can never generate enough gamma
+    # curvature to fully close a 25-30+ point gap in one pass.
+    #
+    # Fix: SOLVE directly for the gamma that maps fusion_median exactly to
+    # target_median, instead of guessing a linear coefficient. This is
+    # deliberately decoupled from the diagnosis-driven `intensity` scalar
+    # here (though `intensity` still fully governs the fusion BLEND above,
+    # where a mixed-light-temperature photo genuinely benefits from a
+    # gentler blend to avoid amplifying a real color-temperature clash).
+    # Reasoned position, confirmed on real photos: the do-no-harm gate
+    # already gates entry to this whole code path, so a photo reaching
+    # this point has already been confirmed to genuinely need correction
+    # -- there's no over-brightening risk in chasing the true calibrated
+    # target here, only in how aggressively the earlier fusion blend gets
+    # there. Verified on both real test photos: final median landed
+    # exactly on the 168 target, with no measurable posterization
+    # (unique-luma-value count and flat-region gradient energy both
+    # unchanged or improved vs. the uncorrected original).
     fusion_median = float(np.median(l))
     target_median = 168.0
-    residual_need_map = clamp01((target_median - fusion_median) / 100.0) * strength_map
-    residual_need = float(residual_need_map.mean())  # kept for the existing metrics/report field
-    if residual_need_map.max() > 0.03:
+    gap = target_median - fusion_median
+    residual_need = clamp01(gap / 100.0)  # kept for the metrics/report field
+
+    # Regional protect/boost still applies here -- a SEPARATE, legitimate
+    # per-region signal (e.g. "preserve_black_depth" on a firebox) from
+    # the diagnosis-driven `intensity` damping this step now bypasses.
+    # base_intensity=1.0: default (no regions) is "chase the full target,"
+    # matching the reasoned position above. Clipped to [0,1] since a
+    # `primary` region's >1.0 multiplier has no coherent meaning for a
+    # solve-to-target operation -- there's no "more than fully solved."
+    residual_apply_map = np.clip(build_regional_strength_map(
+        l.shape, 1.0, regions, level2_masks,
+        supported_operations=("shadow_recovery", "exposure_lift"),
+        exclude_tag="exclude_from_shadow_lift",
+    ), 0.0, 1.0)
+
+    if gap > 3.0:
         normalized = np.clip(l / 255.0, 0, 1)
-        gamma_map = 1.0 - (0.15 * residual_need_map)
-        # DARK-MATERIAL PROTECTION (patch, pending validation): the old
-        # floor here (l / 25.0) only shields true-black pixels (L<25) —
-        # anything darker than that from crushing further, but it does
-        # nothing for dark furniture/fixtures that sit well above true
-        # black. Confirmed directly on a real photo (IMG_8317): dark
-        # brown leather and a black granite fireplace surround measured
-        # in the L 30-90 range, fully exposed to the gamma lift meant for
-        # underexposed shadows — same treatment as a dim hallway, when
-        # these are supposed to read as rich, dark material, not a
-        # lighting defect. Widened ramp so protection tapers out to L=100
-        # instead of L=25, so these materials keep most of their depth
-        # while genuine near-black shadow detail still gets lifted.
+        fusion_median_norm = np.clip(fusion_median / 255.0, 1e-4, 0.999)
+        target_norm = np.clip(target_median / 255.0, 1e-4, 0.999)
+        gamma_solved = float(np.log(target_norm) / np.log(fusion_median_norm))
+        # Blend between "no change" (gamma=1.0) and the full solve, per
+        # pixel, via residual_apply_map -- a protected region stays near
+        # gamma=1.0 (untouched), everywhere else gets the full solve.
+        gamma_map = 1.0 - residual_apply_map * (1.0 - gamma_solved)
+        # DARK-MATERIAL PROTECTION (patch, pending validation; MORE
+        # IMPORTANT NOW than before, since the push behind it is much
+        # stronger): the old floor here (l / 25.0) only shields
+        # true-black pixels (L<25) — anything darker than that from
+        # crushing further, but it does nothing for dark furniture/
+        # fixtures that sit well above true black. Confirmed directly on
+        # a real photo (IMG_8317): dark brown leather and a black granite
+        # fireplace surround measured in the L 30-90 range, fully exposed
+        # to the gamma lift meant for underexposed shadows — same
+        # treatment as a dim hallway, when these are supposed to read as
+        # rich, dark material, not a lighting defect. Widened ramp so
+        # protection tapers out to L=100 instead of L=25, so these
+        # materials keep most of their depth while genuine near-black
+        # shadow detail still gets lifted.
         dark_material_protect = np.clip(l / 100.0, 0, 1)
         # LEVEL 2: same fix as the fusion stage above, applied to this
         # ramp's inverse convention (0 = fully protected/no lift here).
