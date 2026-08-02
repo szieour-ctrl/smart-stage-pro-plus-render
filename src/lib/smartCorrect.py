@@ -124,6 +124,111 @@ def clamp01(x):
     return float(np.clip(x, 0.0, 1.0))
 
 
+# ── Regional execution engine (Aug 2, 2026) ─────────────────────────────
+# Converts the Vision-produced per-region schema (region/maskId/
+# regionType/operation/priority/protections/confidence -- see the
+# Retoucher Schema spec) into a per-pixel parameter map any classical CV
+# function can consume in place of a single global `intensity` scalar.
+#
+# This is a GENERALIZATION of a pattern already proven in this file:
+# dark_material_mask and exclusion_weight (used by mls_brightness_lift
+# and clean_whites_adaptive today) are both already continuous,
+# heavily-feathered float masks meaning "how much to hold this back" --
+# a single fixed category. This makes that mechanism general: any number
+# of named, Vision-directed regions, each able to either boost or
+# protect, instead of one hardcoded exclusion category.
+#
+# Protection is evaluated LAST and always wins at its mask's footprint
+# (conflictPolicy.protectOverridesPrimary /
+# materialProtectionOverridesGlobalAdjustment from the schema spec),
+# feathered at the boundary using the same np.maximum + multiplicative
+# blend pattern already proven for dark_material_mask -- NOT a hard
+# boolean cutover, which is the exact failure mode that caused the Level
+# 2 rug-seam bug and the second hdrRecover.py fix attempt. A region only
+# gets to boost if BOTH its confidence clears the bar AND its
+# `operation` is one this specific function knows how to execute --
+# every function only listens to the operations relevant to what IT
+# does, exactly as the schema spec's "operation, not directive" design
+# requires.
+REGIONAL_CONFIDENCE_FLOOR = 0.6  # below this, a region's instruction is ignored entirely
+REGIONAL_UNIVERSAL_PROTECT_OPERATIONS = ("no_change", "hue_protection", "saturation_protection")
+REGIONAL_PRIORITY_MULTIPLIER = {"primary": 1.35, "secondary": 1.15}
+# Operations meaning "dial this down, not off" -- distinct from `protect`
+# (full exclusion from every operation) and from primary/secondary boost.
+# A clarity_reduction region still gets normal treatment from every OTHER
+# function; only the specific mechanism this operation names is reduced,
+# and only partially, matching a human editor's "ease off here" rather
+# than "don't touch this at all."
+REGIONAL_REDUCTION_OPERATIONS = ("clarity_reduction",)
+REGIONAL_REDUCTION_MULTIPLIER = 0.35
+
+
+def build_regional_strength_map(shape, base_intensity, regions, level2_masks,
+                                  supported_operations, exclude_tag=None):
+    """Returns a float32 (H,W) array, defaulting to base_intensity
+    everywhere (so a photo with no regions, or regions this function
+    doesn't act on, behaves EXACTLY as today's scalar-intensity code
+    did -- opt-in only, never worse than today).
+
+    shape: (H, W) of the image being corrected.
+    base_intensity: today's existing scalar (from adaptive_intensity /
+        diagnosis bias) -- the map's floor value.
+    regions: list of region dicts from the Vision schema. None or []
+        -> returns a uniform base_intensity array, unchanged behavior.
+    level2_masks: dict of maskId -> feathered float32 (H,W) mask in
+        [0,1], from level2_vision_regions.py. A region whose maskId
+        isn't present is skipped, not errored -- a missing mask should
+        never crash a correction pass.
+    supported_operations: set/tuple of `operation` values this specific
+        function should act on (e.g. mls_brightness_lift listens for
+        "shadow_recovery"/"exposure_lift" and ignores everything else,
+        even in regional mode).
+    exclude_tag: this function's specific `protections` tag (e.g.
+        "exclude_from_shadow_lift") checked IN ADDITION to the universal
+        protect checks below.
+    """
+    strength = np.full(shape, float(base_intensity), dtype=np.float32)
+    if not regions or not level2_masks:
+        return strength
+
+    protect_accum = np.zeros(shape, dtype=np.float32)
+
+    for region in regions:
+        mask = level2_masks.get(region.get("maskId"))
+        if mask is None:
+            continue
+        confidence = region.get("confidence", 1.0)
+        if isinstance(confidence, str):
+            confidence = {"high": 0.9, "medium": 0.7, "low": 0.4}.get(confidence, 0.5)
+        if confidence < REGIONAL_CONFIDENCE_FLOOR:
+            continue
+
+        protections = region.get("protections") or []
+        is_universal_protect = (
+            region.get("priority") == "protect"
+            or region.get("operation") in REGIONAL_UNIVERSAL_PROTECT_OPERATIONS
+            or (exclude_tag is not None and exclude_tag in protections)
+        )
+        if is_universal_protect:
+            protect_accum = np.maximum(protect_accum, mask.astype(np.float32))
+            continue
+
+        operation = region.get("operation")
+        if operation not in supported_operations:
+            continue
+
+        m = mask.astype(np.float32)
+        if operation in REGIONAL_REDUCTION_OPERATIONS:
+            target_value = base_intensity * REGIONAL_REDUCTION_MULTIPLIER
+        else:
+            target_value = base_intensity * REGIONAL_PRIORITY_MULTIPLIER.get(region.get("priority"), 1.0)
+        strength = strength * (1.0 - m) + target_value * m
+
+    # Protection applied last, feathered, always wins -- never a hard cut.
+    strength = strength * (1.0 - protect_accum)
+    return np.clip(strength, 0.0, 1.5).astype(np.float32)
+
+
 # ── Measurement helpers (read-only, no pixel changes) ──────────────────────
 
 def image_stats(img):
@@ -330,13 +435,28 @@ def assess_professional_mls_bright(img):
 
 # ── Technical correction layer ──────────────────────────────────────────────
 
-def white_balance_neutral_aware(img):
+def white_balance_neutral_aware(img, regions=None, level2_masks=None):
     """White balance using likely-neutral surfaces (trim, doors, cabinets,
     ceilings) as the primary reference, falling back to gray-world when
     there aren't enough neutral candidates in frame. More targeted than
     pure gray-world, per Sam's calibrated reference — real estate photos
     are full of genuinely colorful content (wood, furniture) that pulls a
-    whole-image average away from true neutral."""
+    whole-image average away from true neutral.
+
+    regions / level2_masks (Aug 2, 2026, optional): applies the SAME
+    globally-computed cast-correction scales below, per-pixel, instead of
+    uniformly across the whole frame -- e.g. a region tagged
+    operation="white_balance_adjustment" can get more of the correction
+    than the frame's baseline, and a `protect` region gets none.
+
+    NOT HANDLED (deliberately, honestly): operation="mixed_light_balance"
+    -- per the schema spec, this means two genuinely different color
+    temperatures in one frame need DIFFERENT corrections, not more/less
+    of the SAME one. That requires computing separate neutral-reference
+    statistics per region, not just gating this one global scale — a
+    real, separate capability this pass does not build. A
+    mixed_light_balance region is silently ignored here (falls through
+    "not in supported_operations"), not faked with a wrong mechanism."""
     bgr = img.astype(np.float32)
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     h, s, v = cv2.split(hsv)
@@ -378,10 +498,21 @@ def white_balance_neutral_aware(img):
     if is_warm_cast:
         strength *= 0.35
 
-    applied = 1.0 + strength * (scales - 1.0)
+    # ── Regional strength map (Aug 2, 2026) ──────────────────────────────
+    # base_intensity=strength (today's single computed scalar) so a photo
+    # with no regions behaves EXACTLY as before -- the map's floor value
+    # IS today's answer, not a different default.
+    h_px, w_px = img.shape[:2]
+    strength_map = build_regional_strength_map(
+        (h_px, w_px), strength, regions, level2_masks,
+        supported_operations=("white_balance_adjustment",),
+        exclude_tag="exclude_from_white_balance",
+    )
 
-    out = bgr * applied.reshape(1, 1, 3)
-    return np.clip(out, 0, 255).astype(np.uint8), round(strength, 3)
+    applied = 1.0 + strength_map[:, :, None] * (scales.reshape(1, 1, 3) - 1.0)
+
+    out = bgr * applied
+    return np.clip(out, 0, 255).astype(np.uint8), round(float(strength_map.mean()), 3)
 
 
 def mild_mobile_lens_correction(img, mode="auto"):
@@ -627,7 +758,7 @@ def vignette_correct(img):
 
 # ── MLS Bright finish layer (calibrated against real MLS Bright photos) ────
 
-def mls_brightness_lift(img, intensity=1.0, dark_material_mask=None):
+def mls_brightness_lift(img, intensity=1.0, dark_material_mask=None, regions=None, level2_masks=None):
     """Interior-first MLS brightness pass.
 
     dark_material_mask (Level 2, optional): float32 (H,W) array in [0,1]
@@ -639,6 +770,17 @@ def mls_brightness_lift(img, intensity=1.0, dark_material_mask=None):
     L<40 taper-to-L=140 window's strongest protection) from ordinary
     midtone content that should lift normally. None = original
     luma-only behavior, unchanged.
+
+    regions / level2_masks (Aug 2, 2026, optional): the Vision region
+    schema and its corresponding masks. When supplied, replaces the
+    single scalar `intensity` with a per-pixel strength map built by
+    build_regional_strength_map() — e.g. a backlit foreground chair
+    (operation="shadow_recovery", priority="primary") gets MORE lift
+    than the frame's base intensity, while a region tagged `protect` or
+    "exclude_from_shadow_lift" gets none, regardless of the global
+    setting. When None (the default), behavior is IDENTICAL to before
+    this parameter existed — every call site in this file today doesn't
+    pass these, so nothing changes for existing callers.
 
     REDESIGNED (July 8, 2026) after Sam directly flagged that a single
     global gamma curve didn't achieve real "professional balance" between
@@ -674,6 +816,18 @@ def mls_brightness_lift(img, intensity=1.0, dark_material_mask=None):
     l_before = lab[:, :, 0]
     before_median = float(np.median(l_before))
     before_mean = float(l_before.mean())
+
+    # ── Regional strength map (Aug 2, 2026) ──────────────────────────────
+    # Built once, up front, so it can drive both the fusion blend below
+    # AND the residual gamma nudge later — same map, two consumers.
+    # Falls back to a uniform `intensity` array when regions aren't
+    # supplied, so every downstream line below behaves exactly as before.
+    strength_map = build_regional_strength_map(
+        l_before.shape, intensity, regions, level2_masks,
+        supported_operations=("shadow_recovery", "exposure_lift"),
+        exclude_tag="exclude_from_shadow_lift",
+    )
+    regional_mode = regions is not None and level2_masks is not None
 
     # Synthetic exposure brackets from the one real photo — linear
     # exposure-stop scaling (roughly -1.5 / +1.7 stops), closer to how
@@ -735,20 +889,35 @@ def mls_brightness_lift(img, intensity=1.0, dark_material_mask=None):
     lab_hybrid[:, :, 0] = protected_l
     fused = cv2.cvtColor(lab_hybrid, cv2.COLOR_LAB2BGR)
 
-    # Blend fusion result with the original by `intensity`, so the
-    # existing intensity dial (0.6-1.25) still controls overall strength.
-    blended = cv2.addWeighted(fused, intensity, img, 1.0 - intensity, 0) if intensity < 1.0 else fused
+    # Blend fusion result with the original using the strength map,
+    # per-pixel, instead of a single scalar. Clipped to [0,1] for THIS
+    # blend specifically — fusion is bounded (there's no "more than 100%
+    # fused" image to blend toward); a region's strength above 1.0
+    # ("primary" emphasis) instead gets more reach in the residual gamma
+    # nudge below, which is a separate, effectively-unbounded technique.
+    # When strength_map is uniform (non-regional callers), this is
+    # arithmetically identical to the old
+    # `addWeighted(fused, intensity, img, 1-intensity, 0)` call.
+    blend_map = np.clip(strength_map, 0.0, 1.0)[:, :, None]
+    blended = (fused.astype(np.float32) * blend_map + img.astype(np.float32) * (1.0 - blend_map))
+    blended = np.clip(blended, 0, 255).astype(np.uint8)
     lab = cv2.cvtColor(blended, cv2.COLOR_BGR2LAB).astype(np.float32)
     l = lab[:, :, 0]
 
     # Secondary nudge toward the calibrated target, only if fusion alone
     # didn't reach it — mild, since fusion should do most of the work.
+    # Now a per-pixel map (was a scalar): regions with strength above 1.0
+    # ("primary" emphasis, e.g. a genuinely backlit foreground subject)
+    # get proportionally more reach here than the frame's base intensity
+    # would give them, since this step isn't capped at "100% fused" the
+    # way the blend above is.
     fusion_median = float(np.median(l))
     target_median = 168.0
-    residual_need = clamp01((target_median - fusion_median) / 100.0) * intensity
-    if residual_need > 0.03:
+    residual_need_map = clamp01((target_median - fusion_median) / 100.0) * strength_map
+    residual_need = float(residual_need_map.mean())  # kept for the existing metrics/report field
+    if residual_need_map.max() > 0.03:
         normalized = np.clip(l / 255.0, 0, 1)
-        gamma = 1.0 - (0.15 * residual_need)
+        gamma_map = 1.0 - (0.15 * residual_need_map)
         # DARK-MATERIAL PROTECTION (patch, pending validation): the old
         # floor here (l / 25.0) only shields true-black pixels (L<25) —
         # anything darker than that from crushing further, but it does
@@ -769,7 +938,7 @@ def mls_brightness_lift(img, intensity=1.0, dark_material_mask=None):
         # protection in the L 40-100 range.
         if dark_material_mask is not None:
             dark_material_protect = dark_material_protect * (1.0 - dark_material_mask)
-        l = (255.0 * np.power(normalized, gamma)) * dark_material_protect + l * (1.0 - dark_material_protect)
+        l = (255.0 * np.power(normalized, gamma_map)) * dark_material_protect + l * (1.0 - dark_material_protect)
 
     # Highlight/window protection — compress rather than let anything blow out.
     # WIDENED CEILING (patch, pending validation): confirmed on real photos
@@ -797,10 +966,12 @@ def mls_brightness_lift(img, intensity=1.0, dark_material_mask=None):
         "residual_need": round(float(residual_need), 3),
         "method": "synthetic_exposure_fusion",
         "level2DarkMaterialMaskApplied": dark_material_mask is not None,
+        "regionalModeApplied": regional_mode,
+        "regionalStrengthRange": [round(float(strength_map.min()), 3), round(float(strength_map.max()), 3)] if regional_mode else None,
     }
 
 
-def clean_whites_adaptive(img, intensity=1.0, exclusion_weight=None):
+def clean_whites_adaptive(img, intensity=1.0, exclusion_weight=None, regions=None, level2_masks=None):
     """Adaptive MLS Bright clean-whites pass — measures actual likely-white
     architectural surfaces (trim, cabinets, ceilings via LAB chroma+luma)
     and only neutralizes/lifts them if they measurably need it, feathered
@@ -813,20 +984,19 @@ def clean_whites_adaptive(img, intensity=1.0, exclusion_weight=None):
     furniture/floor AND dark-material regions. Multiplied in as a "keep"
     weight, not subtracted as a hard AND.
 
-    Two real bugs this fixes, both confirmed on real photos:
-    1. Without ANY exclusion, this function can misclassify a light wood
-       floor, cream sofa, or a specular highlight on polished dark stone
-       (a fireplace surround) as "white trim" and desaturate its real
-       color -- the original boundary-critical case this was built for.
-    2. An earlier HARD-boolean version of the exclusion fixed (1) but
-       introduced a new bug: a coarse Vision box that doesn't fully cover
-       a large surface (e.g. a rug) creates a visible rectangular seam
-       right at the box edge -- corrected on one side, untouched on the
-       other, with no photographic basis for the line. Using a
-       continuous, heavily-feathered weight instead of a hard cutoff
-       (see level2_vision_regions.py's _boxes_to_mask) means a
-       partial-coverage box tapers off gradually instead of stopping
-       dead."""
+    regions / level2_masks (Aug 2, 2026, optional): folds any `protect`-
+    priority region (or one tagged "exclude_from_clean_whites") directly
+    into the SAME exclusion mechanism above, unioned with
+    exclusion_weight rather than replacing it.
+
+    NO BOOST PATHWAY (deliberate, not an oversight): unlike
+    mls_brightness_lift or window_balance, this function doesn't have a
+    natural "do more of this, Vision-directed" instruction -- it already
+    self-detects which surfaces qualify as likely-white via LAB
+    chroma/luma, and corrects only those, automatically. There's no
+    meaningful "primary" version of that beyond what the measurement
+    already computes. Regional input here is protection-only.
+    """
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
     L, A, B = cv2.split(lab)
 
@@ -836,6 +1006,21 @@ def clean_whites_adaptive(img, intensity=1.0, exclusion_weight=None):
 
     white_w = white_mask.astype(np.float32)
     strong_w = strong_white_mask.astype(np.float32)
+
+    # ── Regional protection fold-in (Aug 2, 2026) ────────────────────────
+    # Reuses build_regional_strength_map purely for its protect_accum
+    # logic: pass empty supported_operations so no region can ever boost,
+    # only protect (priority=="protect", or "exclude_from_clean_whites").
+    if regions and level2_masks:
+        regional_keep = build_regional_strength_map(
+            L.shape, 1.0, regions, level2_masks,
+            supported_operations=(), exclude_tag="exclude_from_clean_whites",
+        )
+        exclusion_weight = np.maximum(
+            exclusion_weight if exclusion_weight is not None else 0.0,
+            1.0 - regional_keep,
+        )
+
     if exclusion_weight is not None:
         keep = np.clip(1.0 - exclusion_weight, 0.0, 1.0)
         white_w = white_w * keep
@@ -918,13 +1103,38 @@ def clean_whites_adaptive(img, intensity=1.0, exclusion_weight=None):
     }
 
 
-def window_balance(img):
+def window_balance(img, regions=None, level2_masks=None):
     """Safe window/highlight balancing — compresses overly bright highlight
     regions only. Does not reconstruct exterior detail, replace views, or
-    add any content."""
+    add any content.
+
+    regions / level2_masks (Aug 2, 2026, optional): a region tagged
+    operation="highlight_reduction" can trigger compression even BELOW
+    the automatic L>238 threshold below -- real positive control, not
+    just scaling an already-automatic mask, since Vision may correctly
+    flag a highlight that hasn't technically blown out yet but still
+    reads as excessive (e.g. the schema spec's french_doors example: "the
+    exterior view is already well exposed... reduce only excessive
+    highlights"). A `protect` region (or one tagged
+    "exclude_from_highlight_reduction") is excluded from compression
+    entirely, regardless of brightness."""
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
     l = lab[:, :, 0]
     bright_frac = float((l > 240).sum()) / float(l.size)
+
+    regional_mode = regions is not None and level2_masks is not None
+
+    # ── Regional threshold lowering (Aug 2, 2026) ────────────────────────
+    # base_intensity=0.0: a pixel gets NO regional help by default. A
+    # highlight_reduction region raises that toward 1.0 in its footprint,
+    # which lowers the effective trigger threshold there (see
+    # `effective_threshold` below) -- letting Vision flag a highlight the
+    # automatic global rule wouldn't have caught on its own.
+    regional_boost = build_regional_strength_map(
+        l.shape, 0.0, regions, level2_masks,
+        supported_operations=("highlight_reduction",),
+        exclude_tag="exclude_from_highlight_reduction",
+    ) if regional_mode else np.zeros(l.shape, dtype=np.float32)
 
     # RAISED TRIGGER + SOFTENED RATIO (patch, pending validation): this
     # function runs immediately after mls_brightness_lift(), which already
@@ -937,21 +1147,72 @@ def window_balance(img):
     # only engages for genuinely overexposed highlight regions, and
     # softened the compression ratio so what does trigger doesn't crush
     # highlight detail mls_brightness_lift already preserved.
-    if bright_frac < 0.02:
-        return img, {"applied": False, "highlight_fraction": round(bright_frac, 4)}
+    #
+    # Regional lowering: threshold drops from 238 toward 200 (still not
+    # aggressive -- 200 is a bright midtone, not a shadow) in proportion
+    # to regional_boost, so a flagged-but-not-yet-blown highlight can
+    # still get pulled back where Vision specifically asked for it,
+    # without lowering the bar for the rest of the frame.
+    effective_threshold = 238.0 - (38.0 * regional_boost)
+    mask = np.clip((l - effective_threshold) / 17.0, 0, 1)
+    if regional_mode:
+        # Regions that were pure `protect` (not highlight_reduction) never
+        # raised regional_boost above 0, so they're already excluded from
+        # the threshold-lowering above -- but they should ALSO be excluded
+        # from the ORIGINAL automatic mask (a protected region sitting at
+        # L>238 shouldn't get compressed just because it's naturally
+        # bright). Compute that separately, same protect-only pattern as
+        # clean_whites_adaptive.
+        protect_only = 1.0 - build_regional_strength_map(
+            l.shape, 1.0, regions, level2_masks,
+            supported_operations=(), exclude_tag="exclude_from_highlight_reduction",
+        )
+        mask = mask * (1.0 - protect_only)
 
-    mask = np.clip((l - 238.0) / 17.0, 0, 1)
-    compressed = 238.0 + (l - 238.0) * 0.75
+    # BUG CAUGHT AND FIXED DURING TESTING (Aug 2, 2026): an earlier
+    # version of this gate checked mask.max() >= 0.02, which is nearly
+    # ALWAYS true the instant any single pixel anywhere in the frame
+    # exceeds ~238 -- reproducing the exact over-triggering bug this
+    # function was already patched once to prevent ("fired on nearly any
+    # photo with a window or lamp in it"). Confirmed directly on a real
+    # test photo: a single unrelated bright pixel (unrelated to any
+    # region) drove mask.max() to 1.0 while the actual affected FRACTION
+    # of the frame was 0.49% -- nowhere near meaningful. Fixed: gate on
+    # the fraction of pixels actually crossing threshold, same quantity
+    # and same 0.02 bar the original design used, computed from the
+    # (possibly regionally-lowered) mask so it stays correct in both
+    # modes instead of bypassing the gate entirely in regional mode.
+    triggered_fraction = float((mask > 0.02).mean())
+    if triggered_fraction < 0.02:
+        return img, {"applied": False, "highlight_fraction": round(bright_frac, 4),
+                      "regionalModeApplied": regional_mode}
+
+    compressed = effective_threshold + (l - effective_threshold) * 0.75
     lab[:, :, 0] = np.clip(l * (1.0 - mask) + compressed * mask, 0, 252)
     out = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
-    return out, {"applied": True, "highlight_fraction": round(bright_frac, 4)}
+    return out, {
+        "applied": True,
+        "highlight_fraction": round(bright_frac, 4),
+        "regionalModeApplied": regional_mode,
+    }
 
 
-def mls_color_finish(img, intensity=1.0):
+def mls_color_finish(img, intensity=1.0, regions=None, level2_masks=None):
     """MLS finish: neutral, clean, bright — not editorial. Normalizes
     saturation toward the calibrated MLS Bright target range and adds a
     mild clarity/unsharp pass so the image doesn't read as flat after the
-    brightness and white-surface work above."""
+    brightness and white-surface work above.
+
+    regions / level2_masks (Aug 2, 2026, optional):
+    - operation="hue_protection" or "saturation_protection" on any region
+      already works for free via build_regional_strength_map's universal
+      protect list -- no extra code needed here, applied to the global
+      saturation factor below.
+    - operation="texture_enhancement" boosts the existing automatic
+      texture-based sharpening mask in that region; "clarity_reduction"
+      dials it down (not off) using the new reduction mode -- e.g. a
+      delicate patterned surface Vision wants left softer than the
+      automatic local-variance detector would otherwise sharpen."""
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
     sat_mean = float(hsv[:, :, 1].mean())
 
@@ -961,7 +1222,20 @@ def mls_color_finish(img, intensity=1.0):
         factor = 1.0 - 0.08 * intensity
     else:
         factor = 1.0 - 0.02 * intensity
-    hsv[:, :, 1] = np.clip(hsv[:, :, 1] * factor, 0, 255)
+
+    regional_mode = regions is not None and level2_masks is not None
+    if regional_mode:
+        # base_intensity=1.0 -- "how much of the computed saturation shift
+        # to apply," 1.0 = today's full-strength behavior everywhere a
+        # protect region doesn't override it.
+        sat_regional = build_regional_strength_map(
+            hsv.shape[:2], 1.0, regions, level2_masks,
+            supported_operations=(), exclude_tag="exclude_from_color_finish",
+        )
+        sat_factor_map = 1.0 + sat_regional[:, :, None] * (factor - 1.0)
+        hsv[:, :, 1] = np.clip(hsv[:, :, 1] * sat_factor_map[:, :, 0], 0, 255)
+    else:
+        hsv[:, :, 1] = np.clip(hsv[:, :, 1] * factor, 0, 255)
     color_finished = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
 
     blurred = cv2.GaussianBlur(color_finished, (0, 0), sigmaX=1.2)
@@ -981,12 +1255,22 @@ def mls_color_finish(img, intensity=1.0):
     local_mean = cv2.blur(gray, (9, 9))
     local_sqmean = cv2.blur(gray * gray, (9, 9))
     local_var = np.clip(local_sqmean - local_mean ** 2, 0, None)
-    texture_mask = np.clip(local_var / 60.0, 0, 1)[:, :, None]  # 0 on flat surfaces, 1 on real texture
+    texture_mask = np.clip(local_var / 60.0, 0, 1)  # 0 on flat surfaces, 1 on real texture
 
+    if regional_mode:
+        clarity_regional = build_regional_strength_map(
+            gray.shape, 1.0, regions, level2_masks,
+            supported_operations=("texture_enhancement", "clarity_reduction"),
+            exclude_tag="exclude_from_color_finish",
+        )
+        texture_mask = np.clip(texture_mask * clarity_regional, 0, 1)
+
+    texture_mask = texture_mask[:, :, None]
     sharpened_full = cv2.addWeighted(color_finished, 1.08, blurred, -0.08, 0)
     sharpened = color_finished.astype(np.float32) * (1.0 - texture_mask) + sharpened_full.astype(np.float32) * texture_mask
     return np.clip(sharpened, 0, 255).astype(np.uint8), {
         "mean_saturation_before": round(sat_mean, 2), "saturation_factor": round(float(factor), 3),
+        "regionalModeApplied": regional_mode,
     }
 
 
