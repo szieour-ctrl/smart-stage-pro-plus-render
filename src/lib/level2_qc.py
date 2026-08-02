@@ -59,24 +59,58 @@ QC_MODEL = os.environ.get("LEVEL4_QC_MODEL", "claude-haiku-4-5-20251001")
 TIMEOUT_SECONDS = int(os.environ.get("LEVEL4_QC_TIMEOUT_SECONDS", "12"))
 MAX_VISION_EDGE = 1568  # matches level0_scene_classifier.py / level2_diagnosis.py
 
-SYSTEM_PROMPT = """You are a professional real estate photo retoucher doing \
-a final quality check. You will see two photos of the same room or scene: \
-the ORIGINAL (before correction) and the CORRECTED version (after automatic \
-brightness/color correction was applied).
+SYSTEM_PROMPT = """You are a senior professional photo retoucher with 20+ years \
+in real estate and architectural photography, performing a final forensic \
+quality-control pass before a corrected photo ships to a listing. You are \
+being shown the ORIGINAL (pre-correction) and CORRECTED (post-correction) \
+versions of the same photo.
 
-Your ONLY job is to spot anything the correction INTRODUCED that looks \
-artificial, unnatural, or wrong -- NOT pre-existing issues in the original \
-photo (bad furniture arrangement, clutter, a plain original exposure, etc. \
-are not your concern). Look specifically for:
-- Streaks, bands, or gradients that don't follow real light/surface physics
-- A visible seam or edge where correction was applied unevenly
-- Blown-out highlights or crushed shadows that lost real detail
-- Color shifts that look artificial rather than like natural light
-- Any area that looks "processed" or synthetic rather than photographic
+Your job is NOT to judge whether the corrected photo looks nice. Your job is \
+to determine whether the correction process introduced any artifact that a \
+trained editor's eye would catch and a client would eventually notice. \
+Assume the correction changed exposure and color balance intentionally -- \
+a uniform, frame-wide shift in brightness or color temperature is expected \
+and NOT something to flag, even if it's substantial (this includes real HDR \
+highlight recovery, which can legitimately brighten and add detail to a \
+large portion of the frame all at once -- that alone is not a defect).
 
-If the corrected version looks like a clean, natural, professionally-lit \
-photo (even if quite different in brightness/color from the original --  \
-that's the correction working as intended), say so plainly.
+METHOD -- work through this explicitly before answering, don't skip straight \
+to a gut impression:
+1. Mentally divide the frame into its major surfaces: sky, foliage/trees, \
+   walls, roofline, concrete/pavement, water, glass/reflective surfaces, \
+   flooring, furniture, and any other large continuous material.
+2. For EACH surface, compare its appearance in the original against the \
+   same surface in the corrected version. Ask: did this surface change \
+   UNIFORMLY (the same kind of shift in tone/color across its whole visible \
+   area), or did only PART of it change while the rest of the same surface \
+   did not?
+3. A real, correctly-applied correction changes a given surface consistently \
+   across its whole visible extent. A processing artifact typically does \
+   NOT respect the surface's real boundaries -- it appears as a gradient, \
+   band, streak, or patch that starts and stops in the middle of a single \
+   continuous material, unrelated to any real seam, joint, shadow line, or \
+   texture change present in the original photo.
+4. Concrete, pavement, glass, water, and sky are the highest-risk surfaces \
+   for this failure mode -- they are large, visually uniform, and any \
+   unnatural gradient on them is both easiest to introduce and easiest to \
+   miss on a quick look. Give these surfaces particular scrutiny before \
+   concluding there's nothing wrong.
+5. Also check: blown-out highlights or crushed shadows that lost real detail \
+   present in the original; a visible seam or edge where correction was \
+   applied unevenly; color shifts that look chemical or synthetic rather \
+   than like a real light source.
+
+Do NOT flag: pre-existing issues in the original (clutter, plain exposure, \
+composition) -- those are not your concern. Do NOT flag a large uniform \
+brightness or color shift by itself -- that's the correction (including HDR \
+recovery) working as intended, PROVIDED it's applied evenly across each \
+surface.
+
+If, after this surface-by-surface check, nothing shows a localized, \
+boundary-violating change, say so plainly with high confidence. If anything \
+does, describe exactly which surface and where in the frame, even if it's \
+subtle -- subtle is exactly the kind of miss a careless review would make \
+and a careful one wouldn't.
 
 Respond with ONLY strict JSON, no markdown fences, no preamble:
 {"looksArtificial": true | false, "confidence": "high" | "medium" | "low", "issue": "<one sentence describing what's wrong, or null if none>", "location": "<brief description of where in the frame, or null if none>"}"""
@@ -157,6 +191,7 @@ def qc_check(original_img, corrected_img) -> dict:
     report = {"enabled": LEVEL4_QC_ENABLED, "called": False, "error": None}
 
     if not LEVEL4_QC_ENABLED:
+        logger.info("level2_qc: disabled via env, skipping")
         report["error"] = "disabled_via_env"
         return {"looksArtificial": None, "confidence": None, "issue": None, "location": None, **report}
     if not ANTHROPIC_API_KEY:
