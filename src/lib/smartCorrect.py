@@ -990,6 +990,179 @@ def mls_color_finish(img, intensity=1.0):
     }
 
 
+# ── Front judgment: Stage 1 diagnosis -> real correction decisions ──────
+# (Aug 2, 2026 -- previously log-only, see level2_diagnosis.py.) Each
+# category below has an explicit, stated correction implication in the
+# diagnosis prompt itself; this table is that implication made real.
+# Multiplier applies on top of the existing exposure-only adaptive_intensity
+# math -- it never OVERRIDES the exposure signal, only biases it, and only
+# when Vision's confidence is medium/high. A low-confidence or absent
+# diagnosis leaves today's exposure-only behavior completely unchanged --
+# same "never worse than today" rule as every other patch in this file.
+DIAGNOSIS_INTENSITY_MULTIPLIER = {
+    "already_acceptable": 0.0,       # special-cased below: hard cap, not a multiplier
+    "backlit_mixed_lighting": 0.7,   # protect the correctly-exposed background;
+                                      # lean on window_balance() instead of global lift
+    "color_cast": 0.85,              # exposure isn't the problem; de-emphasize brightness
+    "mixed_light_temperature": 0.75, # a single global WB pass can't fix two casts at once --
+                                      # be more conservative, not more aggressive
+    "flat_evenly_underexposed": 1.0, # this is what the exposure-only math already assumes
+}
+DIAGNOSIS_ALREADY_ACCEPTABLE_CEILING = 0.35  # matches the existing intensity floor elsewhere
+
+
+def _diagnosis_adjusted_intensity(adaptive_intensity, diagnosis):
+    """Applies the front-judgment bias table above. Returns
+    (adjusted_intensity, tag_or_None)."""
+    if diagnosis is None or diagnosis.get("confidence") not in ("medium", "high"):
+        return adaptive_intensity, None
+    category = diagnosis.get("diagnosis")
+    if category == "already_acceptable":
+        if adaptive_intensity > DIAGNOSIS_ALREADY_ACCEPTABLE_CEILING:
+            return DIAGNOSIS_ALREADY_ACCEPTABLE_CEILING, "ai_diagnosis_capped_intensity"
+        return adaptive_intensity, None
+    mult = DIAGNOSIS_INTENSITY_MULTIPLIER.get(category)
+    if mult is not None and mult < 1.0:
+        adjusted = adaptive_intensity * mult
+        if adjusted < adaptive_intensity:
+            return adjusted, "ai_diagnosis_reduced_intensity"
+    return adaptive_intensity, None
+
+
+def _diagnosis_wb_threshold(diagnosis):
+    """color_cast diagnosis lowers the bar for tagging white balance as
+    applied -- a real cast should be corrected and reported even if
+    subtle, per the diagnosis category's own stated implication."""
+    if diagnosis is not None and diagnosis.get("confidence") in ("medium", "high") \
+            and diagnosis.get("diagnosis") == "color_cast":
+        return 0.05
+    return 0.1
+
+
+# ── Back judgment: Stage 4 QC -> retry-then-safe-fallback loop ──────────
+# (Aug 2, 2026 -- previously log-only.) Closes the loop as originally
+# designed on Aug 1: "run the deterministic correction, then show Vision
+# the result and ask does anything look wrong" was always meant to be
+# ACTED on, not just logged. Scope is deliberately bounded to whole-frame
+# retry, no masking/local revert (a real, larger capability, intentionally
+# deferred) -- this only reuses tunables that already exist in this file
+# (adaptive_intensity, target_display_headroom).
+#
+# Loop: if QC flags the first pass, retry ONCE at reduced intensity/
+# reduced HDR headroom, whole frame. If the retry passes QC, ship it. If
+# the retry STILL fails QC, do not ship a flagged photo silently -- fall
+# back to the true pre-correction original and flag for manual review.
+# Worst case is now "no correction, flagged for a human," never "silently
+# worse than the original," which is the actual defect this closes.
+QC_RETRY_INTENSITY_MULTIPLIER = 0.5
+QC_RETRY_HEADROOM_MULTIPLIER = 0.5  # fraction of the *excess* headroom above 1.0 to keep
+
+
+def _run_hdr_pass(source_path, target_display_headroom=None):
+    """Thin, retriable wrapper around recover_hdr_if_present()."""
+    if not HDR_RECOVERY_ENABLED:
+        return None, {"gainMapPresent": False, "recoveryApplied": False, "enabled": False}
+    img, report = recover_hdr_if_present(source_path, target_display_headroom=target_display_headroom)
+    report["enabled"] = True
+    return img, report
+
+
+def _apply_exterior_stack(img, args, intensity, wb_threshold=0.1):
+    """Deterministic exterior correction stack, factored out of main() so
+    the QC retry loop can re-run it at a different intensity without
+    duplicating ~25 lines inline."""
+    modules = []
+    img, wb_strength = white_balance_neutral_aware(img)
+    if wb_strength >= wb_threshold:
+        modules.append("white_balance")
+    img, lens_strength = mild_mobile_lens_correction(img, args.lens_mode)
+    if lens_strength > 0:
+        modules.append("lens_correction")
+    img, rotation_deg = deskew_perspective(img)
+    if rotation_deg != 0.0:
+        modules.append("perspective_alignment")
+    img, denoise_strength = adaptive_denoise(img)
+    if denoise_strength > 2:
+        modules.append("adaptive_noise_reduction")
+    img, exterior_metrics = exterior_daylight_correction(img, intensity=intensity)
+    if abs(exterior_metrics["after_median_luma"] - exterior_metrics["before_median_luma"]) >= 3:
+        modules.append("exterior_daylight_shadow_lift")
+    metrics = {
+        "whiteBalanceStrength": wb_strength,
+        "lensCorrectionStrength": lens_strength,
+        "exteriorCorrection": exterior_metrics,
+    }
+    return img, modules, metrics, rotation_deg, denoise_strength
+
+
+def _apply_interior_stack(img, args, adaptive_intensity, level2_regions, wb_threshold=0.1):
+    """Deterministic interior correction stack, factored out of main() so
+    the QC retry loop can re-run it at a different intensity without
+    duplicating the full stack inline. level2_regions is passed in rather
+    than recomputed -- geometric layout doesn't meaningfully change
+    between a normal-headroom and reduced-headroom HDR variant of the
+    same photo, so this avoids a second Vision call on retry."""
+    modules = []
+    img, wb_strength = white_balance_neutral_aware(img)
+    if wb_strength >= wb_threshold:
+        modules.append("white_balance")
+    img, lens_strength = mild_mobile_lens_correction(img, args.lens_mode)
+    if lens_strength > 0:
+        modules.append("lens_correction")
+    img, rotation_deg = deskew_perspective(img)
+    if rotation_deg != 0.0:
+        modules.append("perspective_alignment")
+    img, denoise_strength = adaptive_denoise(img)
+    if denoise_strength > 2:
+        modules.append("adaptive_noise_reduction")
+    img, vignette_strength = vignette_correct(img)
+    if vignette_strength >= 0.1:
+        modules.append("vignette_neutralization")
+
+    img, brightness_metrics = mls_brightness_lift(
+        img, intensity=adaptive_intensity,
+        dark_material_mask=level2_regions.get("dark_material_mask"),
+    )
+    brightness_moved = abs(brightness_metrics["after_fusion_median_luma"] - brightness_metrics["before_median_luma"]) >= 5
+    if brightness_moved or brightness_metrics["residual_need"] >= 0.05:
+        modules.append("mls_brightness_lift")
+
+    ff_weight = level2_regions.get("furniture_floor_mask")
+    dm_weight = level2_regions.get("dark_material_mask")
+    if ff_weight is not None or dm_weight is not None:
+        combined_exclusion_weight = np.maximum(
+            ff_weight if ff_weight is not None else 0.0,
+            dm_weight if dm_weight is not None else 0.0,
+        )
+    else:
+        combined_exclusion_weight = None
+
+    img, white_metrics = clean_whites_adaptive(
+        img, intensity=adaptive_intensity, exclusion_weight=combined_exclusion_weight,
+    )
+    if white_metrics.get("applied"):
+        modules.append("clean_whites")
+
+    img, window_metrics = window_balance(img)
+    if window_metrics.get("applied"):
+        modules.append("window_highlight_balance")
+
+    img, finish_metrics = mls_color_finish(img, intensity=adaptive_intensity)
+    modules.append("color_clarity_finish")
+
+    metrics = {
+        "whiteBalanceStrength": wb_strength,
+        "lensCorrectionStrength": lens_strength,
+        "vignetteStrength": vignette_strength,
+        "adaptiveIntensity": round(adaptive_intensity, 3),
+        "mlsBrightness": brightness_metrics,
+        "cleanWhites": white_metrics,
+        "windowBalance": window_metrics,
+        "mlsFinish": finish_metrics,
+    }
+    return img, modules, metrics, rotation_deg, denoise_strength
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", required=True)
@@ -1117,35 +1290,72 @@ def main():
         modules_applied.append(f"ai_diagnosis_{diagnosis.get('diagnosis', 'unknown')}")
 
     if is_exterior:
-        img, wb_strength = white_balance_neutral_aware(img)
-        if wb_strength >= 0.1:
-            modules_applied.append("white_balance")
-        img, lens_strength = mild_mobile_lens_correction(img, args.lens_mode)
-        if lens_strength > 0:
-            modules_applied.append("lens_correction")
-        img, rotation_deg = deskew_perspective(img)
-        if rotation_deg != 0.0:
-            modules_applied.append("perspective_alignment")
-        img, denoise_strength = adaptive_denoise(img)
-        if denoise_strength > 2:
-            modules_applied.append("adaptive_noise_reduction")
-        img, exterior_metrics = exterior_daylight_correction(img, intensity=intensity)
-        if abs(exterior_metrics["after_median_luma"] - exterior_metrics["before_median_luma"]) >= 3:
-            modules_applied.append("exterior_daylight_shadow_lift")
+        # ── Front judgment applied here (Aug 2, 2026) ────────────────────
+        # Exterior photos don't get Stage 1 diagnosis today (level2_diagnose
+        # explicitly skips exteriors -- see level2_diagnosis.py's
+        # `is_exterior` early-return), so `diagnosis` is always None on
+        # this branch and the adjustment below is a deliberate no-op for
+        # now. Left wired so exterior diagnosis can plug in later without
+        # touching this branch again.
+        ext_intensity, diag_tag = _diagnosis_adjusted_intensity(intensity, diagnosis)
+        if diag_tag:
+            modules_applied.append(diag_tag)
+        wb_threshold = _diagnosis_wb_threshold(diagnosis)
+
+        img, ext_modules, exterior_stack_metrics, rotation_deg, denoise_strength = \
+            _apply_exterior_stack(img, args, ext_intensity, wb_threshold)
+        modules_applied.extend(ext_modules)
         skipped = skipped + ["mls_brightness_lift", "clean_whites", "window_highlight_balance",
                               "vignette_neutralization"]
 
-        histogram_stats = shadow_highlight_stats(img)
-
-        # ── Stage 4: Vision QC (added Aug 2026, LOG-ONLY) ────────────────
-        # See level2_qc.py docstring. Compares original_img_for_qc (pre-
-        # correction) against the final `img` (post-correction). Result
-        # is included in the JSON output but never blocks or changes
-        # what's returned -- purely observational until reviewed.
+        # ── Back judgment: Stage 4 QC retry-then-fallback (Aug 2, 2026) ──
+        # This is the branch IMG_8311 (the confirmed real artifact case)
+        # actually runs through. See the module-level docstring above
+        # main() for the full loop rationale.
         qc = qc_check(original_img_for_qc, img)
-        if qc.get("looksArtificial") is True:
+        retry_report = {"attempted": False}
+        if qc.get("looksArtificial") is True and qc.get("confidence") in ("high", "medium"):
+            retry_report["attempted"] = True
+            retry_headroom = None
+            if hdr_report.get("recoveryApplied") and hdr_report.get("headroom"):
+                retry_headroom = 1.0 + (hdr_report["headroom"] - 1.0) * QC_RETRY_HEADROOM_MULTIPLIER
+            retry_img, retry_hdr_report = _run_hdr_pass(args.source, target_display_headroom=retry_headroom)
+            if retry_img is None:
+                retry_img = original_img_for_qc.copy()
+                retry_hdr_report = hdr_report
+            retry_intensity = max(ext_intensity * QC_RETRY_INTENSITY_MULTIPLIER, 0.6)
+
+            retry_final, retry_modules, retry_metrics, retry_rotation, retry_denoise = \
+                _apply_exterior_stack(retry_img, args, retry_intensity, wb_threshold)
+            retry_qc = qc_check(original_img_for_qc, retry_final)
+            retry_report.update({
+                "retryHeadroomTarget": retry_headroom,
+                "retryIntensity": retry_intensity,
+                "retryQC": retry_qc,
+            })
+
+            if retry_qc.get("looksArtificial") is not True:
+                # Retry resolved it -- ship the retry result.
+                img, exterior_stack_metrics = retry_final, retry_metrics
+                modules_applied = ["hdr_gain_map_recovery"] if retry_hdr_report.get("recoveryApplied") else []
+                modules_applied += retry_modules + ["qc_retry_resolved"]
+                rotation_deg, denoise_strength = retry_rotation, retry_denoise
+                hdr_report, qc = retry_hdr_report, retry_qc
+            else:
+                # Retry still flagged -- do not ship a flagged photo
+                # silently. Fall back to the true pre-correction original;
+                # worst case is now "no correction, flagged for a human,"
+                # never "silently worse than the original."
+                img = original_img_for_qc.copy()
+                modules_applied = ["qc_retry_failed_fallback_to_original", "needs_manual_review"]
+                qc = retry_qc
+                hdr_report = {**hdr_report, "recoveryApplied": False, "fallbackReason": "qc_flagged_after_retry"}
+                rotation_deg, denoise_strength = 0.0, 0
+                exterior_stack_metrics = {"note": "correction reverted -- QC flagged both the original and retry passes"}
+        elif qc.get("looksArtificial") is True:
             modules_applied.append("qc_flagged_possible_artifact")
 
+        histogram_stats = shadow_highlight_stats(img)
         cv2.imwrite(args.output, img, [int(cv2.IMWRITE_JPEG_QUALITY), 94])
         print(json.dumps({
             "output": args.output,
@@ -1160,13 +1370,11 @@ def main():
             "sceneProfile": "exterior_daylight",
             "exteriorSignals": exterior_signals,
             "level0Scene": scene,
+            "level2Diagnosis": diagnosis_report,
             "level4QC": qc,
+            "qcRetry": retry_report,
             "hdrRecovery": hdr_report,
-            "metrics": {
-                "whiteBalanceStrength": wb_strength,
-                "lensCorrectionStrength": lens_strength,
-                "exteriorCorrection": exterior_metrics,
-            },
+            "metrics": exterior_stack_metrics,
         }))
         return
 
@@ -1179,32 +1387,60 @@ def main():
         # source bytes here would silently throw away a successful
         # recovery the moment the do-no-harm gate decides no further
         # correction is needed — exactly backwards from the point of this
-        # integration. Only take the fast raw-copy path when recovery
-        # didn't apply; write the actual (possibly recovered) image
-        # otherwise.
-        if hdr_report.get("recoveryApplied"):
-            cv2.imwrite(args.output, img, [int(cv2.IMWRITE_JPEG_QUALITY), 94])
-        elif os.path.abspath(args.source) != os.path.abspath(args.output):
-            shutil.copyfile(args.source, args.output)
+        # integration. The actual write now happens AFTER the QC
+        # retry/fallback logic below, once the final `img` is settled --
+        # writing here, before QC has had a chance to retry or revert,
+        # would ship whatever HDR recovery produced even if QC later
+        # rejects it.
 
-        # ── Stage 4: Vision QC (added Aug 2026, LOG-ONLY) ────────────────
+        # ── Stage 4: Vision QC (added Aug 2026) ───────────────────────────
         # Only worth calling if HDR recovery actually changed pixels here
         # -- otherwise `img` is byte-identical to the original and a QC
         # comparison would be a wasted Vision call with a guaranteed-false
         # result. If recovery didn't apply, report a clear "not needed"
         # status rather than silently omitting the field (see missing-
         # level0Scene bug this same branch had, found via real testing).
+        retry_report = {"attempted": False}
         if hdr_report.get("recoveryApplied"):
             qc = qc_check(original_img_for_qc, img)
             if qc.get("looksArtificial") is True:
                 modules_applied_gate_tag = ["qc_flagged_possible_artifact"]
             else:
                 modules_applied_gate_tag = []
+
+            # ── Back judgment: QC retry-then-fallback (Aug 2, 2026) ──────
+            # Only HDR recovery ran on this branch (no other corrections),
+            # so the only retriable knob is the headroom target itself.
+            if qc.get("looksArtificial") is True and qc.get("confidence") in ("high", "medium"):
+                retry_report["attempted"] = True
+                retry_headroom = None
+                if hdr_report.get("headroom"):
+                    retry_headroom = 1.0 + (hdr_report["headroom"] - 1.0) * QC_RETRY_HEADROOM_MULTIPLIER
+                retry_img, retry_hdr_report = _run_hdr_pass(args.source, target_display_headroom=retry_headroom)
+                if retry_img is not None:
+                    retry_qc = qc_check(original_img_for_qc, retry_img)
+                    retry_report.update({"retryHeadroomTarget": retry_headroom, "retryQC": retry_qc})
+                    if retry_qc.get("looksArtificial") is not True:
+                        img, hdr_report, qc = retry_img, retry_hdr_report, retry_qc
+                        modules_applied_gate_tag = ["qc_retry_resolved"]
+                    else:
+                        img = original_img_for_qc.copy()
+                        hdr_report = {**hdr_report, "recoveryApplied": False, "fallbackReason": "qc_flagged_after_retry"}
+                        qc = retry_qc
+                        modules_applied_gate_tag = ["qc_retry_failed_fallback_to_original", "needs_manual_review"]
         else:
             qc = {"looksArtificial": None, "confidence": None, "issue": None,
                   "location": None, "enabled": None,
                   "called": False, "error": "not_needed_no_pixels_changed"}
             modules_applied_gate_tag = []
+
+        # Re-check the (possibly retried/reverted) image before writing --
+        # `img` may now be the fallback original rather than the
+        # HDR-recovered version decided above.
+        if hdr_report.get("recoveryApplied") or "qc_retry_failed_fallback_to_original" in modules_applied_gate_tag:
+            cv2.imwrite(args.output, img, [int(cv2.IMWRITE_JPEG_QUALITY), 94])
+        elif os.path.abspath(args.source) != os.path.abspath(args.output):
+            shutil.copyfile(args.source, args.output)
 
         print(json.dumps({
             "output": args.output,
@@ -1217,6 +1453,7 @@ def main():
             "hdrRecovery": hdr_report,
             "level0Scene": scene,
             "level4QC": qc,
+            "qcRetry": retry_report,
         }))
         return
 
@@ -1241,96 +1478,92 @@ def main():
     exposure_need = 1.0 - (sum(1 for k in exposure_checks if guard["checks"][k]) / float(len(exposure_checks)))
     adaptive_intensity = float(np.clip(intensity * (0.35 + 0.65 * exposure_need), 0.35, intensity))
 
-    img, wb_strength = white_balance_neutral_aware(img)
-    if wb_strength >= 0.1:
-        modules_applied.append("white_balance")
-
-    img, lens_strength = mild_mobile_lens_correction(img, args.lens_mode)
-    if lens_strength > 0:
-        modules_applied.append("lens_correction")
-
-    img, rotation_deg = deskew_perspective(img)
-    if rotation_deg != 0.0:
-        modules_applied.append("perspective_alignment")
-
-    img, denoise_strength = adaptive_denoise(img)
-    if denoise_strength > 2:
-        modules_applied.append("adaptive_noise_reduction")
-
-    img, vignette_strength = vignette_correct(img)
-    if vignette_strength >= 0.1:
-        modules_applied.append("vignette_neutralization")
+    # ── Front judgment applied here (Aug 2, 2026) ─────────────────────────
+    # Previously log-only; see level2_diagnosis.py and the bias table
+    # above main(). Only acts when confidence is medium/high -- a low-
+    # confidence or absent diagnosis leaves the exposure-only number above
+    # completely unchanged.
+    adaptive_intensity, diag_tag = _diagnosis_adjusted_intensity(adaptive_intensity, diagnosis)
+    if diag_tag:
+        modules_applied.append(diag_tag)
+    wb_threshold = _diagnosis_wb_threshold(diagnosis)
 
     # ── Level 2 Vision pre-pass (added Aug 2026) ─────────────────────────
-    # Called HERE, not earlier: every geometric correction (lens, deskew,
-    # crop-after-rotate) has already run, so the boxes Vision returns are
-    # in the same pixel coordinate space `img` is in for the rest of the
-    # pipeline. Calling this before deskew would misalign the masks by
-    # however much the photo got rotated/cropped.
+    # Called HERE, not inside _apply_interior_stack: every geometric
+    # correction below (lens, deskew) needs to have already run so the
+    # boxes Vision returns are in the same pixel coordinate space `img`
+    # will be in. Computed ONCE, outside the retry loop -- geometric
+    # layout doesn't meaningfully change between a normal-headroom and
+    # reduced-headroom HDR variant of the same photo, so reusing these
+    # masks on retry avoids a second Vision call.
     #
     # READ-ONLY, routing-signal-only, per level2_vision_regions.py's own
     # docstring -- this does not touch pixels and does not compromise
-    # this file's "no generative model" rule (see top docstring). If it
-    # fails or is disabled, both masks are None and every downstream call
-    # below falls back to its original heuristic-only behavior, unchanged.
-    level2_regions, level2_report = get_level2_regions(img)
+    # this file's "no generative model" rule. If it fails or is disabled,
+    # both masks are None and every downstream call falls back to its
+    # original heuristic-only behavior, unchanged.
+    #
+    # NOTE: this pre-pass needs a geometrically-corrected `img` to align
+    # masks correctly, so run the lens/deskew steps once, upfront, on a
+    # throwaway copy purely to get aligned regions -- the real pass
+    # (inside _apply_interior_stack) re-runs these deterministically and
+    # will produce identical geometry, so this is not wasted, it's the
+    # only way to get aligned masks before the retriable stack runs.
+    _geom_preview, _ = mild_mobile_lens_correction(img.copy(), args.lens_mode)
+    _geom_preview, _ = deskew_perspective(_geom_preview)
+    level2_regions, level2_report = get_level2_regions(_geom_preview)
     if level2_report.get("called") and not level2_report.get("error"):
         modules_applied.append("level2_vision_regions")
 
-    # ── MLS Bright finish ────────────────────────────────────────────────
-    img, brightness_metrics = mls_brightness_lift(
-        img, intensity=adaptive_intensity,
-        dark_material_mask=level2_regions.get("dark_material_mask"),
-    )
-    # Fusion runs every time (it's the primary technique now, not
-    # conditional) — report as applied if it moved the median meaningfully
-    # OR the secondary target-nudge kicked in.
-    brightness_moved = abs(brightness_metrics["after_fusion_median_luma"] - brightness_metrics["before_median_luma"]) >= 5
-    if brightness_moved or brightness_metrics["residual_need"] >= 0.05:
-        modules_applied.append("mls_brightness_lift")
-
-    # LEVEL 2 FIX (after real-photo test, Aug 2026): clean_whites_adaptive
-    # previously only received furniture_floor exclusion. Confirmed on a
-    # real photo that a polished black granite fireplace surround can
-    # trip white_mask's own L>145/chroma<22 threshold via specular
-    # highlight alone -- nothing to do with furniture or floor. Combine
-    # BOTH region categories into one continuous exclusion weight (max,
-    # since either category alone is sufficient reason to exclude a
-    # pixel from "clean whites" candidacy).
-    ff_weight = level2_regions.get("furniture_floor_mask")
-    dm_weight = level2_regions.get("dark_material_mask")
-    if ff_weight is not None or dm_weight is not None:
-        combined_exclusion_weight = np.maximum(
-            ff_weight if ff_weight is not None else 0.0,
-            dm_weight if dm_weight is not None else 0.0,
-        )
-    else:
-        combined_exclusion_weight = None
-
-    img, white_metrics = clean_whites_adaptive(
-        img, intensity=adaptive_intensity,
-        exclusion_weight=combined_exclusion_weight,
-    )
-    if white_metrics.get("applied"):
-        modules_applied.append("clean_whites")
-
-    img, window_metrics = window_balance(img)
-    if window_metrics.get("applied"):
-        modules_applied.append("window_highlight_balance")
-
-    img, finish_metrics = mls_color_finish(img, intensity=adaptive_intensity)
-    modules_applied.append("color_clarity_finish")
+    img, stack_modules, stack_metrics, rotation_deg, denoise_strength = \
+        _apply_interior_stack(img, args, adaptive_intensity, level2_regions, wb_threshold)
+    modules_applied.extend(stack_modules)
 
     histogram_stats = shadow_highlight_stats(img)
 
-    # ── Stage 4: Vision QC (added Aug 2026, LOG-ONLY) ────────────────────
-    # See level2_qc.py docstring. Compares original_img_for_qc (pre-
-    # correction) against the final `img` (post-correction, full interior
-    # MLS Bright stack applied). Result is included in the JSON output
-    # but never blocks or changes what's returned -- purely observational
-    # until reviewed against real photo volume.
+    # ── Back judgment: Stage 4 QC retry-then-fallback (Aug 2, 2026) ──────
+    # Previously log-only. See the module-level docstring above main() for
+    # the full loop rationale -- bounded to whole-frame retry, no masking.
     qc = qc_check(original_img_for_qc, img)
-    if qc.get("looksArtificial") is True:
+    retry_report = {"attempted": False}
+    if qc.get("looksArtificial") is True and qc.get("confidence") in ("high", "medium"):
+        retry_report["attempted"] = True
+        retry_headroom = None
+        if hdr_report.get("recoveryApplied") and hdr_report.get("headroom"):
+            retry_headroom = 1.0 + (hdr_report["headroom"] - 1.0) * QC_RETRY_HEADROOM_MULTIPLIER
+        retry_img, retry_hdr_report = _run_hdr_pass(args.source, target_display_headroom=retry_headroom)
+        if retry_img is None:
+            retry_img = original_img_for_qc.copy()
+            retry_hdr_report = hdr_report
+        retry_intensity = max(adaptive_intensity * QC_RETRY_INTENSITY_MULTIPLIER, 0.35)
+
+        retry_final, retry_stack_modules, retry_stack_metrics, retry_rotation, retry_denoise = \
+            _apply_interior_stack(retry_img, args, retry_intensity, level2_regions, wb_threshold)
+        retry_qc = qc_check(original_img_for_qc, retry_final)
+        retry_report.update({
+            "retryHeadroomTarget": retry_headroom,
+            "retryIntensity": round(retry_intensity, 3),
+            "retryQC": retry_qc,
+        })
+
+        if retry_qc.get("looksArtificial") is not True:
+            img, stack_metrics = retry_final, retry_stack_metrics
+            modules_applied = ([m for m in modules_applied if m not in stack_modules
+                                 and m != "hdr_gain_map_recovery"])
+            modules_applied += (["hdr_gain_map_recovery"] if retry_hdr_report.get("recoveryApplied") else [])
+            modules_applied += retry_stack_modules + ["qc_retry_resolved"]
+            rotation_deg, denoise_strength = retry_rotation, retry_denoise
+            hdr_report, qc = retry_hdr_report, retry_qc
+            histogram_stats = shadow_highlight_stats(img)
+        else:
+            img = original_img_for_qc.copy()
+            modules_applied = ["qc_retry_failed_fallback_to_original", "needs_manual_review"]
+            qc = retry_qc
+            hdr_report = {**hdr_report, "recoveryApplied": False, "fallbackReason": "qc_flagged_after_retry"}
+            rotation_deg, denoise_strength = 0.0, 0
+            stack_metrics = {"note": "correction reverted -- QC flagged both the original and retry passes"}
+            histogram_stats = shadow_highlight_stats(img)
+    elif qc.get("looksArtificial") is True:
         modules_applied.append("qc_flagged_possible_artifact")
 
     cv2.imwrite(args.output, img, [int(cv2.IMWRITE_JPEG_QUALITY), 94])
@@ -1351,16 +1584,8 @@ def main():
         "level2Diagnosis": diagnosis_report,
         "level0Scene": scene,
         "level4QC": qc,
-        "metrics": {
-            "whiteBalanceStrength": wb_strength,
-            "lensCorrectionStrength": lens_strength,
-            "vignetteStrength": vignette_strength,
-            "adaptiveIntensity": round(adaptive_intensity, 3),
-            "mlsBrightness": brightness_metrics,
-            "cleanWhites": white_metrics,
-            "windowBalance": window_metrics,
-            "mlsFinish": finish_metrics,
-        },
+        "qcRetry": retry_report,
+        "metrics": stack_metrics,
     }))
 
 
