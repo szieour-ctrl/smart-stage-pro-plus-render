@@ -1549,6 +1549,8 @@ def _apply_interior_stack(img, args, adaptive_intensity, level2_regions, wb_thre
         "mlsFinish": finish_metrics,
     }
     return img, modules, metrics, rotation_deg, denoise_strength
+
+
 # ── Region debug overlay (Aug 3, 2026) ──────────────────────────────────
 # Answers a question the Aug 3 wiring session couldn't answer: "did the
 # region I'm looking at in the corrected photo actually correspond to
@@ -1622,7 +1624,6 @@ def write_region_debug_overlay(img, regions, level2_masks, output_path):
         print(f"[write_region_debug_overlay] failed (non-fatal): {e}", file=sys.stderr)
 
 
-def main():
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", required=True)
@@ -1974,6 +1975,13 @@ def main():
     level2_regions, level2_report = get_level2_regions(_geom_preview)
     if level2_report.get("called") and not level2_report.get("error"):
         modules_applied.append("level2_vision_regions")
+
+    # ── Region debug overlay (Aug 3, 2026, optional) ──────────────────────
+    if DEBUG_REGIONS_OVERLAY:
+        debug_path = os.path.splitext(args.output)[0] + "_regions_debug.jpg"
+        write_region_debug_overlay(
+            _geom_preview, level2_regions.get("regions"), level2_regions.get("masks"), debug_path,
+        )
 
     img, stack_modules, stack_metrics, rotation_deg, denoise_strength = \
         _apply_interior_stack(img, args, adaptive_intensity, level2_regions, wb_threshold)
