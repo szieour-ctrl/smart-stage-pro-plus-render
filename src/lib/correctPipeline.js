@@ -85,6 +85,23 @@ function correctOneImage(image, workDir) {
       try {
         const parsed = JSON.parse(stdout.trim());
         const correctedBase64 = fs.readFileSync(outputPath).toString("base64");
+
+        // ── Region debug overlay (Aug 3, 2026, optional) ─────────────────
+        // Only present when DEBUG_REGIONS_OVERLAY=true is set on Railway --
+        // smartCorrect.py writes this as a SEPARATE file next to outputPath,
+        // never touching the real corrected image. Read best-effort: if the
+        // env var is off (the normal case) this file simply won't exist,
+        // which is not an error -- readFileSync failing here must never
+        // fail the whole image.
+        let regionsDebugBase64 = null;
+        const debugPath = outputPath.slice(0, -ext.length) + "_regions_debug.jpg";
+        try {
+          regionsDebugBase64 = fs.readFileSync(debugPath).toString("base64");
+        } catch {
+          // Expected when DEBUG_REGIONS_OVERLAY is off, or Level 2 had no
+          // regions for this photo -- not an error, just nothing to attach.
+        }
+
         // Previously hand-picked six fields (modulesApplied, modulesSkipped,
         // perspectiveCorrectionDegrees) and silently dropped everything
         // else smartCorrect.py computes -- including level0Scene and
@@ -101,6 +118,7 @@ function correctOneImage(image, workDir) {
           id: image.id,
           status: "done",
           correctedBase64,
+          ...(regionsDebugBase64 ? { regionsDebugBase64 } : {}),
         });
       } catch (err) {
         console.error(`[correctOneImage] ${image.id}: failed to read/parse output. stdout: ${stdout.slice(0, 300)} | err: ${err.message}`);
