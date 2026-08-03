@@ -303,7 +303,14 @@ def get_level2_regions(img):
     every failure mode is caught and reported instead.
     """
     empty = {"regions": [], "masks": {}, "furniture_floor_mask": None, "dark_material_mask": None}
-    report = {"enabled": LEVEL2_VISION_MASKS_ENABLED, "called": False, "error": None}
+    # "model" included from the start (Aug 3, 2026, diagnostic patch),
+    # not just on success -- the whole point is answering "which model
+    # actually ran this" without guessing from context, and that
+    # question applies just as much when the call was skipped/failed
+    # as when it succeeded. Reflects VISION_MODEL's resolved value
+    # (env override or the hardcoded default), not a hope -- this is
+    # the exact string that would be/was sent to the API.
+    report = {"enabled": LEVEL2_VISION_MASKS_ENABLED, "called": False, "model": VISION_MODEL, "error": None}
 
     if not LEVEL2_VISION_MASKS_ENABLED:
         report["error"] = "disabled_via_env"
