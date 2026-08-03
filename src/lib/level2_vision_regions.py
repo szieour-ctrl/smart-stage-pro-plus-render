@@ -364,7 +364,28 @@ def get_level2_regions(img):
 
         if region["regionType"] in LEGACY_FURNITURE_FLOOR_TYPES:
             ff_boxes.append(scaled_box)
-        if region["regionType"] in LEGACY_DARK_MATERIAL_TYPES:
+        # BUG FOUND AND FIXED (Aug 3, 2026, real photo IMG_8317): a
+        # fireplace's dark glass front got tagged regionType=
+        # "screen_display" (Vision's reasonable-but-wrong read of a dark
+        # reflective surface) instead of "dark_fixture" -- and since
+        # main() isn't wired to the new regions/masks yet, ONLY this
+        # legacy-derived mask actually protects anything today. A
+        # regionType outside LEGACY_DARK_MATERIAL_TYPES meant zero
+        # protection reached this genuinely protect-priority region,
+        # confirmed by real pixel measurement: this exact photo's firebox
+        # moved +20 luma this run vs. +16 under the OLD dedicated
+        # dark-material prompt -- worse, not better.
+        #
+        # Fix: ANY region tagged priority=="protect" feeds this legacy
+        # fallback, regardless of regionType. The whole meaning of
+        # `protect` is "don't brighten this like the rest of the frame,"
+        # which is exactly what dark_material_mask does for
+        # mls_brightness_lift today -- this doesn't depend on getting
+        # the regionType label exactly right, and closes the gap
+        # immediately rather than waiting on a prompt fix (which may
+        # also be worth doing, but shouldn't be the ONLY fix for
+        # something this consequential).
+        if region["regionType"] in LEGACY_DARK_MATERIAL_TYPES or region["priority"] == "protect":
             dm_boxes.append(scaled_box)
 
     ff_mask = _boxes_to_mask(ff_boxes, img.shape) if ff_boxes else np.zeros((h, w), dtype=np.float32)
