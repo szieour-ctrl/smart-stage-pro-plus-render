@@ -1615,6 +1615,22 @@ def write_region_debug_overlay(img, regions, level2_masks, output_path):
             overlay = overlay * (1.0 - alpha) + color * alpha
         overlay = np.clip(overlay, 0, 255).astype(np.uint8)
 
+        # Raw box outline, drawn on top of the feathered blob (Aug 3,
+        # 2026, diagnostic patch): a thin white rectangle showing
+        # EXACTLY what Vision returned, before padding/feathering. If
+        # the rectangle is already large, the box itself is the
+        # problem. If the rectangle is small but the colored blob
+        # extends well past it, padding/feathering is the problem.
+        # Distinguishing these was impossible from the blob alone --
+        # confirmed on IMG_8315/IMG_8317 where protect regions appeared
+        # to blanket most of the frame with no way to tell why.
+        for region in regions:
+            box = region.get("box")
+            if not (isinstance(box, list) and len(box) == 4):
+                continue
+            x1, y1, x2, y2 = (int(round(c)) for c in box)
+            cv2.rectangle(overlay, (x1, y1), (x2, y2), (255, 255, 255), 1, cv2.LINE_AA)
+
         for region in regions:
             mask = level2_masks.get(region.get("maskId"))
             if mask is None:
