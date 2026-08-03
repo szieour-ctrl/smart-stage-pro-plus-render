@@ -2,55 +2,61 @@
 """
 level2_vision_regions.py — Level 2 Vision pre-pass for smartCorrect.py.
 
-Generates READ-ONLY routing masks (furniture/floor exclusion, dark-material
-protection) using Claude Haiku 4.5 Vision. This module NEVER touches pixel
-values — it only classifies WHERE regions are, so the existing classical CV
-corrections in smartCorrect.py know where to apply or skip their own
-deterministic math. All actual pixel modification remains classical CV in
-smartCorrect.py, unchanged.
+REWRITTEN (Aug 3, 2026) to emit the Retoucher Schema: an open-ended list
+of named regions, each carrying a controlled-vocabulary regionType,
+operation, priority, protections, and confidence -- instead of the
+previous two fixed categories (furniture_floor / dark_material). This is
+what makes Level 2 an actual per-photo judgment call rather than a
+one-size-fits-all label: a photo can now come back with, say, "backlit
+foreground chair -> shadow_recovery, primary" and "French doors ->
+highlight_reduction, protect" in the SAME frame, each tied to its own
+mask -- not one exclusion mask applied uniformly regardless of what's
+actually wrong (or already fine) in that specific region.
+
+Generates READ-ONLY routing masks using Claude Haiku 4.5 Vision. This
+module NEVER touches pixel values -- it only classifies WHAT and WHERE,
+so the existing classical CV corrections in smartCorrect.py know how to
+apply their own deterministic math per region. All actual pixel
+modification remains classical CV in smartCorrect.py, unchanged.
 
 WHY THIS DOESN'T VIOLATE smartCorrect.py's "no generative model" rule
 (see that file's own top docstring): Vision here plays the same role a
-human retoucher's eye plays before reaching for the dodge/burn tool —
-deciding what's furniture vs. trim, what's a real dark material vs. a
-shadow. It classifies, it doesn't generate pixels. If this module fails,
-times out, or is disabled, smartCorrect.py's corrections fall back to
-their existing heuristic-only behavior unchanged — this is a strictly
-additive routing signal, never a dependency the pipeline can't run without.
+human retoucher's eye plays before reaching for the dodge/burn tool --
+deciding what needs attention, what kind, and how urgently. It judges
+and classifies, it doesn't generate pixels. If this module fails, times
+out, or is disabled, smartCorrect.py's corrections fall back to their
+existing heuristic-only behavior unchanged -- this is a strictly
+additive routing signal, never a dependency the pipeline can't run
+without.
 
-DESIGN, per the July 31, 2026 test session (Notion: "Session handoff —
-Level 2 mask test — Haiku vs Sonnet, routing vs hard-mask"):
-  - Haiku 4.5 and Sonnet 5 produced near-identical region calls on real
-    hard-case photos (dark granite, backlit windows, dark leather +
-    hardwood). Haiku 4.5 is the production default; cost/quality gap is
-    immaterial at ~$0.004-0.005/image.
-  - Coarse, GENEROUSLY PADDED boxes are the deliverable, not tight
-    polygons or pixel-accurate segmentation — that test found the model
-    does real material reasoning (specular highlights, grain, gradient
-    falloff vs. hard-edged uniform darkness) well enough for a routing
-    signal, but box precision was never validated to pixel-tight
-    accuracy and shouldn't be trusted to that level.
+DESIGN CARRIED FORWARD from the original (July 31, 2026 test session,
+Notion: "Session handoff -- Level 2 mask test -- Haiku vs Sonnet, routing
+vs hard-mask"):
+  - Haiku 4.5 remains the production default -- that test found Haiku
+    and Sonnet produce near-identical region calls on real hard-case
+    photos; cost/quality gap is immaterial at ~$0.004-0.005/image. No
+    evidence yet that the richer schema below needs the larger model,
+    but this is worth re-validating once real photos have gone through
+    the new prompt, not assumed to carry over automatically.
+  - Coarse, GENEROUSLY PADDED boxes remain the deliverable, not tight
+    polygons or pixel-accurate segmentation -- box precision was never
+    validated to pixel-tight accuracy and shouldn't be trusted to that
+    level regardless of how much richer the per-region metadata is now.
   - No hallucinated regions on the control (no-wall/window) exterior
-    photo in that test — reasonable confidence against false-positive
-    region invention, but this hasn't been tested at production volume.
+    photo in the original test -- reasonable confidence against
+    false-positive region invention, but that was the ORIGINAL prompt,
+    not this rewrite's schema. Needs its own re-validation.
 
-TWO INTEGRATION POINTS this feeds (see smartCorrect.py):
-  1. furniture_floor_mask -> subtracted from white_surface_stats()'s
-     white_mask before clean_whites_adaptive() runs. This is the
-     boundary-critical case: white_mask is a proxy for "wall/trim/
-     ceiling/cabinet," and when it's wrong it repaints real color
-     (A/B channels) on whatever it caught — a light wood floor or
-     cream sofa fabric can get miscategorized as white trim and
-     desaturated. Because the risk here is misclassifying material IN,
-     a padded EXCLUSION box is inherently safer than a tight inclusion
-     boundary: over-excluding only costs a little legitimate trim near
-     furniture; under-excluding is the actual compliance risk.
-  2. dark_material_mask -> unioned into mls_brightness_lift()'s existing
-     luma-threshold dark-material protection. Today that protection is
-     a blunt L<40 taper-to-L=140 rule that can't distinguish a black
-     granite countertop from a shadow at the same brightness. This mask
-     lets genuinely dark materials outside that luma window (e.g. a
-     medium-dark wood table around L~110) also get protected.
+BACKWARD COMPATIBILITY: every existing call site in smartCorrect.py
+(main()'s _apply_interior_stack, the exterior branch) was written
+against the OLD two-key return shape and has NOT yet been updated to
+consume the new `regions`/`masks` this rewrite adds -- that's real,
+separate wiring work, intentionally not done in this same pass (see
+Notion handoff for what's next). `get_level2_regions()` still returns
+"furniture_floor_mask" and "dark_material_mask" in its return dict,
+derived by unioning every new region whose regionType matches the old
+category's intent, so nothing existing breaks today. New callers should
+read the same dict's "regions" and "masks" keys instead.
 """
 
 import base64
@@ -69,23 +75,96 @@ VISION_TIMEOUT_SECONDS = 12
 MAX_VISION_EDGE = 1568  # matches the existing cap in autoSelect.js (Vision API 8000px ceiling)
 DEFAULT_PAD_FRAC = 0.08  # pad each box by 8% of its own size on every side
 
-PROMPT_TEMPLATE = """You are analyzing a real estate listing photo for a photo-correction pipeline. Return ONLY strict JSON, no prose, no markdown fences.
+# ── Controlled vocabulary (Retoucher Schema) ─────────────────────────────
+# Anything Vision returns outside these sets is dropped, not guessed at --
+# same "never trust an unvalidated Vision string as a code branch" rule
+# used everywhere else tonight (level2_diagnosis.py's category set,
+# smartCorrect.py's DIAGNOSIS_INTENSITY_MULTIPLIER table).
+REGION_TYPES = {
+    "dark_furniture", "dark_stone", "dark_fixture",
+    "furniture", "flooring", "rug_textile",
+    "window_glass", "mirror", "screen_display",
+    "light_wall_trim", "sky_exterior", "other",
+}
+OPERATIONS = {
+    "exposure_lift", "shadow_recovery", "highlight_reduction",
+    "white_balance_adjustment", "mixed_light_balance",
+    "texture_enhancement", "clarity_reduction",
+    "saturation_protection", "hue_protection", "no_change",
+}
+PRIORITIES = {"primary", "secondary", "protect"}
 
-Identify bounding boxes for two region categories. Use generously PADDED boxes -- err on the side of larger boxes, not tight ones. Coordinates are pixel values in this exact image (width={w}, height={h}), format [x1, y1, x2, y2].
+# regionTypes that feed the BACKWARD-COMPATIBLE legacy masks below.
+# "dark_furniture" deliberately contributes to BOTH -- a dark couch is
+# both furniture (exclude from clean_whites) and a dark material
+# (protect from brightness lift), matching the old scheme's behavior
+# for that same case.
+LEGACY_FURNITURE_FLOOR_TYPES = {"dark_furniture", "furniture", "flooring", "rug_textile"}
+LEGACY_DARK_MATERIAL_TYPES = {"dark_furniture", "dark_stone", "dark_fixture"}
 
-1. "furniture_floor": movable furniture (sofas, chairs, tables, beds, rugs, decor) AND flooring (carpet, hardwood, tile) -- anything that is NOT a wall, ceiling, or built-in trim/cabinet surface.
-2. "dark_material": any region where the material itself is genuinely dark by design -- black/dark countertops, dark leather or fabric upholstery, dark wood furniture, black fixture surrounds, dark stone. Do NOT include areas that are dark only because of shadow/lighting with no distinct dark material -- those should stay eligible for brightening.
+PROMPT_TEMPLATE = """You are a senior professional photo retoucher reviewing a real estate \
+listing photo before correction, the way you would before reaching for \
+dodge/burn or a graduated filter. Return ONLY strict JSON, no prose, no \
+markdown fences.
+
+Identify any regions in this photo that need SPECIFIC attention -- either \
+because they need a targeted correction different from what the rest of \
+the frame needs, or because they must be PROTECTED from whatever \
+correction the rest of the frame gets. Most photos will have a FEW such \
+regions, not many -- do not invent regions just to fill out the list, and \
+return an empty list if nothing in the frame needs individual treatment \
+beyond a normal, uniform correction.
+
+For EACH region, return:
+- "regionId": a short human-readable label, e.g. "foreground_chair"
+- "box": [x1, y1, x2, y2] in pixel coordinates for THIS image \
+(width={w}, height={h}). Use a generously PADDED box -- err larger, not \
+tighter. This is a coarse routing signal, not a precise boundary.
+- "regionType": exactly one of: dark_furniture, dark_stone, dark_fixture, \
+furniture, flooring, rug_textile, window_glass, mirror, screen_display, \
+light_wall_trim, sky_exterior, other
+- "operation": exactly one of: exposure_lift, shadow_recovery, \
+highlight_reduction, white_balance_adjustment, mixed_light_balance, \
+texture_enhancement, clarity_reduction, saturation_protection, \
+hue_protection, no_change
+- "priority": exactly one of: primary (this needs real correction), \
+secondary (mild correction, lower priority than primary regions), \
+protect (this must NOT receive whatever correction the rest of the \
+frame gets)
+- "protections": a list of any of: preserve_hue, preserve_black_depth, \
+preserve_texture, preserve_exterior_view, preserve_source_detail, \
+exclude_from_shadow_lift, exclude_from_white_balance, \
+exclude_from_color_finish, exclude_from_highlight_reduction -- only the \
+ones that genuinely apply, can be an empty list
+- "confidence": a number from 0 to 1 for how sure you are this region \
+genuinely needs distinct treatment
+- "reasoning": one short sentence
+
+Examples of what belongs on this list: a foreground subject sitting in \
+shadow against a bright window behind it (shadow_recovery, primary); a \
+genuinely black countertop or dark leather that should stay dark, not \
+get brightened like the rest of the room (protect, preserve_black_depth); \
+an already well-exposed window or doorway that shouldn't be pushed \
+brighter along with a dim room (highlight_reduction, protect); a TV or \
+monitor screen showing real content, which should never be treated like \
+a wall or trim surface (screen_display, no_change, protect).
+
+Do NOT include ordinary, evenly-lit content that just needs whatever \
+uniform correction the rest of the frame gets -- that's the default \
+behavior and doesn't need a region entry.
 
 Return exactly this shape:
-{{"furniture_floor": [[x1,y1,x2,y2], ...], "dark_material": [[x1,y1,x2,y2], ...]}}
+{{"regions": [{{"regionId": "...", "box": [x1,y1,x2,y2], "regionType": "...", \
+"operation": "...", "priority": "...", "protections": [...], \
+"confidence": 0.0, "reasoning": "..."}}, ...]}}
 
-If a category has no regions in this photo, return an empty list for it."""
+If nothing in this photo needs individual treatment, return {{"regions": []}}."""
 
 
 def _call_vision_api(image_b64: str, media_type: str, w: int, h: int) -> dict:
     body = json.dumps({
         "model": VISION_MODEL,
-        "max_tokens": 1024,
+        "max_tokens": 2048,
         "messages": [{
             "role": "user",
             "content": [
@@ -120,7 +199,11 @@ def _call_vision_api(image_b64: str, media_type: str, w: int, h: int) -> dict:
 
 def _boxes_to_mask(boxes, shape, pad_frac=DEFAULT_PAD_FRAC, feather_frac=0.035, feather_min_px=18):
     """Rasterize [x1,y1,x2,y2] boxes into a SOFT (H,W) float32 mask in
-    [0,1], not a hard boolean.
+    [0,1], not a hard boolean. Unchanged from the original -- this
+    technique is generic to any box-shaped region regardless of what
+    category it represents, and the feathering fix behind it (see
+    below) applies exactly the same way to every region this file now
+    produces, not just the original two categories.
 
     FEATHERING (added after first real-photo test, Aug 2026): the first
     version returned a hard binary mask. Confirmed directly on real
@@ -132,9 +215,8 @@ def _boxes_to_mask(boxes, shape, pad_frac=DEFAULT_PAD_FRAC, feather_frac=0.035, 
     inside it, producing a visible rectangular seam with no photographic
     basis (nothing in the room actually changes at that line). Same
     mechanism produced a visible streak where a box edge crossed window
-    glass. A box is a coarse routing signal, not a tight boundary (see
-    level2_vision_regions.py's own design notes) -- treating its edge as
-    a hard cutoff was the bug, not the box itself.
+    glass. A box is a coarse routing signal, not a tight boundary --
+    treating its edge as a hard cutoff was the bug, not the box itself.
 
     Fix: rasterize the (already padded) hard box, then apply a Gaussian
     blur wide enough that the box's own edges become a gradual falloff
@@ -161,29 +243,75 @@ def _boxes_to_mask(boxes, shape, pad_frac=DEFAULT_PAD_FRAC, feather_frac=0.035, 
     return np.clip(soft, 0.0, 1.0)
 
 
-def get_level2_regions(img):
-    """Returns (regions, report).
+def _sanitize_region(raw, index):
+    """Validates one raw region dict from Vision against the controlled
+    vocabulary. Returns None (drop it) rather than guess at anything
+    outside the enum -- an unrecognized regionType/operation/priority is
+    treated as Vision not being usable for this specific region, not as
+    a new category to invent handling for on the fly."""
+    box = raw.get("box")
+    if not (isinstance(box, list) and len(box) == 4):
+        return None
+    region_type = raw.get("regionType")
+    operation = raw.get("operation")
+    priority = raw.get("priority")
+    if region_type not in REGION_TYPES or operation not in OPERATIONS or priority not in PRIORITIES:
+        return None
+    try:
+        confidence = float(raw.get("confidence", 0.5))
+    except (TypeError, ValueError):
+        confidence = 0.5
+    confidence = max(0.0, min(1.0, confidence))
+    protections = raw.get("protections")
+    protections = [p for p in protections if isinstance(p, str)] if isinstance(protections, list) else []
 
-    regions = {
+    mask_id = f"mask_{index:02d}"
+    region_id = raw.get("regionId")
+    region_id = region_id if isinstance(region_id, str) and region_id.strip() else mask_id
+
+    return {
+        "regionId": region_id,
+        "maskId": mask_id,
+        "regionType": region_type,
+        "operation": operation,
+        "priority": priority,
+        "protections": protections,
+        "confidence": confidence,
+        "reasoning": raw.get("reasoning") if isinstance(raw.get("reasoning"), str) else None,
+    }, box
+
+
+def get_level2_regions(img):
+    """Returns (level2_regions, report).
+
+    level2_regions = {
+        # NEW (Aug 3, 2026):
+        "regions": [ {regionId, maskId, regionType, operation, priority,
+                       protections, confidence, reasoning}, ... ],
+        "masks": { maskId: float32 (H,W) ndarray in [0,1], ... },
+        # BACKWARD-COMPATIBLE (unchanged shape/meaning from before):
         "furniture_floor_mask": float32 (H,W) ndarray in [0,1], or None,
         "dark_material_mask": float32 (H,W) ndarray in [0,1], or None,
     }
-    These are SOFT masks (heavily feathered, see _boxes_to_mask) -- treat
+    All masks are SOFT (heavily feathered, see _boxes_to_mask) -- treat
     as a continuous weight, not a boolean. Multiply, don't index/AND.
-    None means disabled/unconfigured/failed -- callers must treat None as
-    "no exclusion/no extra protection," i.e. fall back to current
-    heuristic-only behavior. This function never raises; every failure
-    mode is caught and reported instead.
+
+    On any failure/disable: "regions" is [], "masks" is {}, and the two
+    legacy keys are None -- callers must treat that as "no exclusion/no
+    extra protection, no regional signal," i.e. fall back to whatever
+    heuristic-only behavior already exists. This function never raises;
+    every failure mode is caught and reported instead.
     """
+    empty = {"regions": [], "masks": {}, "furniture_floor_mask": None, "dark_material_mask": None}
     report = {"enabled": LEVEL2_VISION_MASKS_ENABLED, "called": False, "error": None}
 
     if not LEVEL2_VISION_MASKS_ENABLED:
         report["error"] = "disabled_via_env"
-        return {"furniture_floor_mask": None, "dark_material_mask": None}, report
+        return empty, report
 
     if not ANTHROPIC_API_KEY:
         report["error"] = "missing_ANTHROPIC_API_KEY"
-        return {"furniture_floor_mask": None, "dark_material_mask": None}, report
+        return empty, report
 
     h, w = img.shape[:2]
     scale = min(1.0, MAX_VISION_EDGE / float(max(h, w)))
@@ -193,7 +321,7 @@ def get_level2_regions(img):
     ok, buf = cv2.imencode(".jpg", small, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
     if not ok:
         report["error"] = "jpeg_encode_failed"
-        return {"furniture_floor_mask": None, "dark_material_mask": None}, report
+        return empty, report
 
     image_b64 = base64.b64encode(buf.tobytes()).decode("ascii")
 
@@ -202,20 +330,55 @@ def get_level2_regions(img):
         result = _call_vision_api(image_b64, "image/jpeg", sw, sh)
     except Exception as e:  # noqa: BLE001 -- any Vision failure must fall back, never crash the pipeline
         report["error"] = f"{type(e).__name__}: {e}"
-        return {"furniture_floor_mask": None, "dark_material_mask": None}, report
+        return empty, report
 
     inv_scale = (1.0 / scale) if scale < 1.0 else 1.0
-    try:
-        ff_boxes = [[c * inv_scale for c in box] for box in result.get("furniture_floor", [])]
-        dm_boxes = [[c * inv_scale for c in box] for box in result.get("dark_material", [])]
-    except (TypeError, ValueError) as e:
-        report["error"] = f"malformed_box_data: {type(e).__name__}: {e}"
-        return {"furniture_floor_mask": None, "dark_material_mask": None}, report
+    raw_regions = result.get("regions", [])
+    if not isinstance(raw_regions, list):
+        report["error"] = "malformed_response: 'regions' is not a list"
+        return empty, report
+
+    regions = []
+    masks = {}
+    dropped_count = 0
+    ff_boxes, dm_boxes = [], []
+
+    for i, raw in enumerate(raw_regions):
+        try:
+            sanitized = _sanitize_region(raw, i)
+        except (TypeError, ValueError, AttributeError):
+            sanitized = None
+        if sanitized is None:
+            dropped_count += 1
+            continue
+        region, box = sanitized
+        try:
+            scaled_box = [c * inv_scale for c in box]
+        except (TypeError, ValueError):
+            dropped_count += 1
+            continue
+
+        mask = _boxes_to_mask([scaled_box], img.shape)
+        masks[region["maskId"]] = mask
+        regions.append(region)
+
+        if region["regionType"] in LEGACY_FURNITURE_FLOOR_TYPES:
+            ff_boxes.append(scaled_box)
+        if region["regionType"] in LEGACY_DARK_MATERIAL_TYPES:
+            dm_boxes.append(scaled_box)
 
     ff_mask = _boxes_to_mask(ff_boxes, img.shape) if ff_boxes else np.zeros((h, w), dtype=np.float32)
     dm_mask = _boxes_to_mask(dm_boxes, img.shape) if dm_boxes else np.zeros((h, w), dtype=np.float32)
 
+    report["regionCount"] = len(regions)
+    report["droppedCount"] = dropped_count
+    # Kept for anything still reading these exact report fields.
     report["furnitureFloorBoxCount"] = len(ff_boxes)
     report["darkMaterialBoxCount"] = len(dm_boxes)
 
-    return {"furniture_floor_mask": ff_mask, "dark_material_mask": dm_mask}, report
+    return {
+        "regions": regions,
+        "masks": masks,
+        "furniture_floor_mask": ff_mask,
+        "dark_material_mask": dm_mask,
+    }, report
