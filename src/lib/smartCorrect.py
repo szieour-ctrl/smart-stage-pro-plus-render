@@ -1466,9 +1466,28 @@ def _apply_interior_stack(img, args, adaptive_intensity, level2_regions, wb_thre
     duplicating the full stack inline. level2_regions is passed in rather
     than recomputed -- geometric layout doesn't meaningfully change
     between a normal-headroom and reduced-headroom HDR variant of the
-    same photo, so this avoids a second Vision call on retry."""
+    same photo, so this avoids a second Vision call on retry.
+
+    WIRED LIVE (Aug 3, 2026): regions/level2_masks are now threaded into
+    every one of the five functions that already know how to consume
+    them (white_balance_neutral_aware, mls_brightness_lift,
+    clean_whites_adaptive, window_balance, mls_color_finish). Previously
+    get_level2_regions() computed a full per-region Retoucher Schema read
+    and this function discarded almost all of it, keeping only the two
+    legacy derived masks (dark_material_mask / furniture_floor_mask).
+    This is the change that lets a Vision-identified region (e.g. a
+    backlit chair tagged shadow_recovery/primary) actually change the
+    shipped pixels instead of only ever being available to protect
+    something. `regions`/`level2_masks` collapse to None (not just
+    empty) when Level 2 is disabled or the Vision call failed/returned
+    nothing, so every function below falls back to its exact pre-Aug-3
+    scalar/legacy-mask-only behavior -- nothing changes for a photo with
+    no usable regions."""
     modules = []
-    img, wb_strength = white_balance_neutral_aware(img)
+    regions = level2_regions.get("regions") or None
+    level2_masks = level2_regions.get("masks") or None
+
+    img, wb_strength = white_balance_neutral_aware(img, regions=regions, level2_masks=level2_masks)
     if wb_strength >= wb_threshold:
         modules.append("white_balance")
     img, lens_strength = mild_mobile_lens_correction(img, args.lens_mode)
@@ -1487,6 +1506,7 @@ def _apply_interior_stack(img, args, adaptive_intensity, level2_regions, wb_thre
     img, brightness_metrics = mls_brightness_lift(
         img, intensity=adaptive_intensity,
         dark_material_mask=level2_regions.get("dark_material_mask"),
+        regions=regions, level2_masks=level2_masks,
     )
     brightness_moved = abs(brightness_metrics["after_fusion_median_luma"] - brightness_metrics["before_median_luma"]) >= 5
     if brightness_moved or brightness_metrics["residual_need"] >= 0.05:
@@ -1504,15 +1524,18 @@ def _apply_interior_stack(img, args, adaptive_intensity, level2_regions, wb_thre
 
     img, white_metrics = clean_whites_adaptive(
         img, intensity=adaptive_intensity, exclusion_weight=combined_exclusion_weight,
+        regions=regions, level2_masks=level2_masks,
     )
     if white_metrics.get("applied"):
         modules.append("clean_whites")
 
-    img, window_metrics = window_balance(img)
+    img, window_metrics = window_balance(img, regions=regions, level2_masks=level2_masks)
     if window_metrics.get("applied"):
         modules.append("window_highlight_balance")
 
-    img, finish_metrics = mls_color_finish(img, intensity=adaptive_intensity)
+    img, finish_metrics = mls_color_finish(
+        img, intensity=adaptive_intensity, regions=regions, level2_masks=level2_masks,
+    )
     modules.append("color_clarity_finish")
 
     metrics = {
@@ -1526,7 +1549,6 @@ def _apply_interior_stack(img, args, adaptive_intensity, level2_regions, wb_thre
         "mlsFinish": finish_metrics,
     }
     return img, modules, metrics, rotation_deg, denoise_strength
-
 
 def main():
     parser = argparse.ArgumentParser()
