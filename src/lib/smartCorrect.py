@@ -1549,7 +1549,80 @@ def _apply_interior_stack(img, args, adaptive_intensity, level2_regions, wb_thre
         "mlsFinish": finish_metrics,
     }
     return img, modules, metrics, rotation_deg, denoise_strength
+# ── Region debug overlay (Aug 3, 2026) ──────────────────────────────────
+# Answers a question the Aug 3 wiring session couldn't answer: "did the
+# region I'm looking at in the corrected photo actually correspond to
+# what Vision drew?" Previous manual pixel checks (this session) had to
+# eyeball rectangles from a thumbnail, with no way to confirm they
+# actually overlapped the real mask -- worthless as verification. This
+# draws the REAL feathered mask (not a guessed box) as a colored, alpha-
+# blended overlay with a text label per region, so any future visual
+# check is against the pipeline's actual data, not a guess.
+#
+# Off by default (env var), zero cost to every normal request -- same
+# kill-switch pattern as LEVEL2_VISION_MASKS_ENABLED / LEVEL0_SHADOW_MODE.
+# Writes to a SEPARATE file next to the real output; never touches the
+# shipped photo itself.
+DEBUG_REGIONS_OVERLAY = os.environ.get("DEBUG_REGIONS_OVERLAY", "false").lower() == "true"
 
+# Distinct color per priority so a glance tells you what each blob means
+# without reading every label. BGR since this stays in cv2's color space
+# the whole way through -- no BGR2RGB round-trip needed before imwrite.
+_DEBUG_PRIORITY_COLORS = {
+    "protect": (0, 0, 255),      # red   -- "don't touch this"
+    "primary": (0, 200, 0),      # green -- "boost this the most"
+    "secondary": (255, 200, 0),  # cyan  -- "boost this some"
+}
+_DEBUG_DEFAULT_COLOR = (255, 0, 255)  # magenta -- anything else (shouldn't happen)
+
+
+def write_region_debug_overlay(img, regions, level2_masks, output_path):
+    """Writes a colored overlay of the REAL per-pixel region masks (not
+    guessed boxes) to output_path, with a text label per region showing
+    regionId / operation / priority. Silently no-ops if there are no
+    regions to draw -- never raises, matches every other Level 2 failure
+    mode in this file (degrade gracefully, don't crash the batch)."""
+    if not regions or not level2_masks:
+        return
+    try:
+        overlay = img.astype(np.float32).copy()
+        for region in regions:
+            mask = level2_masks.get(region.get("maskId"))
+            if mask is None:
+                continue
+            color = np.array(
+                _DEBUG_PRIORITY_COLORS.get(region.get("priority"), _DEBUG_DEFAULT_COLOR),
+                dtype=np.float32,
+            )
+            alpha = (np.clip(mask, 0, 1) * 0.45)[:, :, None]
+            overlay = overlay * (1.0 - alpha) + color * alpha
+        overlay = np.clip(overlay, 0, 255).astype(np.uint8)
+
+        for region in regions:
+            mask = level2_masks.get(region.get("maskId"))
+            if mask is None:
+                continue
+            # Label at the mask's centroid (weighted by mask strength,
+            # not a bounding-box corner) -- lands inside the actual
+            # feathered shape even for irregular masks.
+            ys, xs = np.where(mask > 0.5)
+            if len(xs) == 0:
+                continue
+            cx, cy = int(xs.mean()), int(ys.mean())
+            label = f"{region.get('regionId', '?')} [{region.get('operation', '?')}/{region.get('priority', '?')}]"
+            # Black outline + white fill so the label reads on any
+            # background color the overlay produces.
+            cv2.putText(overlay, label, (max(0, cx - 70), max(15, cy)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 0, 0), 2, cv2.LINE_AA)
+            cv2.putText(overlay, label, (max(0, cx - 70), max(15, cy)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
+
+        cv2.imwrite(output_path, overlay, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+    except Exception as e:  # noqa: BLE001 -- a debug tool must never crash a real correction
+        print(f"[write_region_debug_overlay] failed (non-fatal): {e}", file=sys.stderr)
+
+
+def main():
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", required=True)
