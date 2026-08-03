@@ -1946,6 +1946,7 @@ def main():
         "professionalMLSGuard": guard,
         "hdrRecovery": hdr_report,
         "level2Vision": level2_report,
+        "level2Regions": level2_regions.get("regions", []),
         "level2Diagnosis": diagnosis_report,
         "level0Scene": scene,
         "level4QC": qc,
