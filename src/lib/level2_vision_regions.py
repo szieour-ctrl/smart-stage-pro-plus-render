@@ -116,7 +116,14 @@ return an empty list if nothing in the frame needs individual treatment \
 beyond a normal, uniform correction.
 
 For EACH region, return:
-- "regionId": a short human-readable label, e.g. "foreground_chair"
+- "regionId": a short human-readable label describing what is LITERALLY \
+visible inside the box -- not an inferred function or purpose. Confirmed \
+on a real photo: a bright stairwell/window area got labeled \
+"front_door_highlight" though no door was anywhere near that box, \
+reproduced across separate runs of the same photo. If you are not \
+certain a labeled object (a door, a specific fixture, etc.) is actually \
+inside the box, name the region after what you can actually see \
+instead (e.g. "stairwell_window_light", not "front_door_highlight").
 - "box": [x1, y1, x2, y2] in pixel coordinates for THIS image \
 (width={w}, height={h}). Use a generously PADDED box -- err larger, not \
 tighter. This is a coarse routing signal, not a precise boundary.
@@ -348,15 +355,52 @@ def get_level2_regions(img):
     regions = []
     masks = {}
     dropped_count = 0
+    # Diagnostic addition (Aug 3, 2026): a real batch (IMG_8315, the
+    # Sonnet comparison run) reported droppedCount:1 with zero visibility
+    # into what that region actually was -- couldn't rule out something
+    # real (e.g. the stair gate, which no run has ever flagged) getting
+    # silently discarded vs. Vision genuinely returning garbage. Captures
+    # the raw (unsanitized) entry plus WHY it was dropped, so this is
+    # answerable directly from the JSON response instead of unknowable.
+    dropped_regions = []
     ff_boxes, dm_boxes = [], []
 
     for i, raw in enumerate(raw_regions):
         try:
             sanitized = _sanitize_region(raw, i)
-        except (TypeError, ValueError, AttributeError):
+        except (TypeError, ValueError, AttributeError) as e:
             sanitized = None
+            drop_reason = f"exception_during_sanitize: {type(e).__name__}: {e}"
+        else:
+            drop_reason = None
         if sanitized is None:
             dropped_count += 1
+            if drop_reason is None:
+                # Mirrors _sanitize_region's own checks, in the same
+                # order, purely to explain the drop -- not a second
+                # source of truth for validity.
+                if not isinstance(raw, dict):
+                    drop_reason = f"malformed_entry_not_a_dict: {type(raw).__name__}"
+                else:
+                    raw_box = raw.get("box")
+                    if not (isinstance(raw_box, list) and len(raw_box) == 4):
+                        drop_reason = "invalid_or_missing_box"
+                    else:
+                        rt, op, pr = raw.get("regionType"), raw.get("operation"), raw.get("priority")
+                        bad = []
+                        if rt not in REGION_TYPES:
+                            bad.append(f"regionType={rt!r}")
+                        if op not in OPERATIONS:
+                            bad.append(f"operation={op!r}")
+                        if pr not in PRIORITIES:
+                            bad.append(f"priority={pr!r}")
+                        drop_reason = ("invalid_enum_value: " + ", ".join(bad)) if bad else "unknown"
+            dropped_regions.append({
+                "index": i,
+                "regionId": raw.get("regionId") if isinstance(raw, dict) else None,
+                "reason": drop_reason,
+                "raw": raw if isinstance(raw, dict) else str(raw),
+            })
             continue
         region, box = sanitized
         try:
@@ -411,6 +455,7 @@ def get_level2_regions(img):
 
     report["regionCount"] = len(regions)
     report["droppedCount"] = dropped_count
+    report["droppedRegions"] = dropped_regions
     # Kept for anything still reading these exact report fields.
     report["furnitureFloorBoxCount"] = len(ff_boxes)
     report["darkMaterialBoxCount"] = len(dm_boxes)
