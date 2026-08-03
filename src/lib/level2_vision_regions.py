@@ -126,10 +126,28 @@ inside the box, name the region after what you can actually see \
 instead (e.g. "stairwell_window_light", not "front_door_highlight").
 - "box": [x1, y1, x2, y2] in pixel coordinates for THIS image \
 (width={w}, height={h}). Use a generously PADDED box -- err larger, not \
-tighter. This is a coarse routing signal, not a precise boundary.
+tighter. This is a coarse routing signal, not a precise boundary. \
+EXCEPTION for built-in architectural features (a stone/tile fireplace \
+surround, a mantel, built-in cabinetry, wall trim) that are continuous \
+with the wall rather than a free-standing object: these have no natural \
+silhouette for padding to expand around, and on a real photo, generous \
+padding on a fireplace surround swept up an unrelated lamp and coffee \
+table sitting nearby. For these, bound the box to where the DISTINCT \
+MATERIAL actually is -- the visible edge where the stone/trim meets the \
+wall, floor, or carpet -- not a padded guess at an object outline.
 - "regionType": exactly one of: dark_furniture, dark_stone, dark_fixture, \
 furniture, flooring, rug_textile, window_glass, mirror, screen_display, \
-light_wall_trim, sky_exterior, other
+light_wall_trim, sky_exterior, other. For a built-in architectural \
+feature, pick ONE based on its dominant material and stay consistent \
+with it: dark_stone for stone/tile/granite/marble surfaces (a fireplace \
+surround, a stone accent wall), light_wall_trim for painted wood trim, \
+crown molding, or a mantel SHELF specifically, dark_fixture for a built-\
+in unit with its own internal darkness (a fireplace's firebox opening, \
+a built-in dark cabinet interior). Confirmed on a real photo: the same \
+physical fireplace surround got classified as dark_stone, then \
+light_wall_trim, then dark_fixture across separate runs -- pick the \
+material-based category and do not waver between them for the same kind \
+of feature.
 - "operation": exactly one of: exposure_lift, shadow_recovery, \
 highlight_reduction, white_balance_adjustment, mixed_light_balance, \
 texture_enhancement, clarity_reduction, saturation_protection, \
@@ -154,7 +172,10 @@ get brightened like the rest of the room (protect, preserve_black_depth); \
 an already well-exposed window or doorway that shouldn't be pushed \
 brighter along with a dim room (highlight_reduction, protect); a TV or \
 monitor screen showing real content, which should never be treated like \
-a wall or trim surface (screen_display, no_change, protect).
+a wall or trim surface (screen_display, no_change, protect); a stone \
+fireplace surround bounded tightly to just the stone material, not \
+padded out to include a nearby lamp or table (dark_stone, protect, \
+preserve_black_depth).
 
 Do NOT include ordinary, evenly-lit content that just needs whatever \
 uniform correction the rest of the frame gets -- that's the default \
