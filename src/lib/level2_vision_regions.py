@@ -287,7 +287,7 @@ def get_level2_regions(img):
     level2_regions = {
         # NEW (Aug 3, 2026):
         "regions": [ {regionId, maskId, regionType, operation, priority,
-                       protections, confidence, reasoning}, ... ],
+                       protections, confidence, reasoning, box}, ... ],
         "masks": { maskId: float32 (H,W) ndarray in [0,1], ... },
         # BACKWARD-COMPATIBLE (unchanged shape/meaning from before):
         "furniture_floor_mask": float32 (H,W) ndarray in [0,1], or None,
@@ -360,6 +360,17 @@ def get_level2_regions(img):
 
         mask = _boxes_to_mask([scaled_box], img.shape)
         masks[region["maskId"]] = mask
+        # Exposed on the region dict itself (Aug 3, 2026, diagnostic
+        # patch): previously only the final feathered mask was kept --
+        # once a region looked wrong on a real photo (oversized protect
+        # coverage on IMG_8315/IMG_8317, confirmed via the new debug
+        # overlay), there was no way to tell whether Vision itself
+        # returned a loose box or whether _boxes_to_mask's padding/
+        # feathering was responsible, without instrumenting this file
+        # directly. Full-image pixel coordinates, already inv_scale-
+        # corrected -- same coordinate space smartCorrect.py's `img`
+        # is in, so this can be drawn directly without further math.
+        region["box"] = [round(c, 1) for c in scaled_box]
         regions.append(region)
 
         if region["regionType"] in LEGACY_FURNITURE_FLOOR_TYPES:
