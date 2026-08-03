@@ -1581,11 +1581,26 @@ _DEBUG_DEFAULT_COLOR = (255, 0, 255)  # magenta -- anything else (shouldn't happ
 def write_region_debug_overlay(img, regions, level2_masks, output_path):
     """Writes a colored overlay of the REAL per-pixel region masks (not
     guessed boxes) to output_path, with a text label per region showing
-    regionId / operation / priority. Silently no-ops if there are no
-    regions to draw -- never raises, matches every other Level 2 failure
-    mode in this file (degrade gracefully, don't crash the batch)."""
+    regionId / operation / priority. Never raises -- matches every other
+    Level 2 failure mode in this file (degrade gracefully, don't crash
+    the batch).
+
+    Returns a small report dict instead of None (Aug 3, 2026 patch, same
+    day as the feature itself): the first real test with
+    DEBUG_REGIONS_OVERLAY=true produced zero overlay files with no
+    visible explanation anywhere in the JSON response -- this function
+    working correctly in isolation (confirmed via a standalone synthetic
+    test) means the failure is either upstream (env var not actually
+    live in the container) or a silent exception specific to production
+    inputs, and there was no way to tell which from the response alone.
+    This report -- included in main()'s final JSON under
+    "debugRegionsOverlay" -- makes that distinguishable on the next run
+    without needing Railway log access."""
+    report = {"attempted": False, "written": False, "path": output_path, "error": None}
     if not regions or not level2_masks:
-        return
+        report["error"] = "no_regions_or_masks"
+        return report
+    report["attempted"] = True
     try:
         overlay = img.astype(np.float32).copy()
         for region in regions:
@@ -1619,9 +1634,14 @@ def write_region_debug_overlay(img, regions, level2_masks, output_path):
             cv2.putText(overlay, label, (max(0, cx - 70), max(15, cy)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
 
-        cv2.imwrite(output_path, overlay, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+        ok = cv2.imwrite(output_path, overlay, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+        report["written"] = bool(ok)
+        if not ok:
+            report["error"] = "cv2.imwrite_returned_false"
     except Exception as e:  # noqa: BLE001 -- a debug tool must never crash a real correction
+        report["error"] = f"{type(e).__name__}: {e}"
         print(f"[write_region_debug_overlay] failed (non-fatal): {e}", file=sys.stderr)
+    return report
 
 
 def main():
@@ -1977,11 +1997,12 @@ def main():
         modules_applied.append("level2_vision_regions")
 
     # ── Region debug overlay (Aug 3, 2026, optional) ──────────────────────
+    debug_overlay_report = {"enabled": DEBUG_REGIONS_OVERLAY}
     if DEBUG_REGIONS_OVERLAY:
         debug_path = os.path.splitext(args.output)[0] + "_regions_debug.jpg"
-        write_region_debug_overlay(
+        debug_overlay_report.update(write_region_debug_overlay(
             _geom_preview, level2_regions.get("regions"), level2_regions.get("masks"), debug_path,
-        )
+        ))
 
     img, stack_modules, stack_metrics, rotation_deg, denoise_strength = \
         _apply_interior_stack(img, args, adaptive_intensity, level2_regions, wb_threshold)
@@ -2055,6 +2076,7 @@ def main():
         "level4QC": qc,
         "qcRetry": retry_report,
         "metrics": stack_metrics,
+        "debugRegionsOverlay": debug_overlay_report,
     }))
 
 
