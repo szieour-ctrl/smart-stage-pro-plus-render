@@ -56,7 +56,16 @@ logger = logging.getLogger(__name__)
 LEVEL4_QC_ENABLED = os.environ.get("LEVEL4_QC_ENABLED", "true").lower() not in ("false", "0", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 QC_MODEL = os.environ.get("LEVEL4_QC_MODEL", "claude-haiku-4-5-20251001")
-TIMEOUT_SECONDS = int(os.environ.get("LEVEL4_QC_TIMEOUT_SECONDS", "12"))
+TIMEOUT_SECONDS = int(os.environ.get("LEVEL4_QC_TIMEOUT_SECONDS", "30"))  # raised
+# from 12s (Aug 3, 2026): confirmed real timeout on a live batch immediately
+# after max_tokens went 300 -> 1500 for Sonnet's longer surface-by-surface
+# narration -- more output room predictably means more generation time, and
+# 12s (sized for Haiku's terse replies) wasn't enough headroom for Sonnet to
+# finish. Raised the DEFAULT itself rather than only documenting an env var
+# override, since this exact class of miss (forgetting to raise a
+# Haiku-era timeout after switching a call to Sonnet) has now cost real
+# back-and-forth twice in one session, in two different files. Still
+# overridable via LEVEL4_QC_TIMEOUT_SECONDS if 30s ever proves insufficient.
 MAX_VISION_EDGE = 1568  # matches level0_scene_classifier.py / level2_diagnosis.py
 
 SYSTEM_PROMPT = """You are a senior professional photo retoucher with 20+ years \
