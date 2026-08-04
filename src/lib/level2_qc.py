@@ -112,6 +112,18 @@ does, describe exactly which surface and where in the frame, even if it's \
 subtle -- subtle is exactly the kind of miss a careless review would make \
 and a careful one wouldn't.
 
+CALIBRATION NOTE from a real miss: this exact check was run on a photo with \
+a genuine streak -- a lightened, smooth vertical band cutting through an \
+otherwise uniformly stippled/speckled concrete slab -- and returned \
+looksArtificial: false at HIGH confidence. The artifact was unambiguous \
+once someone looked closely at that one surface; it was missed on a first \
+holistic pass across the whole frame. A confident "false" must mean you \
+actually traced each high-risk surface's texture/grain from one edge to \
+the other and confirmed it stays continuous -- not that the frame's overall \
+brightness and color looked plausible at a glance. If you have not \
+mentally traced the concrete, pavement, or any other large uniform surface \
+edge-to-edge, do not report high confidence on it.
+
 Respond with ONLY strict JSON, no markdown fences, no preamble:
 {"looksArtificial": true | false, "confidence": "high" | "medium" | "low", "issue": "<one sentence describing what's wrong, or null if none>", "location": "<brief description of where in the frame, or null if none>"}"""
 
