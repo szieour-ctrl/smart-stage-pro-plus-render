@@ -50,6 +50,7 @@ import urllib.request
 from typing import Optional, TypedDict
 
 import cv2
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,73 @@ TIMEOUT_SECONDS = int(os.environ.get("LEVEL4_QC_TIMEOUT_SECONDS", "30"))  # rais
 # back-and-forth twice in one session, in two different files. Still
 # overridable via LEVEL4_QC_TIMEOUT_SECONDS if 30s ever proves insufficient.
 MAX_VISION_EDGE = 1568  # matches level0_scene_classifier.py / level2_diagnosis.py
+
+# ── Targeted zoomed-crop assist (Aug 3, 2026) ────────────────────────────
+# WHY THIS EXISTS: the CALIBRATION NOTE below (added earlier the same day)
+# didn't fix the miss on its own -- a real streak on IMG_8311 was missed
+# THREE more times after that note was added, by Sonnet, with full time and
+# token budget, genuinely completing its reasoning. Two separate outside
+# LLMs, shown just the original/corrected pair with no pipeline framing,
+# both called the same streak "obvious." That gap -- obvious in isolation,
+# missed inside a full 640x480 scene with a pool, trees, sky, and a moving
+# object also competing for attention -- points at framing, not raw model
+# capability. This crops the largest uniform-material region (concrete,
+# wall, pavement -- exactly the highest-risk surfaces named in the prompt's
+# own METHOD section) and sends it as an ADDITIONAL, zoomed image pair
+# alongside the full frame, so Vision gets the same kind of close, isolated
+# look a human reviewer would give the suspicious area -- without this
+# module ever making the artifact/not-artifact decision itself. Vision
+# still decides; this just hands it better material to decide with.
+#
+# Uses the same coarse local-color-spread measure validated during the
+# classical-detector attempt earlier the same day (that attempt's DECISION
+# logic had real false-positive problems and was abandoned -- see repo
+# history -- but this specific measure correctly separated real concrete
+# texture, mean spread ~5, from structured content like foliage/water
+# edges, mean spread ~16, and is reused here only to find WHERE to point
+# the camera, not to make any pass/fail call on its own).
+FLAT_REGION_THRESHOLD = float(os.environ.get("LEVEL4_QC_FLAT_THRESHOLD", "8.0"))
+FLAT_REGION_MIN_AREA_FRAC = float(os.environ.get("LEVEL4_QC_FLAT_MIN_AREA_FRAC", "0.03"))
+
+
+def find_largest_uniform_region(img, threshold=FLAT_REGION_THRESHOLD, min_area_frac=FLAT_REGION_MIN_AREA_FRAC, pad_frac=0.08):
+    """Finds the single largest contiguous uniform-material region in an
+    image (concrete, pavement, wall, sky -- large low-detail surfaces),
+    for use as a targeted QC zoom crop. Returns (x1, y1, x2, y2) in pixel
+    coordinates, or None if nothing large enough qualifies (e.g. a tightly
+    cluttered interior shot with no big uniform surface at all -- QC then
+    just runs on the full frame alone, same as before this patch).
+
+    Never raises -- any internal failure returns None, so a bug here
+    degrades to "no zoom assist" rather than blocking QC entirely."""
+    try:
+        l = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)[:, :, 0].astype(np.float32)
+        h, w = l.shape
+        smoothed = cv2.GaussianBlur(l, (0, 0), sigmaX=6)
+        local_mean = cv2.blur(smoothed, (25, 25))
+        local_sqmean = cv2.blur(smoothed * smoothed, (25, 25))
+        local_spread = np.sqrt(np.maximum(local_sqmean - local_mean * local_mean, 0))
+        flat_mask = (local_spread < threshold).astype(np.uint8)
+
+        num, labels, stats, _ = cv2.connectedComponentsWithStats(flat_mask, connectivity=8)
+        min_area = min_area_frac * h * w
+        best_i, best_area = None, min_area
+        for i in range(1, num):  # skip label 0 (background)
+            area = stats[i, cv2.CC_STAT_AREA]
+            if area > best_area:
+                best_i, best_area = i, area
+        if best_i is None:
+            return None
+
+        x, y, bw, bh = (stats[best_i, cv2.CC_STAT_LEFT], stats[best_i, cv2.CC_STAT_TOP],
+                         stats[best_i, cv2.CC_STAT_WIDTH], stats[best_i, cv2.CC_STAT_HEIGHT])
+        pad_x, pad_y = int(bw * pad_frac), int(bh * pad_frac)
+        x1, y1 = max(0, x - pad_x), max(0, y - pad_y)
+        x2, y2 = min(w, x + bw + pad_x), min(h, y + bh + pad_y)
+        return (x1, y1, x2, y2)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"level2_qc: find_largest_uniform_region failed (non-fatal): {e}")
+        return None
 
 SYSTEM_PROMPT = """You are a senior professional photo retoucher with 20+ years \
 in real estate and architectural photography, performing a final forensic \
@@ -124,22 +192,50 @@ and a careful one wouldn't.
 CALIBRATION NOTE from a real miss: this exact check was run on a photo with \
 a genuine streak -- a lightened, smooth vertical band cutting through an \
 otherwise uniformly stippled/speckled concrete slab -- and returned \
-looksArtificial: false at HIGH confidence. The artifact was unambiguous \
-once someone looked closely at that one surface; it was missed on a first \
-holistic pass across the whole frame. A confident "false" must mean you \
+looksArtificial: false at HIGH confidence, repeatedly, even with full time \
+and reasoning budget. The same streak, shown to a separate reviewer with no \
+other context, was called obvious immediately. The gap wasn't the artifact \
+being subtle -- it was competing for attention against a pool, trees, sky, \
+and other frame content all at once. A confident "false" must mean you \
 actually traced each high-risk surface's texture/grain from one edge to \
 the other and confirmed it stays continuous -- not that the frame's overall \
-brightness and color looked plausible at a glance. If you have not \
-mentally traced the concrete, pavement, or any other large uniform surface \
-edge-to-edge, do not report high confidence on it.
+brightness and color looked plausible at a glance.
+
+If a ZOOMED CROP of the largest uniform surface in the frame is provided \
+below (labeled as such), it exists to remove that competition-for-attention \
+problem directly -- give it your closest, most deliberate scrutiny of the \
+whole set. It was selected automatically because it's the largest \
+low-detail material in the photo (concrete, pavement, wall, or similar), \
+which is exactly the highest-risk surface type named above. If nothing in \
+the full frame looks wrong but the zoomed crop shows a gradient, band, or \
+texture discontinuity that isn't in its corresponding original crop, that \
+IS a real finding -- report it exactly as you would if you'd spotted it in \
+the full frame yourself.
 
 Respond with ONLY strict JSON, no markdown fences, no preamble:
 {"looksArtificial": true | false, "confidence": "high" | "medium" | "low", "issue": "<one sentence describing what's wrong, or null if none>", "location": "<brief description of where in the frame, or null if none>"}"""
 
 
-def _call_vision_api(original_b64: str, corrected_b64: str, media_type: str) -> dict:
+def _call_vision_api(original_b64: str, corrected_b64: str, media_type: str,
+                      crop_original_b64: Optional[str] = None,
+                      crop_corrected_b64: Optional[str] = None) -> dict:
     """Raw urllib.request call, no SDK -- same proven pattern as
     level2_diagnosis.py and level0_scene_classifier.py."""
+    content = [
+        {"type": "text", "text": "ORIGINAL (full frame):"},
+        {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": original_b64}},
+        {"type": "text", "text": "CORRECTED (full frame):"},
+        {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": corrected_b64}},
+    ]
+    if crop_original_b64 and crop_corrected_b64:
+        content += [
+            {"type": "text", "text": "ORIGINAL (ZOOMED CROP of the largest uniform surface in the frame):"},
+            {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": crop_original_b64}},
+            {"type": "text", "text": "CORRECTED (ZOOMED CROP, same region as above):"},
+            {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": crop_corrected_b64}},
+        ]
+    content.append({"type": "text", "text": "Does the corrected version show anything artificially altered, streaked, or unnatural that isn't in the original?"})
+
     body = json.dumps({
         "model": QC_MODEL,
         # 300 was sized for Haiku's typical terse output. Confirmed real
@@ -154,16 +250,7 @@ def _call_vision_api(original_b64: str, corrected_b64: str, media_type: str) -> 
         # never produces a usable verdict.
         "max_tokens": 1500,
         "system": SYSTEM_PROMPT,
-        "messages": [{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": "ORIGINAL:"},
-                {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": original_b64}},
-                {"type": "text", "text": "CORRECTED:"},
-                {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": corrected_b64}},
-                {"type": "text", "text": "Does the corrected version show anything artificially altered, streaked, or unnatural that isn't in the original?"},
-            ],
-        }],
+        "messages": [{"role": "user", "content": content}],
     }).encode("utf-8")
 
     req = urllib.request.Request(
@@ -253,7 +340,7 @@ def qc_check(original_img, corrected_img) -> dict:
     # back with no way to confirm whether LEVEL4_QC_MODEL had actually
     # taken effect on Railway. Reflects QC_MODEL's resolved value (env
     # override or the hardcoded default) on every path, success or not.
-    report = {"enabled": LEVEL4_QC_ENABLED, "called": False, "model": QC_MODEL, "error": None}
+    report = {"enabled": LEVEL4_QC_ENABLED, "called": False, "model": QC_MODEL, "zoomCropBox": None, "error": None}
 
     if not LEVEL4_QC_ENABLED:
         logger.info("level2_qc: disabled via env, skipping")
@@ -271,8 +358,29 @@ def qc_check(original_img, corrected_img) -> dict:
             report["error"] = "jpeg_encode_failed"
             return {"looksArtificial": None, "confidence": None, "issue": None, "location": None, **report}
 
+        # Targeted zoom assist (Aug 3, 2026): find the largest uniform
+        # surface on the ORIGINAL (pre-correction geometry/content --
+        # correction shouldn't change where a wall or slab physically
+        # is) and send matching crops from both images alongside the
+        # full frame. Best-effort: if no region qualifies (e.g. a
+        # tightly cluttered shot with no single large uniform surface),
+        # or the crop step fails for any reason, QC simply runs on the
+        # full frame alone -- same behavior as before this patch, never
+        # a hard failure.
+        crop_original_b64 = crop_corrected_b64 = None
+        try:
+            box = find_largest_uniform_region(original_img)
+            if box is not None:
+                x1, y1, x2, y2 = box
+                crop_original_b64 = _encode_for_vision(original_img[y1:y2, x1:x2])
+                crop_corrected_b64 = _encode_for_vision(corrected_img[y1:y2, x1:x2])
+                report["zoomCropBox"] = [int(x1), int(y1), int(x2), int(y2)]
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"level2_qc: zoom crop failed (non-fatal, continuing without it): {e}")
+
         report["called"] = True
-        result = _call_vision_api(original_b64, corrected_b64, "image/jpeg")
+        result = _call_vision_api(original_b64, corrected_b64, "image/jpeg",
+                                   crop_original_b64, crop_corrected_b64)
 
         looks_artificial = result.get("looksArtificial")
         if not isinstance(looks_artificial, bool):
