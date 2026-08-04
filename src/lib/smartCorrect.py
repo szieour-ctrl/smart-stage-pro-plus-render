@@ -1998,6 +1998,8 @@ def main():
             "sceneProfile": "exterior_daylight",
             "exteriorSignals": exterior_signals,
             "level0Scene": scene,
+            "level2Vision": ext_level2_report,
+            "level2Regions": ext_level2_regions.get("regions", []),
             "level2Diagnosis": diagnosis_report,
             "level4QC": qc,
             "qcRetry": retry_report,
