@@ -40,12 +40,15 @@ existing Level 2 region routing (stage 2, unchanged). This module's
 output is meant to inform which correction path/emphasis to use, not to
 replace any of the deterministic math.
 
-STATUS: prototype, not yet wired into smartCorrect.py's main() pipeline.
-Demonstrated working on one real photo (IMG_8310) during the design
-session; needs testing across a wider photo set — including cases where
-the visual read and the stats agree, to confirm this doesn't just add
-cost without changing the outcome on ordinary photos — before treating
-its diagnosis as authoritative for routing decisions.
+STATUS UPDATE (Aug 4, 2026): the "prototype, not yet wired in" note above
+is stale -- this has been live and authoritative in smartCorrect.py's
+main() since at least Aug 3. Every real batch run that day
+(ai_diagnosis_mixed_light_temperature, ai_diagnosis_already_acceptable,
+ai_diagnosis_reduced_intensity, etc. in modulesApplied) shows this
+diagnosis actively driving _diagnosis_adjusted_intensity(). Left the
+original note above for history rather than deleting it, but do not
+treat this module as unproven or optional -- it is a live, production
+routing signal today.
 """
 
 import base64
@@ -60,7 +63,13 @@ import numpy as np
 LEVEL2_DIAGNOSIS_ENABLED = os.environ.get("LEVEL2_DIAGNOSIS_ENABLED", "true").lower() not in ("false", "0", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 DIAGNOSIS_MODEL = os.environ.get("LEVEL2_DIAGNOSIS_MODEL", "claude-haiku-4-5-20251001")
-DIAGNOSIS_TIMEOUT_SECONDS = 12
+DIAGNOSIS_TIMEOUT_SECONDS = int(os.environ.get("LEVEL2_DIAGNOSIS_TIMEOUT_SECONDS", "30"))  # raised
+# from a hardcoded 12s with NO env override at all (Aug 4, 2026): this exact
+# gap -- a Haiku-era timeout with no way to raise it -- was already found
+# and fixed in level2_qc.py and level2_vision_regions.py after each hit a
+# real live timeout under Sonnet. This file never got the same treatment.
+# Fixed proactively here, informed by those two real incidents, rather
+# than waiting to hit it live a third time.
 MAX_VISION_EDGE = 1568  # matches the existing cap used elsewhere in this codebase
 
 PROMPT_TEMPLATE = """You are a professional real estate photo retoucher doing the FIRST look at a photo before any correction is applied — the same glance a human retoucher gives before touching anything.
@@ -85,7 +94,14 @@ Return ONLY strict JSON, no prose, no markdown fences:
 def _call_vision_api(image_b64: str, media_type: str, stats_json: str) -> dict:
     body = json.dumps({
         "model": DIAGNOSIS_MODEL,
-        "max_tokens": 512,
+        # Raised from 512 (Aug 4, 2026): not yet a confirmed live failure
+        # here the way level2_qc.py's 300 was, but the same shape of risk
+        # -- a model given room to reason fully (this prompt explicitly
+        # asks for a one-sentence reasoning AND a one-sentence correction
+        # emphasis) can run longer than a token budget sized for a terser
+        # model's typical output. Fixed proactively rather than waiting
+        # for a repeat of that exact incident.
+        "max_tokens": 1024,
         "messages": [{
             "role": "user",
             "content": [
@@ -115,14 +131,39 @@ def _call_vision_api(image_b64: str, media_type: str, stats_json: str) -> dict:
         text = text.strip("`")
         if text.lower().startswith("json"):
             text = text[4:]
-    return json.loads(text.strip())
+    text = text.strip()
+
+    # Hardened parsing (Aug 4, 2026): this was a plain json.loads(), not
+    # protected against either failure mode already confirmed real
+    # elsewhere in this same pipeline -- trailing chatter after valid
+    # JSON (level2_qc.py: "Extra data: line 2 column 1") or, worse,
+    # leading prose BEFORE the JSON (level2_qc.py again, once Sonnet was
+    # given room to actually narrate its reasoning per this prompt's own
+    # "one sentence" asks). Same fix as that file: find the first '{' and
+    # parse from there, rather than assume the JSON is the very first
+    # character of the response.
+    if not text:
+        raise ValueError("empty_response_text")
+    brace_start = text.find("{")
+    if brace_start == -1:
+        raise ValueError(f"no_json_object_found -- raw_text={text[:300]!r}")
+    try:
+        return json.JSONDecoder().raw_decode(text, brace_start)[0]
+    except json.JSONDecodeError as e:
+        raise ValueError(f"{e} -- raw_text={text[:300]!r}") from e
 
 
 def diagnose(img, image_stats_dict, white_surface_stats_dict, shadow_highlight_stats_dict, is_exterior):
     """Returns (diagnosis, report). diagnosis is None on disable/failure —
     callers must treat that as 'no diagnosis available, proceed with
     existing threshold-based logic unchanged.' Never raises."""
-    report = {"enabled": LEVEL2_DIAGNOSIS_ENABLED, "called": False, "error": None}
+    # "model" included from the start, not just on success (Aug 4, 2026,
+    # same fix already applied to level2_vision_regions.py and
+    # level2_qc.py after each cost real diagnostic time from not having
+    # it): reflects DIAGNOSIS_MODEL's resolved value on every path,
+    # success or not, so which model served a given diagnosis is never
+    # a guess.
+    report = {"enabled": LEVEL2_DIAGNOSIS_ENABLED, "called": False, "model": DIAGNOSIS_MODEL, "error": None}
 
     if not LEVEL2_DIAGNOSIS_ENABLED:
         report["error"] = "disabled_via_env"
