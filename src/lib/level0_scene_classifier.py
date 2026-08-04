@@ -40,6 +40,20 @@ diagnosis — do not skip steps just because this module feels simpler):
   3. Only after that review, flip LEVEL0_SHADOW_MODE=false so Vision's
      answer becomes the actual gate. HSV heuristic remains as a
      fallback for when Vision is disabled/unavailable/fails.
+
+STEP 3 COMPLETE (Aug 3, 2026): shadow mode is now OFF by default.
+Real-batch review found the HSV heuristic misrouting the majority of a
+4-photo exterior test set -- 3 of 4 either disagreed with Vision or
+showed no disagreement flag on content that was plausibly exterior --
+and in one case, the misroute (an exterior driveway photo pushed through
+the far more aggressive interior MLS Bright stack instead of the
+restrained exterior path) was directly implicated in a real QC-caught
+artifact. Per direction: Vision is the photographer making the judgment
+call that DIRECTS correction -- it should decide, not just be logged.
+HSV heuristic remains the fallback for when Vision is disabled,
+unavailable, or answers with low confidence (see resolve_scene_type) --
+never removed, just no longer the default authority when Vision has a
+real answer to give.
 """
 
 import os
@@ -60,11 +74,10 @@ SCENE_MODEL = os.environ.get("LEVEL0_SCENE_MODEL", "claude-haiku-4-5-20251001")
 TIMEOUT_SECONDS = int(os.environ.get("LEVEL0_VISION_TIMEOUT_SECONDS", "12"))
 MAX_VISION_EDGE = 1568  # matches level2_diagnosis.py / the existing cap used elsewhere in this codebase
 
-# SHADOW_MODE=true: Vision result is computed and returned/logged only;
-# the HSV heuristic still decides routing. Flip to "false" only after
-# reviewing a real batch of logged disagreements via level0Scene in the
-# JSON output.
-SHADOW_MODE = os.environ.get("LEVEL0_SHADOW_MODE", "true").lower() not in ("false", "0", "")
+# SHADOW_MODE default flipped to "false" (Aug 3, 2026): see rollout note
+# above. Still overridable via LEVEL0_SHADOW_MODE=true if Vision ever
+# needs to be pulled back to log-only without a code change.
+SHADOW_MODE = os.environ.get("LEVEL0_SHADOW_MODE", "false").lower() not in ("false", "0", "")
 
 
 class SceneClassification(TypedDict, total=False):
@@ -206,14 +219,31 @@ def resolve_scene_type(img, hsv_heuristic_result: bool) -> dict:
 
     hsv_heuristic_result: output of the existing is_exterior_daylight()
     (True = heuristic says exterior).
+
+    Vision is authoritative by default (Aug 3, 2026) -- see module
+    docstring. HSV heuristic is the fallback for exactly three cases:
+    shadow mode explicitly re-enabled, Vision unavailable (disabled,
+    missing key, timeout, parse failure), or Vision answered but at LOW
+    confidence -- this routing decision determines which of two very
+    different correction stacks a photo gets (interior's aggressive MLS
+    Bright target vs. exterior's restrained lift), so an uncertain
+    Vision answer shouldn't silently override a working heuristic.
     """
     vision_result = classify_scene(img)
     vision_available = vision_result.get("sceneType") is not None
     vision_says_exterior = vision_result.get("sceneType") == "exterior"
+    vision_confidence = vision_result.get("confidence")
+    vision_trustworthy = vision_available and vision_confidence in ("high", "medium")
 
-    if SHADOW_MODE or not vision_available:
+    if SHADOW_MODE:
         final_is_exterior = hsv_heuristic_result
-        source = "hsv_heuristic (shadow mode)" if SHADOW_MODE else "hsv_heuristic (vision unavailable)"
+        source = "hsv_heuristic (shadow mode)"
+    elif not vision_available:
+        final_is_exterior = hsv_heuristic_result
+        source = "hsv_heuristic (vision unavailable)"
+    elif not vision_trustworthy:
+        final_is_exterior = hsv_heuristic_result
+        source = f"hsv_heuristic (vision low confidence: {vision_confidence})"
     else:
         final_is_exterior = vision_says_exterior
         source = "vision"
@@ -224,7 +254,8 @@ def resolve_scene_type(img, hsv_heuristic_result: bool) -> dict:
             f"level0_scene_classifier: DISAGREEMENT — hsv_exterior={hsv_heuristic_result} "
             f"vision_exterior={vision_says_exterior} "
             f"(confidence={vision_result.get('confidence')}) "
-            f"reasoning='{vision_result.get('reasoning')}'"
+            f"reasoning='{vision_result.get('reasoning')}' "
+            f"-- final decision source: {source}"
         )
 
     return {
