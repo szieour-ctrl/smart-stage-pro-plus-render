@@ -1,4 +1,4 @@
-"""
+A"""
 level2_qc.py
 
 Stage 4 of the four-stage architecture (design session, Aug 2026):
@@ -8,7 +8,7 @@ Vision diagnoses -> Vision routes regions -> classical CV executes ->
 WHAT THIS IS: a single Vision call made AFTER correction runs, shown
 BOTH the original and corrected photo, asked a holistic "does anything
 here look artificially altered, streaked, or unnatural" question. This
-plays to what Vision models are actually reliable at (a holistic "does
+plays to what Vision models aAre actually reliable at (a holistic "does
 this look wrong" read) rather than asking them to originate calibrated
 correction values (already rejected for Stage 3) or self-diagnose a
 subtle pixel-level artifact from a single image with no reference.
@@ -133,7 +133,17 @@ def _call_vision_api(original_b64: str, corrected_b64: str, media_type: str) -> 
     level2_diagnosis.py and level0_scene_classifier.py."""
     body = json.dumps({
         "model": QC_MODEL,
-        "max_tokens": 300,
+        # 300 was sized for Haiku's typical terse output. Confirmed real
+        # failure (Aug 3, 2026): Sonnet, given the same prompt, actually
+        # narrates the full surface-by-surface METHOD in visible prose
+        # ("I'll work through this surface by surface carefully...
+        # **Sky:**... **Foliage/Trees:**...") before ever reaching the
+        # closing JSON -- and was very likely getting cut off by the 300
+        # token ceiling before it got there at all. Raised generously;
+        # at Sonnet's $15/MTok output rate even 1500 tokens is
+        # ~$0.0225/call, trivial next to the cost of a QC call that
+        # never produces a usable verdict.
+        "max_tokens": 1500,
         "system": SYSTEM_PROMPT,
         "messages": [{
             "role": "user",
@@ -181,6 +191,19 @@ def _call_vision_api(original_b64: str, corrected_b64: str, media_type: str) -> 
     if not text:
         raise ValueError(f"empty_response_text (stop_reason={payload.get('stop_reason')!r})")
 
+    # Confirmed real failure (Aug 3, 2026): raw_decode() starting at
+    # position 0 assumes JSON is the FIRST thing in the text. That broke
+    # the moment a model (Sonnet, narrating its reasoning per the
+    # prompt's own METHOD instructions) put paragraphs of prose before
+    # the JSON instead of after it -- the original raw_decode fallback
+    # only ever handled TRAILING junk, not leading. Find the first '{'
+    # and start there instead of assuming position 0; falls through to
+    # the original behavior unchanged when the response is pure JSON
+    # with nothing before it (brace_start == 0).
+    brace_start = text.find("{")
+    if brace_start == -1:
+        raise ValueError(f"no_json_object_found -- raw_text={text[:300]!r}")
+
     # Use raw_decode rather than a plain json.loads: despite the prompt
     # saying "ONLY JSON, no prose", models occasionally append a trailing
     # sentence after a complete, valid JSON object (confirmed on a real
@@ -188,7 +211,7 @@ def _call_vision_api(original_b64: str, corrected_b64: str, media_type: str) -> 
     # just the first valid JSON value and ignores anything after it,
     # rather than failing the whole call over trailing chatter.
     try:
-        return json.JSONDecoder().raw_decode(text)[0]
+        return json.JSONDecoder().raw_decode(text, brace_start)[0]
     except json.JSONDecodeError as e:
         raise ValueError(f"{e} -- raw_text={text[:300]!r}") from e
 
