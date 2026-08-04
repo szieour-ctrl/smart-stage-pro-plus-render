@@ -783,29 +783,24 @@ def _largest_crop_after_rotation(w, h, angle_deg):
     return wr, hr
 
 
-def deskew_perspective(img):
-    """Perspective/vertical alignment via Hough-line detection.
+def measure_deskew_angle(img):
+    """Pure measurement half of deskew_perspective (Aug 4, 2026 split) --
+    Hough-line detection through the confidence-scaled angle math, zero
+    pixel changes. See deskew_perspective()'s docstring for the fix
+    history this inherits unchanged.
 
-    APPROXIMATION NOTE: detects the dominant near-vertical line angle
-    (architectural edges) and applies a single global rotation — not full
-    4-point perspective/keystone correction. Upgrade path if testing shows
-    meaningfully converging verticals a single rotation can't fix.
-
-    Includes both fixes verified earlier this session: (1) canonicalized
-    line direction so HoughLinesP's arbitrary endpoint ordering can't flip
-    a valid line into the rejected ~180-degree range, (2) correct sign on
-    the corrective rotation (proved via a known 5-degree test tilt: the
-    unfixed version measured ~10 degrees residual, doubling the tilt; this
-    version measures 0.0), and (3) crop-after-rotate so no replicated
-    border pixels survive into the delivered image (proved via a
-    marker-color test — zero fabricated pixels found in the final output).
-    """
+    Returns (correction_angle, debug_dict). debug_dict always has at
+    least a "reason"/"lineCount" style entry -- useful for exactly the
+    kind of root-cause work that found this needed splitting out in the
+    first place (a downstream color correction changing the line count
+    just enough to cross the 3-line minimum on a photo with razor-thin
+    evidence either way)."""
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(gray, 50, 150, apertureSize=3)
     lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=80,
                              minLineLength=max(40, img.shape[0] // 4), maxLineGap=12)
     if lines is None:
-        return img, 0.0
+        return 0.0, {"reason": "no_lines_detected"}
 
     angles = []
     lengths = []
@@ -822,7 +817,7 @@ def deskew_perspective(img):
             lengths.append(float(np.hypot(dx, dy)))
 
     if len(angles) < 3:
-        return img, 0.0
+        return 0.0, {"reason": "too_few_lines", "lineCount": len(angles)}
 
     # PERSPECTIVE-CONVERGENCE FIX (July 8, 2026): confirmed directly on a
     # real photo that a "pick the winning cluster" strategy (both plain
@@ -875,9 +870,23 @@ def deskew_perspective(img):
 
     correction_angle = -raw_median * confidence
     correction_angle = max(-6.0, min(6.0, correction_angle))
+    debug = {
+        "lineCount": len(angles), "rawMedian": round(raw_median, 3),
+        "confidence": round(confidence, 3),
+    }
     if abs(correction_angle) < 0.35:
-        return img, 0.0
+        return 0.0, {**debug, "reason": "below_apply_threshold"}
+    return correction_angle, debug
 
+
+def apply_deskew_rotation(img, correction_angle):
+    """Pure application half of deskew_perspective (Aug 4, 2026 split) --
+    given an already-measured angle, does the warpAffine + crop-after-
+    rotate (zero fabricated border pixels, per this function's original
+    validation) + resize back to source dimensions. No measurement here
+    at all -- takes whatever angle it's given."""
+    if correction_angle == 0.0:
+        return img
     h, w = img.shape[:2]
     center = (w / 2, h / 2)
     rot_matrix = cv2.getRotationMatrix2D(center, correction_angle, 1.0)
@@ -889,9 +898,50 @@ def deskew_perspective(img):
     x0 = max(0, (w - crop_w) // 2)
     y0 = max(0, (h - crop_h) // 2)
     cropped = rotated[y0:y0 + crop_h, x0:x0 + crop_w]
-    result = cv2.resize(cropped, (w, h), interpolation=cv2.INTER_CUBIC)
+    return cv2.resize(cropped, (w, h), interpolation=cv2.INTER_CUBIC)
 
-    return result, correction_angle
+
+def deskew_perspective(img, measure_img=None):
+    """Perspective/vertical alignment via Hough-line detection.
+
+    APPROXIMATION NOTE: detects the dominant near-vertical line angle
+    (architectural edges) and applies a single global rotation — not full
+    4-point perspective/keystone correction. Upgrade path if testing shows
+    meaningfully converging verticals a single rotation can't fix.
+
+    Includes both fixes verified earlier this session: (1) canonicalized
+    line direction so HoughLinesP's arbitrary endpoint ordering can't flip
+    a valid line into the rejected ~180-degree range, (2) correct sign on
+    the corrective rotation (proved via a known 5-degree test tilt: the
+    unfixed version measured ~10 degrees residual, doubling the tilt; this
+    version measures 0.0), and (3) crop-after-rotate so no replicated
+    border pixels survive into the delivered image (proved via a
+    marker-color test — zero fabricated pixels found in the final output).
+
+    measure_img (Aug 4, 2026, optional -- MEASUREMENT/APPLICATION SPLIT):
+    root-caused via a real photo (IMG_8341) where the HDR protect
+    pullback patch -- a color/exposure fix with zero geometric intent --
+    changed this function's Hough line count from 1 to 3, crossing the
+    minimum-evidence threshold and triggering a near-max 5.77-degree
+    rotation on a photo that never had a real ~6-degree camera roll.
+    Confirmed directly: line count for this photo was 1-2 at every stage
+    tested (raw original, post-HDR, post-HDR+white-balance) -- razor-thin
+    evidence the function was never far from misfiring on, regardless of
+    which specific color correction happened to tip it over. The real
+    bug isn't any one patch; it's that a GEOMETRY measurement was coupled
+    to whatever COLOR correction happened to run before it, meaning any
+    future pixel-value change anywhere upstream could silently change
+    which photos get rotated. When measure_img is provided, the angle is
+    measured from IT (intended: a stable, canonical reference captured
+    before Vision-driven regional color correction -- HDR pullback,
+    white balance -- ever touches pixels) while the rotation itself is
+    still APPLIED to img, whatever stage of correction it's currently at.
+    measure_img=None preserves the exact original single-image behavior
+    for any caller not passing it."""
+    angle, _debug = measure_deskew_angle(measure_img if measure_img is not None else img)
+    if angle == 0.0:
+        return img, 0.0
+    return apply_deskew_rotation(img, angle), angle
 
 
 def detect_noise_level(img):
@@ -1654,7 +1704,7 @@ def _run_hdr_pass(source_path, target_display_headroom=None):
     return img, report
 
 
-def _apply_exterior_stack(img, args, intensity, level2_regions, wb_threshold=0.1):
+def _apply_exterior_stack(img, args, intensity, level2_regions, wb_threshold=0.1, geometry_ref_img=None):
     """Deterministic exterior correction stack, factored out of main() so
     the QC retry loop can re-run it at a different intensity without
     duplicating ~25 lines inline.
@@ -1662,7 +1712,13 @@ def _apply_exterior_stack(img, args, intensity, level2_regions, wb_threshold=0.1
     level2_regions (Aug 3, 2026): passed in rather than recomputed, same
     pattern _apply_interior_stack already uses -- avoids a second Vision
     call on QC retry. regions/level2_masks collapse to None when empty,
-    same "no regions -> exact unchanged behavior" guarantee as interior."""
+    same "no regions -> exact unchanged behavior" guarantee as interior.
+
+    geometry_ref_img (Aug 4, 2026, optional): stable reference for
+    deskew's angle MEASUREMENT, decoupled from whatever color correction
+    img has already been through by this point -- see
+    deskew_perspective()'s docstring for why this exists. None preserves
+    old behavior (measure from img itself)."""
     modules = []
     regions = level2_regions.get("regions") or None
     level2_masks = level2_regions.get("masks") or None
@@ -1673,7 +1729,7 @@ def _apply_exterior_stack(img, args, intensity, level2_regions, wb_threshold=0.1
     img, lens_strength = mild_mobile_lens_correction(img, args.lens_mode)
     if lens_strength > 0:
         modules.append("lens_correction")
-    img, rotation_deg = deskew_perspective(img)
+    img, rotation_deg = deskew_perspective(img, measure_img=geometry_ref_img)
     if rotation_deg != 0.0:
         modules.append("perspective_alignment")
     img, denoise_strength = adaptive_denoise(img)
@@ -1703,7 +1759,7 @@ def _apply_exterior_stack(img, args, intensity, level2_regions, wb_threshold=0.1
     return img, modules, metrics, rotation_deg, denoise_strength
 
 
-def _apply_interior_stack(img, args, adaptive_intensity, level2_regions, wb_threshold=0.1):
+def _apply_interior_stack(img, args, adaptive_intensity, level2_regions, wb_threshold=0.1, geometry_ref_img=None):
     """Deterministic interior correction stack, factored out of main() so
     the QC retry loop can re-run it at a different intensity without
     duplicating the full stack inline. level2_regions is passed in rather
@@ -1725,7 +1781,14 @@ def _apply_interior_stack(img, args, adaptive_intensity, level2_regions, wb_thre
     empty) when Level 2 is disabled or the Vision call failed/returned
     nothing, so every function below falls back to its exact pre-Aug-3
     scalar/legacy-mask-only behavior -- nothing changes for a photo with
-    no usable regions."""
+    no usable regions.
+
+    geometry_ref_img (Aug 4, 2026, optional): same stable deskew-
+    measurement reference as _apply_exterior_stack -- see
+    deskew_perspective()'s docstring. Interior runs white_balance /
+    mls_brightness_lift / etc. before this same deskew call, so it was
+    exposed to the identical measurement-coupled-to-color-correction risk
+    even though the confirmed real-photo case (IMG_8341) was exterior."""
     modules = []
     regions = level2_regions.get("regions") or None
     level2_masks = level2_regions.get("masks") or None
@@ -1736,7 +1799,7 @@ def _apply_interior_stack(img, args, adaptive_intensity, level2_regions, wb_thre
     img, lens_strength = mild_mobile_lens_correction(img, args.lens_mode)
     if lens_strength > 0:
         modules.append("lens_correction")
-    img, rotation_deg = deskew_perspective(img)
+    img, rotation_deg = deskew_perspective(img, measure_img=geometry_ref_img)
     if rotation_deg != 0.0:
         modules.append("perspective_alignment")
     img, denoise_strength = adaptive_denoise(img)
@@ -1981,6 +2044,18 @@ def main():
         print(f"[smartCorrect] Could not build raw QC baseline, falling back to post-HDR img: {e}", file=sys.stderr)
         original_img_for_qc = img.copy()
 
+    # ── Stable geometry reference for deskew (Aug 4, 2026) ───────────────
+    # Captured HERE deliberately: post-HDR-recovery (a real photographer
+    # would want geometry measured on the properly-exposed image, not a
+    # flat/underexposed one) but before Level 0, Level 2 regions, the HDR
+    # protect pullback, or white balance can touch a single pixel. See
+    # deskew_perspective()'s docstring for the real-photo root cause this
+    # closes (a color-only patch changing which photos get rotated at
+    # all). Threaded through both stacks and both QC retry branches below
+    # so no future pixel-value change upstream of deskew can silently
+    # change its measurement again.
+    img_for_geometry = img.copy()
+
     # ── Exterior daylight scene gate (patch, pending validation) ────────
     # Confirmed directly on a real photo (IMG_8311, pool/patio) that the
     # interior-calibrated MLS Bright stack — target median luma 178,
@@ -2087,7 +2162,7 @@ def main():
         wb_threshold = _diagnosis_wb_threshold(diagnosis)
 
         img, ext_modules, exterior_stack_metrics, rotation_deg, denoise_strength = \
-            _apply_exterior_stack(img, args, ext_intensity, ext_level2_regions, wb_threshold)
+            _apply_exterior_stack(img, args, ext_intensity, ext_level2_regions, wb_threshold, geometry_ref_img=img_for_geometry)
         modules_applied.extend(ext_modules)
         skipped = skipped + ["mls_brightness_lift", "clean_whites", "window_highlight_balance",
                               "vignette_neutralization"]
@@ -2122,7 +2197,7 @@ def main():
                 )
 
             retry_final, retry_modules, retry_metrics, retry_rotation, retry_denoise = \
-                _apply_exterior_stack(retry_img, args, retry_intensity, ext_level2_regions, wb_threshold)
+                _apply_exterior_stack(retry_img, args, retry_intensity, ext_level2_regions, wb_threshold, geometry_ref_img=img_for_geometry)
             retry_qc = qc_check(original_img_for_qc, retry_final)
             retry_report.update({
                 "retryHeadroomTarget": retry_headroom,
@@ -2326,7 +2401,7 @@ def main():
         ))
 
     img, stack_modules, stack_metrics, rotation_deg, denoise_strength = \
-        _apply_interior_stack(img, args, adaptive_intensity, level2_regions, wb_threshold)
+        _apply_interior_stack(img, args, adaptive_intensity, level2_regions, wb_threshold, geometry_ref_img=img_for_geometry)
     modules_applied.extend(stack_modules)
 
     histogram_stats = shadow_highlight_stats(img)
@@ -2348,7 +2423,7 @@ def main():
         retry_intensity = max(adaptive_intensity * QC_RETRY_INTENSITY_MULTIPLIER, 0.35)
 
         retry_final, retry_stack_modules, retry_stack_metrics, retry_rotation, retry_denoise = \
-            _apply_interior_stack(retry_img, args, retry_intensity, level2_regions, wb_threshold)
+            _apply_interior_stack(retry_img, args, retry_intensity, level2_regions, wb_threshold, geometry_ref_img=img_for_geometry)
         retry_qc = qc_check(original_img_for_qc, retry_final)
         retry_report.update({
             "retryHeadroomTarget": retry_headroom,
