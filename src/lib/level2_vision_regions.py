@@ -71,7 +71,14 @@ import numpy as np
 LEVEL2_VISION_MASKS_ENABLED = os.environ.get("LEVEL2_VISION_MASKS_ENABLED", "true").lower() not in ("false", "0", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 VISION_MODEL = os.environ.get("LEVEL2_VISION_MODEL", "claude-haiku-4-5-20251001")
-VISION_TIMEOUT_SECONDS = 12
+VISION_TIMEOUT_SECONDS = int(os.environ.get("LEVEL2_VISION_TIMEOUT_SECONDS", "30"))  # raised
+# from a hardcoded 12s (Aug 3, 2026): this file had no env override at all,
+# unlike level2_qc.py's equivalent -- and this exact class of miss (a
+# Haiku-era timeout left unraised after Sonnet gets real load, or before a
+# second call site starts depending on the same function) already cost
+# real back-and-forth twice today in level2_qc.py. Fixed proactively here,
+# ahead of wiring a second call site (the exterior branch) onto this same
+# function, rather than waiting to hit the same timeout a third time.
 MAX_VISION_EDGE = 1568  # matches the existing cap in autoSelect.js (Vision API 8000px ceiling)
 DEFAULT_PAD_FRAC = 0.08  # pad each box by 8% of its own size on every side
 
