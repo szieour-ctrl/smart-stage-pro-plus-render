@@ -169,13 +169,28 @@ def _call_vision_api(original_b64: str, corrected_b64: str, media_type: str) -> 
             text = text[4:]
     text = text.strip()
 
+    # Confirmed real failure (Aug 3, 2026): a QC call returned
+    # "JSONDecodeError: Expecting value: line 1 column 1" with no way to
+    # tell whether Vision sent back an empty response, a refusal, or
+    # something else -- the raw text was never preserved anywhere, so
+    # the failure was a dead end to diagnose. Two fixes: flag the empty-
+    # response case explicitly (the most likely cause of a column-1
+    # failure), and on any other parse failure, attach a truncated
+    # snippet of the actual raw text to the exception so it survives
+    # into qc_check's report["error"] instead of vanishing.
+    if not text:
+        raise ValueError(f"empty_response_text (stop_reason={payload.get('stop_reason')!r})")
+
     # Use raw_decode rather than a plain json.loads: despite the prompt
     # saying "ONLY JSON, no prose", models occasionally append a trailing
     # sentence after a complete, valid JSON object (confirmed on a real
     # response here -- "Extra data: line 2 column 1"). raw_decode parses
     # just the first valid JSON value and ignores anything after it,
     # rather than failing the whole call over trailing chatter.
-    return json.JSONDecoder().raw_decode(text)[0]
+    try:
+        return json.JSONDecoder().raw_decode(text)[0]
+    except json.JSONDecodeError as e:
+        raise ValueError(f"{e} -- raw_text={text[:300]!r}") from e
 
 
 def _encode_for_vision(img) -> Optional[str]:
@@ -200,7 +215,13 @@ def qc_check(original_img, corrected_img) -> dict:
     JSON), returns {"looksArtificial": None, ...} -- treat that as "QC
     unavailable for this photo," not "photo is clean."
     """
-    report = {"enabled": LEVEL4_QC_ENABLED, "called": False, "error": None}
+    # "model" included from the start, not just on success (Aug 3, 2026,
+    # same fix already made in level2_vision_regions.py after the
+    # identical blind spot cost real time there): three QC runs came
+    # back with no way to confirm whether LEVEL4_QC_MODEL had actually
+    # taken effect on Railway. Reflects QC_MODEL's resolved value (env
+    # override or the hardcoded default) on every path, success or not.
+    report = {"enabled": LEVEL4_QC_ENABLED, "called": False, "model": QC_MODEL, "error": None}
 
     if not LEVEL4_QC_ENABLED:
         logger.info("level2_qc: disabled via env, skipping")
