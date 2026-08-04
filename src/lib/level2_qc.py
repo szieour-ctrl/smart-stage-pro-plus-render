@@ -1,4 +1,4 @@
-A"""
+"""
 level2_qc.py
 
 Stage 4 of the four-stage architecture (design session, Aug 2026):
@@ -8,7 +8,7 @@ Vision diagnoses -> Vision routes regions -> classical CV executes ->
 WHAT THIS IS: a single Vision call made AFTER correction runs, shown
 BOTH the original and corrected photo, asked a holistic "does anything
 here look artificially altered, streaked, or unnatural" question. This
-plays to what Vision models aAre actually reliable at (a holistic "does
+plays to what Vision models are actually reliable at (a holistic "does
 this look wrong" read) rather than asking them to originate calibrated
 correction values (already rejected for Stage 3) or self-diagnose a
 subtle pixel-level artifact from a single image with no reference.
