@@ -229,6 +229,96 @@ def build_regional_strength_map(shape, base_intensity, regions, level2_masks,
     return np.clip(strength, 0.0, 1.5).astype(np.float32)
 
 
+def apply_hdr_protect_pullback(post_hdr_img, pre_hdr_img, regions, level2_masks, max_pullback=1.0):
+    """Partially reverts HDR gain-map recovery's OWN lift inside Vision-
+    flagged protect regions (Aug 4, 2026, root-caused via regionStrengthDebug
+    on two real photos: IMG_8341/8344 both showed protect regions like
+    garage_door_white_panel(s) with meanLumaDelta=0 INSIDE
+    exterior_daylight_correction -- the regional protect/boost system
+    itself is correct -- yet the FINAL output still showed +5 to +9 of
+    unrequested lift on those exact regions. Isolated by comparing
+    original -> post-HDR-recovery-only: the lift was already fully baked
+    in before Vision's regions are even computed. hdrRecover.py is pure
+    deterministic gain-map math with zero region awareness by design --
+    it runs first, on the raw source, before Level 0 or Level 2 exist.
+    Vision's "protect the sky, it'll blow out" instruction, once it does
+    run, is correctly obeyed by the regional system downstream -- it just
+    never had jurisdiction over the stage that already did most of the
+    lifting.
+
+    Rather than reordering the pipeline (Vision would then be judging a
+    flatter, non-recovered image, which could change what it even flags
+    as "already bright, protect it") or making apply_gain_map() itself
+    region-aware (bigger surface area, touches proven HDR math), this
+    blends the CURRENT (post-HDR) image back toward the TRUE pre-HDR
+    original -- already available as original_img_for_qc, same raw
+    decode_standard() call the QC baseline uses, zero new decode --
+    specifically inside the same protect masks Vision already produced.
+    Stays purely classical/deterministic (an alpha blend of two already-
+    decoded images): no new judgment, no pixel generation, same AB 723
+    posture as everything else in this file.
+
+    Same protect-detection logic as build_regional_strength_map's
+    is_universal_protect check, deliberately NOT limited to
+    exclude_from_shadow_lift -- that tag only ever meant "exclude from
+    exterior_daylight_correction's shadow lift specifically," a narrower
+    scope than what "protect" turned out to mean once HDR recovery was
+    in the picture too.
+
+    Returns (img, debug_list_or_None). Never raises -- shape/None guards
+    return post_hdr_img unchanged rather than crash a real correction."""
+    if not regions or not level2_masks:
+        return post_hdr_img, None
+    if pre_hdr_img is None or pre_hdr_img.shape != post_hdr_img.shape:
+        return post_hdr_img, None
+
+    pre_l = cv2.cvtColor(pre_hdr_img, cv2.COLOR_BGR2LAB)[:, :, 0]
+    post_l = cv2.cvtColor(post_hdr_img, cv2.COLOR_BGR2LAB)[:, :, 0]
+
+    protect_accum = np.zeros(post_hdr_img.shape[:2], dtype=np.float32)
+    protect_cores = []  # (regionId, core boolmask) pairs -- filled in once, reused after the blend
+    for region in regions:
+        mask = level2_masks.get(region.get("maskId"))
+        if mask is None:
+            continue
+        confidence = region.get("confidence", 1.0)
+        if isinstance(confidence, str):
+            confidence = {"high": 0.9, "medium": 0.7, "low": 0.4}.get(confidence, 0.5)
+        if confidence < REGIONAL_CONFIDENCE_FLOOR:
+            continue
+        is_protect = (
+            region.get("priority") == "protect"
+            or region.get("operation") in REGIONAL_UNIVERSAL_PROTECT_OPERATIONS
+        )
+        if not is_protect:
+            continue
+        m = np.clip(mask.astype(np.float32), 0, 1)
+        protect_accum = np.maximum(protect_accum, m)
+        core = m > 0.5
+        if core.any():
+            protect_cores.append((region.get("regionId"), core))
+
+    if not protect_cores:
+        return post_hdr_img, None
+
+    alpha = np.clip(protect_accum * max_pullback, 0.0, 1.0)[:, :, None]
+    out = post_hdr_img.astype(np.float32) * (1.0 - alpha) + pre_hdr_img.astype(np.float32) * alpha
+    out = np.clip(out, 0, 255).astype(np.uint8)
+    out_l = cv2.cvtColor(out, cv2.COLOR_BGR2LAB)[:, :, 0]
+
+    debug = [
+        {
+            "regionId": region_id,
+            "corePixelCount": int(core.sum()),
+            "meanLumaPreHdr": round(float(pre_l[core].mean()), 2),
+            "meanLumaPostHdrBeforePullback": round(float(post_l[core].mean()), 2),
+            "meanLumaAfterPullback": round(float(out_l[core].mean()), 2),
+        }
+        for region_id, core in protect_cores
+    ]
+    return out, debug
+
+
 # ── Measurement helpers (read-only, no pixel changes) ──────────────────────
 
 def image_stats(img):
@@ -1962,6 +2052,28 @@ def main():
                 _ext_geom_preview, ext_level2_regions.get("regions"), ext_level2_regions.get("masks"), debug_path,
             )
 
+        # ── HDR protect pullback (Aug 4, 2026) ────────────────────────────
+        # See apply_hdr_protect_pullback()'s docstring for the full root
+        # cause. Real photo confirmation: regionStrengthDebug showed
+        # exterior_daylight_correction's own regional protect logic is
+        # correct (meanLumaDelta=0 on garage_door_white_panel(s) inside
+        # that function, on two separate real photos) -- yet the shipped
+        # output still carried +5 to +9 luma of unrequested lift on those
+        # same regions, all of it from hdrRecover.py running before Vision
+        # regions exist. `img` here is post-HDR, pre-lens-correction/
+        # pre-deskew -- same geometry state original_img_for_qc is
+        # already in (also un-corrected), so this sits at the exact same
+        # tolerance point white_balance_neutral_aware's regional call
+        # inside _apply_exterior_stack already accepts.
+        hdr_pullback_debug = None
+        if hdr_report.get("recoveryApplied") and ext_level2_regions.get("regions"):
+            img, hdr_pullback_debug = apply_hdr_protect_pullback(
+                img, original_img_for_qc,
+                ext_level2_regions.get("regions"), ext_level2_regions.get("masks"),
+            )
+            if hdr_pullback_debug:
+                modules_applied.append("hdr_protect_pullback")
+
         # ── Front judgment applied here (Aug 2, 2026) ────────────────────
         # Exterior photos don't get Stage 1 diagnosis today (level2_diagnose
         # explicitly skips exteriors -- see level2_diagnosis.py's
@@ -1997,6 +2109,18 @@ def main():
                 retry_hdr_report = hdr_report
             retry_intensity = max(ext_intensity * QC_RETRY_INTENSITY_MULTIPLIER, 0.6)
 
+            # Same pullback as the main path (Aug 4, 2026) -- retry_img is a
+            # FRESH HDR pass on the raw source at a different headroom
+            # target, so without this it would ship the retry result with
+            # the same unrequested protect-region lift the main path just
+            # got fixed for.
+            retry_hdr_pullback_debug = None
+            if retry_hdr_report.get("recoveryApplied") and ext_level2_regions.get("regions"):
+                retry_img, retry_hdr_pullback_debug = apply_hdr_protect_pullback(
+                    retry_img, original_img_for_qc,
+                    ext_level2_regions.get("regions"), ext_level2_regions.get("masks"),
+                )
+
             retry_final, retry_modules, retry_metrics, retry_rotation, retry_denoise = \
                 _apply_exterior_stack(retry_img, args, retry_intensity, ext_level2_regions, wb_threshold)
             retry_qc = qc_check(original_img_for_qc, retry_final)
@@ -2013,6 +2137,9 @@ def main():
                 modules_applied += retry_modules + ["qc_retry_resolved"]
                 rotation_deg, denoise_strength = retry_rotation, retry_denoise
                 hdr_report, qc = retry_hdr_report, retry_qc
+                if retry_hdr_pullback_debug:
+                    modules_applied.append("hdr_protect_pullback")
+                    hdr_pullback_debug = retry_hdr_pullback_debug
             else:
                 # Retry still flagged -- do not ship a flagged photo
                 # silently. Fall back to the true pre-correction original;
@@ -2048,6 +2175,7 @@ def main():
             "level4QC": qc,
             "qcRetry": retry_report,
             "hdrRecovery": hdr_report,
+            "hdrPullback": hdr_pullback_debug,
             "metrics": exterior_stack_metrics,
         }))
         return
