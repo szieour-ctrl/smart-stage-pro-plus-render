@@ -385,7 +385,7 @@ def compute_uniform_surface_caution_mask(img, flat_threshold=8.0, max_dampening=
         return None
 
 
-def exterior_daylight_correction(img, intensity=1.0, caution_mask=None):
+def exterior_daylight_correction(img, intensity=1.0, caution_mask=None, regions=None, level2_masks=None):
     """Restrained correction path for exterior daylight photos — per
     Sam's review of a real over-corrected pool/patio photo, exteriors
     should get a small shadow lift and nothing resembling the interior
@@ -410,26 +410,58 @@ def exterior_daylight_correction(img, intensity=1.0, caution_mask=None):
     natural aggregate texture to trip the same threshold as the mesh.
     Removed rather than ship unproven complexity.
 
-    caution_mask (Aug 3, 2026, optional): continuous 0-1 array from
-    compute_uniform_surface_caution_mask(), same shape as the image.
-    Scales the gamma lift DOWN (never up) on large uniform surfaces --
-    exactly the surface class both of this function's documented real
-    bugs occurred on. None (the default) reproduces the exact pre-patch
-    behavior unchanged."""
+    WIRED TO VISION (Aug 3, 2026): regions/level2_masks, when available,
+    are now the PRIMARY mechanism -- same build_regional_strength_map()
+    machinery already proven on interior's five functions, applied here
+    to modulate the gamma lift spatially instead of with one scalar
+    intensity for the whole frame. This is a direct policy call: "Vision
+    is the photo editor's eyes, not hands" -- Vision judges what needs
+    more/less correction and why (a shadowed foreground subject vs. an
+    already-fine driveway), classical CV executes that judgment, exactly
+    the split already proven on interior and validated today by the Level
+    0 fix (misrouting, not the underlying math, was the real cause of the
+    one confirmed exterior artifact) and the QC zoomed-crop assist
+    (Vision succeeded once given better material, a heuristic didn't).
+
+    caution_mask (classical CV, DEMOTED from primary mechanism to
+    fallback-only, Aug 3, 2026): confirmed unreliable as a primary
+    judgment mechanism on real, compositionally varied photos -- tested
+    against an outdoor kitchen and a rock waterfall scene and flagged
+    foliage, wood fencing, and rocks as "uniform surface" needing
+    dampening, which is simply wrong. It generalizes poorly past the
+    narrow, similar-lighting conditions (four house-front driveway
+    shots) it happened to be validated against -- the same failure
+    pattern as the abandoned classical streak-detector earlier the same
+    day. Kept only as a better-than-nothing safety net for when Vision
+    regions are unavailable (disabled, failed, timed out) -- the same
+    role the HSV heuristic now plays for Level 0 scene classification,
+    not a competing source of judgment when Vision succeeds."""
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
     l = lab[:, :, 0]
     before_median = float(np.median(l))
     l_pre = l
 
+    regional_mode = bool(regions) and bool(level2_masks)
+    classical_fallback_applied = False
+    if regional_mode:
+        strength_map = build_regional_strength_map(
+            l.shape, intensity, regions, level2_masks,
+            supported_operations=("shadow_recovery", "exposure_lift"),
+            exclude_tag="exclude_from_shadow_lift",
+        )
+    else:
+        strength_map = np.full(l.shape, float(intensity), dtype=np.float32)
+        if caution_mask is not None and caution_mask.shape == l.shape:
+            strength_map = strength_map * (1.0 - caution_mask)
+            classical_fallback_applied = True
+
     normalized = np.clip(l_pre / 255.0, 0, 1)
-    gamma = 1.0 - (0.05 * intensity)  # deliberately mild — no 178 target here
+    gamma = 1.0 - (0.05 * strength_map)  # deliberately mild — no 178 target here, now spatially varying
     lifted = 255.0 * np.power(normalized, gamma)
 
     # Keep genuine deep shadow mostly as-is (that's real shade, not a
     # defect) and don't touch bright highlights (sky/sunlit areas).
     mid_mask = np.clip((l_pre - 30.0) / 60.0, 0, 1) * np.clip((200.0 - l_pre) / 60.0, 0, 1)
-    if caution_mask is not None and caution_mask.shape == mid_mask.shape:
-        mid_mask = mid_mask * (1.0 - caution_mask)
     l_out = l_pre * (1.0 - mid_mask) + lifted * mid_mask
 
     lab[:, :, 0] = np.clip(l_out, 0, 255)
@@ -438,6 +470,8 @@ def exterior_daylight_correction(img, intensity=1.0, caution_mask=None):
         "before_median_luma": round(before_median, 2),
         "after_median_luma": round(float(np.median(l_out)), 2),
         "method": "exterior_mild_shadow_lift",
+        "regionalModeApplied": regional_mode,
+        "classicalCautionFallbackApplied": classical_fallback_applied,
         "cautionDampeningApplied": caution_mask is not None,
     }
 
@@ -1486,12 +1520,20 @@ def _run_hdr_pass(source_path, target_display_headroom=None):
     return img, report
 
 
-def _apply_exterior_stack(img, args, intensity, wb_threshold=0.1):
+def _apply_exterior_stack(img, args, intensity, level2_regions, wb_threshold=0.1):
     """Deterministic exterior correction stack, factored out of main() so
     the QC retry loop can re-run it at a different intensity without
-    duplicating ~25 lines inline."""
+    duplicating ~25 lines inline.
+
+    level2_regions (Aug 3, 2026): passed in rather than recomputed, same
+    pattern _apply_interior_stack already uses -- avoids a second Vision
+    call on QC retry. regions/level2_masks collapse to None when empty,
+    same "no regions -> exact unchanged behavior" guarantee as interior."""
     modules = []
-    img, wb_strength = white_balance_neutral_aware(img)
+    regions = level2_regions.get("regions") or None
+    level2_masks = level2_regions.get("masks") or None
+
+    img, wb_strength = white_balance_neutral_aware(img, regions=regions, level2_masks=level2_masks)
     if wb_strength >= wb_threshold:
         modules.append("white_balance")
     img, lens_strength = mild_mobile_lens_correction(img, args.lens_mode)
@@ -1504,14 +1546,19 @@ def _apply_exterior_stack(img, args, intensity, wb_threshold=0.1):
     if denoise_strength > 2:
         modules.append("adaptive_noise_reduction")
 
-    # Computed here (post lens/deskew, so it's spatially aligned with the
-    # image exterior_daylight_correction actually receives) rather than
-    # once up in main() -- keeps this function self-contained for the QC
-    # retry path, which re-runs the whole stack at a different intensity.
-    caution_mask = compute_uniform_surface_caution_mask(img)
-    if caution_mask is not None:
-        modules.append("uniform_surface_caution")
-    img, exterior_metrics = exterior_daylight_correction(img, intensity=intensity, caution_mask=caution_mask)
+    # Classical caution mask only computed/used as a FALLBACK now (Aug 3,
+    # 2026) -- see exterior_daylight_correction()'s docstring for why it
+    # was demoted from primary mechanism. Skipped entirely in regional
+    # mode: no reason to pay for a heuristic that isn't going to be used.
+    caution_mask = None
+    if not regions or not level2_masks:
+        caution_mask = compute_uniform_surface_caution_mask(img)
+        if caution_mask is not None:
+            modules.append("uniform_surface_caution_fallback")
+
+    img, exterior_metrics = exterior_daylight_correction(
+        img, intensity=intensity, caution_mask=caution_mask, regions=regions, level2_masks=level2_masks,
+    )
     if abs(exterior_metrics["after_median_luma"] - exterior_metrics["before_median_luma"]) >= 3:
         modules.append("exterior_daylight_shadow_lift")
     metrics = {
@@ -1849,6 +1896,28 @@ def main():
         modules_applied.append(f"ai_diagnosis_{diagnosis.get('diagnosis', 'unknown')}")
 
     if is_exterior:
+        # ── Level 2 Vision regions pre-pass for exterior (Aug 3, 2026) ────
+        # Mirrors _apply_interior_stack's pre-pass exactly (see the
+        # matching comment further down this file) -- computed ONCE here,
+        # before the retry loop, on a geometrically-aligned throwaway
+        # copy, then reused across both the initial attempt and any QC
+        # retry rather than re-calling Vision on every attempt. Same
+        # get_level2_regions() call interior uses -- this was already
+        # validated not to hallucinate regions on a control exterior
+        # photo (see that file's own docstring), so this is finishing
+        # wiring that was flagged as unfinished, not new capability.
+        _ext_geom_preview, _ = mild_mobile_lens_correction(img.copy(), args.lens_mode)
+        _ext_geom_preview, _ = deskew_perspective(_ext_geom_preview)
+        ext_level2_regions, ext_level2_report = get_level2_regions(_ext_geom_preview)
+        if ext_level2_report.get("called") and not ext_level2_report.get("error"):
+            modules_applied.append("level2_vision_regions")
+
+        if DEBUG_REGIONS_OVERLAY:
+            debug_path = os.path.splitext(args.output)[0] + "_regions_debug.jpg"
+            write_region_debug_overlay(
+                _ext_geom_preview, ext_level2_regions.get("regions"), ext_level2_regions.get("masks"), debug_path,
+            )
+
         # ── Front judgment applied here (Aug 2, 2026) ────────────────────
         # Exterior photos don't get Stage 1 diagnosis today (level2_diagnose
         # explicitly skips exteriors -- see level2_diagnosis.py's
@@ -1862,7 +1931,7 @@ def main():
         wb_threshold = _diagnosis_wb_threshold(diagnosis)
 
         img, ext_modules, exterior_stack_metrics, rotation_deg, denoise_strength = \
-            _apply_exterior_stack(img, args, ext_intensity, wb_threshold)
+            _apply_exterior_stack(img, args, ext_intensity, ext_level2_regions, wb_threshold)
         modules_applied.extend(ext_modules)
         skipped = skipped + ["mls_brightness_lift", "clean_whites", "window_highlight_balance",
                               "vignette_neutralization"]
@@ -1885,7 +1954,7 @@ def main():
             retry_intensity = max(ext_intensity * QC_RETRY_INTENSITY_MULTIPLIER, 0.6)
 
             retry_final, retry_modules, retry_metrics, retry_rotation, retry_denoise = \
-                _apply_exterior_stack(retry_img, args, retry_intensity, wb_threshold)
+                _apply_exterior_stack(retry_img, args, retry_intensity, ext_level2_regions, wb_threshold)
             retry_qc = qc_check(original_img_for_qc, retry_final)
             retry_report.update({
                 "retryHeadroomTarget": retry_headroom,
