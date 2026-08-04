@@ -341,7 +341,51 @@ def is_exterior_daylight(img):
     }
 
 
-def exterior_daylight_correction(img, intensity=1.0):
+def compute_uniform_surface_caution_mask(img, flat_threshold=8.0, max_dampening=0.5):
+    """Classical (non-Vision), zero-added-latency continuous caution weight
+    for exterior correction: 0.0 = normal correction, up to max_dampening =
+    maximum caution, scaled by how uniform/flat the underlying material is.
+
+    WHY THIS EXISTS (Aug 3, 2026): exterior photos get no Level 2 Vision
+    regional routing (that would mean a second Vision API call per exterior
+    photo -- real added cost/latency, decided against in favor of this
+    lighter approach). But two SEPARATE real bugs on this exact class of
+    surface -- the pre-blur/mesh-lattice banding this file's docstring
+    documents above, and the HDR gain-map streak chased at length the same
+    day (hdrRecover.py, unrelated code path, still unfixed) -- both landed
+    on large uniform materials (concrete, pavement). That's not
+    coincidence: a smooth material has no natural texture to camouflage a
+    processing artifact, and any correction step is more likely to produce
+    a visible, ungrounded discontinuity there than on textured content.
+    Dampening correction strength specifically on these surfaces is a
+    direct, structural response to that risk pattern -- prevention,
+    complementing (not replacing) the QC zoomed-crop detection already
+    built for the same risk class.
+
+    Reuses the exact coarse-uniformity measure validated against real
+    concrete (mean spread ~5) vs. structured content like foliage/water
+    edges (mean spread ~16) during the same day's QC crop-assist work --
+    proven discrimination, not a new untested heuristic.
+
+    Never raises -- returns None on any internal failure, meaning callers
+    should treat that as "no dampening," not "maximum dampening.\""""
+    try:
+        l = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)[:, :, 0].astype(np.float32)
+        smoothed = cv2.GaussianBlur(l, (0, 0), sigmaX=6)
+        local_mean = cv2.blur(smoothed, (25, 25))
+        local_sqmean = cv2.blur(smoothed * smoothed, (25, 25))
+        local_spread = np.sqrt(np.maximum(local_sqmean - local_mean * local_mean, 0))
+        # Smooth transition rather than a hard cutoff: full caution at/below
+        # the validated concrete-texture ceiling, tapering to zero caution
+        # by 2x that value (comfortably into structured-content territory).
+        caution = np.clip(1.0 - (local_spread - flat_threshold) / flat_threshold, 0.0, 1.0)
+        return caution * max_dampening
+    except Exception as e:  # noqa: BLE001
+        print(f"[compute_uniform_surface_caution_mask] failed (non-fatal): {e}", file=sys.stderr)
+        return None
+
+
+def exterior_daylight_correction(img, intensity=1.0, caution_mask=None):
     """Restrained correction path for exterior daylight photos — per
     Sam's review of a real over-corrected pool/patio photo, exteriors
     should get a small shadow lift and nothing resembling the interior
@@ -364,7 +408,14 @@ def exterior_daylight_correction(img, intensity=1.0):
     texture-aware version that only pre-blurred genuinely flat regions;
     it didn't discriminate reliably, since the concrete itself has enough
     natural aggregate texture to trip the same threshold as the mesh.
-    Removed rather than ship unproven complexity."""
+    Removed rather than ship unproven complexity.
+
+    caution_mask (Aug 3, 2026, optional): continuous 0-1 array from
+    compute_uniform_surface_caution_mask(), same shape as the image.
+    Scales the gamma lift DOWN (never up) on large uniform surfaces --
+    exactly the surface class both of this function's documented real
+    bugs occurred on. None (the default) reproduces the exact pre-patch
+    behavior unchanged."""
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
     l = lab[:, :, 0]
     before_median = float(np.median(l))
@@ -377,6 +428,8 @@ def exterior_daylight_correction(img, intensity=1.0):
     # Keep genuine deep shadow mostly as-is (that's real shade, not a
     # defect) and don't touch bright highlights (sky/sunlit areas).
     mid_mask = np.clip((l_pre - 30.0) / 60.0, 0, 1) * np.clip((200.0 - l_pre) / 60.0, 0, 1)
+    if caution_mask is not None and caution_mask.shape == mid_mask.shape:
+        mid_mask = mid_mask * (1.0 - caution_mask)
     l_out = l_pre * (1.0 - mid_mask) + lifted * mid_mask
 
     lab[:, :, 0] = np.clip(l_out, 0, 255)
@@ -385,6 +438,7 @@ def exterior_daylight_correction(img, intensity=1.0):
         "before_median_luma": round(before_median, 2),
         "after_median_luma": round(float(np.median(l_out)), 2),
         "method": "exterior_mild_shadow_lift",
+        "cautionDampeningApplied": caution_mask is not None,
     }
 
 
@@ -1449,7 +1503,15 @@ def _apply_exterior_stack(img, args, intensity, wb_threshold=0.1):
     img, denoise_strength = adaptive_denoise(img)
     if denoise_strength > 2:
         modules.append("adaptive_noise_reduction")
-    img, exterior_metrics = exterior_daylight_correction(img, intensity=intensity)
+
+    # Computed here (post lens/deskew, so it's spatially aligned with the
+    # image exterior_daylight_correction actually receives) rather than
+    # once up in main() -- keeps this function self-contained for the QC
+    # retry path, which re-runs the whole stack at a different intensity.
+    caution_mask = compute_uniform_surface_caution_mask(img)
+    if caution_mask is not None:
+        modules.append("uniform_surface_caution")
+    img, exterior_metrics = exterior_daylight_correction(img, intensity=intensity, caution_mask=caution_mask)
     if abs(exterior_metrics["after_median_luma"] - exterior_metrics["before_median_luma"]) >= 3:
         modules.append("exterior_daylight_shadow_lift")
     metrics = {
