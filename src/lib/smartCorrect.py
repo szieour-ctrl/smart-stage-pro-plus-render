@@ -466,6 +466,49 @@ def exterior_daylight_correction(img, intensity=1.0, caution_mask=None, regions=
 
     lab[:, :, 0] = np.clip(l_out, 0, 255)
     out = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
+
+    # ── Per-region strength debug (Aug 4, 2026) ─────────────────────────
+    # DEBUG_REGIONS_OVERLAY draws WHERE masks land, but gives no way to
+    # confirm the strength_map's actual computed VALUE inside a mask --
+    # exactly the gap that made a real anomaly (garage_door_white_panels,
+    # marked protect/exclude_from_shadow_lift, showing meaningful lift
+    # on two separate real photos) impossible to root-cause from output
+    # pixels alone. Reuses the same env var rather than adding a new
+    # toggle -- same "off by default, zero cost, one kill switch" pattern
+    # as the overlay. No image write; this is just numbers in the JSON
+    # response, so it works even without Railway log/shell access.
+    region_strength_debug = None
+    if DEBUG_REGIONS_OVERLAY and regional_mode:
+        region_strength_debug = []
+        for region in regions:
+            mask = level2_masks.get(region.get("maskId"))
+            if mask is None:
+                region_strength_debug.append({
+                    "regionId": region.get("regionId"), "maskFound": False,
+                })
+                continue
+            m = np.clip(mask.astype(np.float32), 0, 1)
+            core = m > 0.5  # where the mask is confidently "this region"
+            if not core.any():
+                region_strength_debug.append({
+                    "regionId": region.get("regionId"), "maskFound": True,
+                    "corePixelCount": 0,
+                })
+                continue
+            region_strength_debug.append({
+                "regionId": region.get("regionId"),
+                "priority": region.get("priority"),
+                "operation": region.get("operation"),
+                "maskFound": True,
+                "corePixelCount": int(core.sum()),
+                "meanStrength": round(float(strength_map[core].mean()), 4),
+                "meanMidMask": round(float(mid_mask[core].mean()), 4),
+                "meanGamma": round(float(gamma[core].mean()), 4),
+                "meanLumaPre": round(float(l_pre[core].mean()), 2),
+                "meanLumaPost": round(float(l_out[core].mean()), 2),
+                "meanLumaDelta": round(float(l_out[core].mean() - l_pre[core].mean()), 2),
+            })
+
     return out, {
         "before_median_luma": round(before_median, 2),
         "after_median_luma": round(float(np.median(l_out)), 2),
@@ -473,6 +516,7 @@ def exterior_daylight_correction(img, intensity=1.0, caution_mask=None, regions=
         "regionalModeApplied": regional_mode,
         "classicalCautionFallbackApplied": classical_fallback_applied,
         "cautionDampeningApplied": caution_mask is not None,
+        "regionStrengthDebug": region_strength_debug,
     }
 
 
