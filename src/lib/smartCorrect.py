@@ -657,6 +657,97 @@ def assess_professional_mls_bright(img):
 
 # ── Technical correction layer ──────────────────────────────────────────────
 
+MIXED_LIGHT_CONFIDENCE_FLOOR = 0.6  # same convention as REGIONAL_CONFIDENCE_FLOOR
+
+
+def _apply_mixed_light_balance_regions(img, global_target, regions, level2_masks):
+    """Real implementation of operation="mixed_light_balance" (Aug 4, 2026
+    -- this file previously documented this as deliberately unbuilt: "a
+    mixed_light_balance region is silently ignored here"). Confirmed
+    directly on a real photo (IMG_8310) why that gap mattered: the frame's
+    global neutral-surface measurement found essentially zero cast (cast
+    magnitude 0.0086, strength 0.0000) because the room genuinely IS
+    close to neutral overall -- the warm color in that photo comes
+    entirely from a small lamp, diluted into invisibility by everything
+    else in frame that's already gray. A whole-frame measurement
+    structurally cannot see a color problem that only exists in one
+    region while the rest of the frame is neutral. That's exactly what
+    this operation exists to name.
+
+    Mechanism: for each mixed_light_balance region (not protected --
+    protect/exclude_from_white_balance/preserve_hue regions are Vision's
+    explicit instruction to leave that pool of color alone, honored
+    unchanged), compute that region's OWN local channel means from ITS
+    OWN pixels -- not the frame-wide gray-world/neutral-surface average,
+    which is precisely the number this operation is flagged for being
+    unrepresentative of. Correct those pixels toward the frame's already-
+    established global_target independently, using the region's own soft
+    mask as the blend weight.
+
+    NO CONSERVATIVE DIAL (Sam, Aug 4, 2026, explicit): unlike the global
+    correction above (which deliberately damps warm-reading photos 0.35x
+    to avoid stripping legitimate warm-room ambiance from a measurement
+    that can't distinguish cast from color), a per-region correction here
+    is applied at its full computed strength. The [0.7, 1.35] clip is a
+    SAFETY bound against a degenerate/near-black local sample producing
+    an extreme scale, not an intensity throttle -- there is no multiplier
+    damping the result the way the global path has one.
+
+    Returns (img, log) where log is a list of dicts (empty list if no
+    mixed_light_balance regions qualified) -- always a list, never None,
+    so callers can report "found regions but none qualified" separately
+    from "no such regions existed" if that distinction ever matters."""
+    log = []
+    if not regions or not level2_masks:
+        return img, log
+
+    orig = img.astype(np.float32)
+    out = orig.copy()
+
+    for region in regions:
+        if region.get("operation") != "mixed_light_balance":
+            continue
+        confidence = region.get("confidence", 1.0)
+        if isinstance(confidence, str):
+            confidence = {"high": 0.9, "medium": 0.7, "low": 0.4}.get(confidence, 0.5)
+        if confidence < MIXED_LIGHT_CONFIDENCE_FLOOR:
+            continue
+        protections = region.get("protections") or []
+        if (region.get("priority") == "protect"
+                or "exclude_from_white_balance" in protections
+                or "preserve_hue" in protections):
+            log.append({
+                "regionId": region.get("regionId"), "applied": False,
+                "reason": "vision_protected_this_color",
+            })
+            continue
+        mask = level2_masks.get(region.get("maskId"))
+        if mask is None:
+            continue
+        m = np.clip(mask.astype(np.float32), 0, 1)
+        core = m > 0.5
+        if core.sum() < 200:
+            log.append({
+                "regionId": region.get("regionId"), "applied": False,
+                "reason": "too_few_core_pixels", "corePixelCount": int(core.sum()),
+            })
+            continue
+
+        local_means = orig[core].mean(axis=0)  # THIS region's own color, from the untouched original
+        local_scales = np.clip(global_target / np.maximum(local_means, 1.0), 0.7, 1.35)
+        applied = 1.0 + m[:, :, None] * (local_scales.reshape(1, 1, 3) - 1.0)
+        out = out * applied
+
+        log.append({
+            "regionId": region.get("regionId"), "applied": True,
+            "corePixelCount": int(core.sum()),
+            "localMeansBGR": [round(float(x), 1) for x in local_means],
+            "localScalesBGR": [round(float(x), 3) for x in local_scales],
+        })
+
+    return np.clip(out, 0, 255).astype(np.uint8), log
+
+
 def white_balance_neutral_aware(img, regions=None, level2_masks=None):
     """White balance using likely-neutral surfaces (trim, doors, cabinets,
     ceilings) as the primary reference, falling back to gray-world when
@@ -671,14 +762,12 @@ def white_balance_neutral_aware(img, regions=None, level2_masks=None):
     operation="white_balance_adjustment" can get more of the correction
     than the frame's baseline, and a `protect` region gets none.
 
-    NOT HANDLED (deliberately, honestly): operation="mixed_light_balance"
-    -- per the schema spec, this means two genuinely different color
-    temperatures in one frame need DIFFERENT corrections, not more/less
-    of the SAME one. That requires computing separate neutral-reference
-    statistics per region, not just gating this one global scale — a
-    real, separate capability this pass does not build. A
-    mixed_light_balance region is silently ignored here (falls through
-    "not in supported_operations"), not faked with a wrong mechanism."""
+    operation="mixed_light_balance" (Aug 4, 2026, now REAL -- see
+    _apply_mixed_light_balance_regions() docstring for the full mechanism
+    and why the frame-global measurement above structurally can't catch
+    this class of problem): applied as a genuinely separate, full-
+    strength, region-local correction after the global pass, not folded
+    into the single global scale."""
     bgr = img.astype(np.float32)
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     h, s, v = cv2.split(hsv)
@@ -716,6 +805,14 @@ def white_balance_neutral_aware(img, regions=None, level2_masks=None):
     # from fluorescents, magenta cast from some LEDs/sensor artifacts)
     # corrected at full strength, since those are not a normal "warm
     # room" signature.
+    #
+    # NOTE this dampening is GLOBAL-scale-only, deliberately: it exists
+    # because the frame-wide measurement can't distinguish "sensor cast"
+    # from "the whole room is legitimately warm-lit." It does NOT apply
+    # to the region-local mixed_light_balance pass below -- a per-region
+    # correction there is scoped to a Vision-identified region and
+    # confidence-gated already, a different and more trustworthy signal
+    # than a raw whole-frame channel comparison.
     is_warm_cast = means[2] > means[0]  # BGR order: means[2]=R, means[0]=B
     if is_warm_cast:
         strength *= 0.35
@@ -733,8 +830,13 @@ def white_balance_neutral_aware(img, regions=None, level2_masks=None):
 
     applied = 1.0 + strength_map[:, :, None] * (scales.reshape(1, 1, 3) - 1.0)
 
-    out = bgr * applied
-    return np.clip(out, 0, 255).astype(np.uint8), round(float(strength_map.mean()), 3)
+    out = np.clip(bgr * applied, 0, 255).astype(np.uint8)
+
+    # Real per-region mixed-light correction, full strength, after the
+    # global pass -- see _apply_mixed_light_balance_regions() docstring.
+    out, mixed_light_log = _apply_mixed_light_balance_regions(out, target, regions, level2_masks)
+
+    return out, round(float(strength_map.mean()), 3), mixed_light_log
 
 
 def mild_mobile_lens_correction(img, mode="auto"):
@@ -1723,9 +1825,11 @@ def _apply_exterior_stack(img, args, intensity, level2_regions, wb_threshold=0.1
     regions = level2_regions.get("regions") or None
     level2_masks = level2_regions.get("masks") or None
 
-    img, wb_strength = white_balance_neutral_aware(img, regions=regions, level2_masks=level2_masks)
+    img, wb_strength, mixed_light_log = white_balance_neutral_aware(img, regions=regions, level2_masks=level2_masks)
     if wb_strength >= wb_threshold:
         modules.append("white_balance")
+    if any(entry.get("applied") for entry in mixed_light_log):
+        modules.append("mixed_light_balance")
     img, lens_strength = mild_mobile_lens_correction(img, args.lens_mode)
     if lens_strength > 0:
         modules.append("lens_correction")
@@ -1753,6 +1857,7 @@ def _apply_exterior_stack(img, args, intensity, level2_regions, wb_threshold=0.1
         modules.append("exterior_daylight_shadow_lift")
     metrics = {
         "whiteBalanceStrength": wb_strength,
+        "mixedLightBalance": mixed_light_log,
         "lensCorrectionStrength": lens_strength,
         "exteriorCorrection": exterior_metrics,
     }
@@ -1793,9 +1898,11 @@ def _apply_interior_stack(img, args, adaptive_intensity, level2_regions, wb_thre
     regions = level2_regions.get("regions") or None
     level2_masks = level2_regions.get("masks") or None
 
-    img, wb_strength = white_balance_neutral_aware(img, regions=regions, level2_masks=level2_masks)
+    img, wb_strength, mixed_light_log = white_balance_neutral_aware(img, regions=regions, level2_masks=level2_masks)
     if wb_strength >= wb_threshold:
         modules.append("white_balance")
+    if any(entry.get("applied") for entry in mixed_light_log):
+        modules.append("mixed_light_balance")
     img, lens_strength = mild_mobile_lens_correction(img, args.lens_mode)
     if lens_strength > 0:
         modules.append("lens_correction")
@@ -1846,6 +1953,7 @@ def _apply_interior_stack(img, args, adaptive_intensity, level2_regions, wb_thre
 
     metrics = {
         "whiteBalanceStrength": wb_strength,
+        "mixedLightBalance": mixed_light_log,
         "lensCorrectionStrength": lens_strength,
         "vignetteStrength": vignette_strength,
         "adaptiveIntensity": round(adaptive_intensity, 3),
