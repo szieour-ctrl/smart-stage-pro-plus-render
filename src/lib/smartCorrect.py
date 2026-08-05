@@ -1536,7 +1536,25 @@ def mls_brightness_lift(img, intensity=1.0, dark_material_mask=None, regions=Non
     # (unique-luma-value count and flat-region gradient energy both
     # unchanged or improved vs. the uncorrected original).
     fusion_median = float(np.median(l))
-    target_median = 168.0
+
+    # RAISED TOWARD ORACLE (Aug 4, 2026, LEAST VALIDATED of today's three
+    # Oracle-calibrated changes -- flagging that explicitly): the prior
+    # 168 was verified to map closely to the FINAL image median on two
+    # real test photos, before surface_consistency and the other
+    # downstream stages added today existed. On the current full
+    # pipeline, IMG_8310's actual final median measured 163-164 -- a
+    # small but real undershoot from 168, consistent with new downstream
+    # luma-touching stages (surface_consistency especially) diluting it
+    # slightly, the same class of effect that diluted the saturation
+    # boost via the ceiling segment. Oracle's reference measured median
+    # 172.0. Raised to 177 to aim for that after accounting for the same
+    # ~5-point downstream dilution, but unlike the saturation and warmth
+    # fixes, this one has NOT been re-verified end-to-end against a
+    # rendered result -- the full pipeline (HDR recovery, Level 2
+    # regions, every stage in order) is expensive to re-simulate blind.
+    # Test this specifically and report the resulting median_luma back --
+    # more likely to need a second correction pass than the other two.
+    target_median = 177.0
 
     # ── WhiteFraction-adjusted effective target (Aug 2, 2026) ────────────
     # Confirmed on a real photo (IMG_8317, original whiteFraction 0.504 --
@@ -2007,6 +2025,33 @@ def mls_color_finish(img, intensity=1.0, regions=None, level2_masks=None):
     else:
         hsv[:, :, 1] = np.clip(hsv[:, :, 1] * factor, 0, 255)
     color_finished = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+
+    # WARMTH NUDGE (Aug 4, 2026, calibrated against the real Oracle
+    # reference for IMG_8310): distinct from white_balance_neutral_aware's
+    # cast REMOVAL above -- this is a deliberate, small ADDITION of
+    # stylistic warmth, the kind a human retoucher applies as a final
+    # grading choice, not a correction of an unwanted cast. Measured
+    # directly: Smart Correct's output landed at mean LAB b=129.4; the
+    # Oracle reference measured 134.6 -- warmer by 5.2. Applied here,
+    # after saturation, as a flat shift rather than scaled by
+    # adaptive_intensity -- this is about the target AESTHETIC, not about
+    # how much correction a given photo's exposure needed, so a dark
+    # room and a bright room calibrated from the same kind of reference
+    # should get the same amount of stylistic warmth. Respects the same
+    # exclude_from_color_finish protection as saturation above (e.g. an
+    # exterior view through a window shouldn't pick up an artificial
+    # warm cast meant for the room's own tone).
+    WARMTH_B_DELTA = 5.2
+    if regional_mode:
+        warmth_regional = build_regional_strength_map(
+            color_finished.shape[:2], 1.0, regions, level2_masks,
+            supported_operations=(), exclude_tag="exclude_from_color_finish",
+        )
+    else:
+        warmth_regional = np.ones(color_finished.shape[:2], dtype=np.float32)
+    lab_warm = cv2.cvtColor(color_finished, cv2.COLOR_BGR2LAB).astype(np.float32)
+    lab_warm[:, :, 2] = np.clip(lab_warm[:, :, 2] + WARMTH_B_DELTA * warmth_regional, 0, 255)
+    color_finished = cv2.cvtColor(lab_warm.astype(np.uint8), cv2.COLOR_LAB2BGR)
 
     blurred = cv2.GaussianBlur(color_finished, (0, 0), sigmaX=1.2)
 
