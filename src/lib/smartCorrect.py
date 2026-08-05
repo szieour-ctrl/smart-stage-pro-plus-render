@@ -113,6 +113,19 @@ from level2_diagnosis import diagnose as level2_diagnose
 from level0_scene_classifier import resolve_scene_type
 from level2_qc import qc_check
 
+# Optional dependency for surface-consistency detection (Aug 4, 2026) --
+# see apply_surface_consistency()'s docstring. NOT confirmed to be in
+# Railway's requirements.txt yet -- degrades to a no-op (surface pass
+# simply doesn't run, everything else in this file is unaffected) rather
+# than crashing every correction if it's missing. Sam: add
+# scikit-image to requirements.txt to actually enable this in production.
+try:
+    from skimage.segmentation import felzenszwalb as _felzenszwalb
+    SKIMAGE_AVAILABLE = True
+except ImportError:
+    _felzenszwalb = None
+    SKIMAGE_AVAILABLE = False
+
 # Kill switch, matching the existing END_FRAME_ENABLED pattern in this
 # codebase — lets HDR recovery be disabled instantly via Railway env var
 # without a redeploy, in case something unexpected shows up on real
@@ -317,6 +330,148 @@ def apply_hdr_protect_pullback(post_hdr_img, pre_hdr_img, regions, level2_masks,
         for region_id, core in protect_cores
     ]
     return out, debug
+
+
+def detect_surface_consistency_targets(
+    orig_img, corrected_img,
+    min_area_frac=0.015, flatness_std_max=35.0,
+    gradient_std_ratio=1.4, gradient_std_min_delta=8.0,
+    downscale=0.35, felzenszwalb_scale=300, felzenszwalb_sigma=1.2, felzenszwalb_min_size=200,
+):
+    """Detects continuous real-world surfaces (ceilings, walls, floors)
+    that correction introduced a visible, spatially-arbitrary luma
+    gradient across, even though the surface itself is a single uniform
+    material (Aug 4, 2026, root-caused via a real photo, IMG_8310: a
+    Vision-flagged window `protect` region bordered the same ceiling as
+    the rest of the room, which gets the full brightness lift -- the
+    ceiling paint doesn't change at that boundary, but the correction's
+    treatment of it does, producing a 39.46-luma visible wedge with no
+    photographic basis). Region-based masking (build_regional_strength_map
+    and everything built on it this session) works by construction for
+    distinguishing different OBJECTS; it has no concept of a continuous
+    SURFACE that happens to span two objects' zones of influence. This
+    is a different, complementary detection: pure classical segmentation
+    on the ORIGINAL (pre-correction) image, cross-referenced against
+    where the CORRECTED image gained variance the original didn't have.
+
+    Deliberately segments the ORIGINAL, not the corrected image -- using
+    the corrected image would risk the artifact itself biasing which
+    pixels get grouped together (a boundary with an artificial 39-luma
+    step is also an edge a segmenter would happily cut along, defeating
+    the purpose).
+
+    Returns a list of dicts, one per flagged surface: segId, mask (bool
+    ndarray), pixelCount, areaFraction, stdBeforeCorrection,
+    stdAfterCorrection, targetL, blendStrength. Empty list if skimage
+    isn't available, if segmentation finds nothing, or if nothing
+    qualifies -- always a list, never None."""
+    if not SKIMAGE_AVAILABLE:
+        return []
+    if orig_img.shape != corrected_img.shape:
+        return []
+
+    h, w = orig_img.shape[:2]
+    total_px = h * w
+    orig_rgb = cv2.cvtColor(orig_img, cv2.COLOR_BGR2RGB)
+    small = cv2.resize(
+        orig_rgb, (max(1, int(w * downscale)), max(1, int(h * downscale))),
+        interpolation=cv2.INTER_AREA,
+    )
+    try:
+        seg_small = _felzenszwalb(
+            small, scale=felzenszwalb_scale, sigma=felzenszwalb_sigma, min_size=felzenszwalb_min_size,
+        )
+    except Exception:
+        return []  # segmentation failing is not a reason to fail the whole correction
+    seg_full = cv2.resize(seg_small.astype(np.int32), (w, h), interpolation=cv2.INTER_NEAREST)
+
+    lab_orig = cv2.cvtColor(orig_img, cv2.COLOR_BGR2LAB).astype(np.float32)
+    lab_corr = cv2.cvtColor(corrected_img, cv2.COLOR_BGR2LAB).astype(np.float32)
+    l_orig = lab_orig[:, :, 0]
+    l_corr = lab_corr[:, :, 0]
+
+    targets = []
+    for seg_id in np.unique(seg_full):
+        mask = seg_full == seg_id
+        count = int(mask.sum())
+        if count < total_px * min_area_frac:
+            continue  # too small to be worth a dedicated pass -- most of a photo's segments are furniture/detail anyway
+
+        seg_lab_orig = lab_orig[mask]
+        flatness = float(seg_lab_orig[:, 0].std() + seg_lab_orig[:, 1].std() + seg_lab_orig[:, 2].std())
+        if flatness > flatness_std_max:
+            continue  # not a flat/uniform material to begin with (furniture, patterned rug, detailed texture) -- leave it alone
+
+        std_before = float(l_orig[mask].std())
+        std_after = float(l_corr[mask].std())
+        if std_after <= std_before * gradient_std_ratio or (std_after - std_before) <= gradient_std_min_delta:
+            continue  # correction didn't meaningfully add variance THIS surface didn't already have
+
+        excess = std_after - std_before
+        # CALIBRATED (Aug 4, 2026) against the real IMG_8310 ceiling case:
+        # divisor=30 (initial guess) produced blend_strength=0.35 for an
+        # excess of 11.88 -- rendered and checked directly, the wedge was
+        # still clearly visible at that strength. A manually-tuned 0.75
+        # (validated by rendering, not just computed) nearly eliminated
+        # it. Solved for a divisor that reproduces that at this photo's
+        # measured excess: divisor=5 gives 0.776, matching. Consistent
+        # with the "no conservative dial" principle from the
+        # mixed_light_balance work earlier this session -- once
+        # something clears the flagging threshold at all (a real,
+        # non-trivial excess), it should get a real correction, not a
+        # token nudge.
+        blend_strength = float(np.clip((excess - gradient_std_min_delta) / 5.0, 0.35, 0.85))
+        targets.append({
+            "segId": int(seg_id), "mask": mask, "pixelCount": count,
+            "areaFraction": round(count / total_px, 4),
+            "stdBeforeCorrection": round(std_before, 2),
+            "stdAfterCorrection": round(std_after, 2),
+            "targetL": round(float(l_corr[mask].mean()), 2),
+            "blendStrength": round(blend_strength, 3),
+        })
+    return targets
+
+
+def apply_surface_consistency(orig_img, corrected_img, **kwargs):
+    """Collapses each flagged continuous surface (see
+    detect_surface_consistency_targets()) toward one consistent,
+    area-weighted luma value, feathered with a SMALL, tight blur right at
+    the surface's true boundary -- unlike the ~100px feather used for
+    Vision's box-based region masks (which needs to be wide because a box
+    is only an APPROXIMATE stand-in for the real object edge), this mask
+    traces the surface's actual boundary from classical segmentation, so
+    a small feather (sigma=20px, widened from an initial 12px after
+    rendering IMG_8310 and finding a faint staircase artifact still
+    visible right at the crown molding) is enough to erase the blocky staircase
+    artifact from the segmentation's internal downscale/upscale without
+    blurring past the real edge (e.g. the crown molding between ceiling
+    and wall) the way a huge feather would.
+
+    Multiple flagged surfaces apply independently and in sequence; where
+    two surfaces' soft edges overlap (a real material seam, e.g. ceiling
+    meeting wall), both blends contribute a fading pull toward their own
+    target there, which is the physically correct behavior at an actual
+    boundary, not an artifact.
+
+    Returns (img, log) -- log is a list of dicts (mask arrays stripped
+    out, everything else kept) for reporting, empty list if nothing
+    was flagged or corrected_img/skimage weren't usable."""
+    targets = detect_surface_consistency_targets(orig_img, corrected_img, **kwargs)
+    if not targets:
+        return corrected_img, []
+
+    lab = cv2.cvtColor(corrected_img, cv2.COLOR_BGR2LAB).astype(np.float32)
+    l = lab[:, :, 0]
+    log = []
+    for t in targets:
+        soft_edge = np.clip(cv2.GaussianBlur(t["mask"].astype(np.float32), (0, 0), sigmaX=20, sigmaY=20), 0.0, 1.0)
+        blend = t["blendStrength"] * soft_edge
+        l = l * (1.0 - blend) + t["targetL"] * blend
+        log.append({k: v for k, v in t.items() if k != "mask"})
+
+    lab[:, :, 0] = np.clip(l, 0, 255)
+    out = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
+    return out, log
 
 
 # ── Measurement helpers (read-only, no pixel changes) ──────────────────────
@@ -2017,6 +2172,21 @@ def _apply_interior_stack(img, args, adaptive_intensity, level2_regions, wb_thre
     )
     modules.append("color_clarity_finish")
 
+    # ── Surface consistency (Aug 4, 2026) ───────────────────────────────
+    # See apply_surface_consistency()'s docstring for the full mechanism.
+    # Runs LAST, after every other correction that could introduce a
+    # cross-surface gradient has already run -- geometry_ref_img (post-
+    # HDR, pre-Level-2) is the closest available "what did this surface
+    # look like before anything region-differentiated touched it"
+    # baseline. Falls back to a no-op automatically if skimage isn't
+    # installed (SKIMAGE_AVAILABLE) or if geometry_ref_img wasn't
+    # supplied -- never blocks a correction from completing.
+    surface_log = []
+    if SKIMAGE_AVAILABLE and geometry_ref_img is not None:
+        img, surface_log = apply_surface_consistency(geometry_ref_img, img)
+        if surface_log:
+            modules.append("surface_consistency")
+
     metrics = {
         "whiteBalanceStrength": wb_strength,
         "mixedLightBalance": mixed_light_log,
@@ -2027,6 +2197,7 @@ def _apply_interior_stack(img, args, adaptive_intensity, level2_regions, wb_thre
         "cleanWhites": white_metrics,
         "windowBalance": window_metrics,
         "mlsFinish": finish_metrics,
+        "surfaceConsistency": surface_log,
     }
     return img, modules, metrics, rotation_deg, denoise_strength
 
