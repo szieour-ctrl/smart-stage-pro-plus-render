@@ -1434,8 +1434,27 @@ def mls_brightness_lift(img, intensity=1.0, dark_material_mask=None, regions=Non
         # Force to 0 -- full protection -- wherever Vision identified a
         # genuine dark material, overriding the luma ramp's partial
         # protection in the L 40-100 range.
+        #
+        # SCALED BY PHOTO_NEEDS_LIFT TOO (Aug 4, 2026): this block was the
+        # REAL reason the fusion-stage fix above didn't move the needle in
+        # production on IMG_8310 -- confirmed directly: dining chairs
+        # delta was still only +0.57 after that fix shipped, against a
+        # locally-validated ~+15 for the fusion stage alone. This stage's
+        # own comment already said its push is "MORE IMPORTANT NOW...
+        # since the push behind it is much stronger" -- and unlike the
+        # fusion stage's old 0.6 multiplier (partial dampening), this one
+        # was an unconditional hard zero: `dark_material_protect * (1.0 -
+        # dark_material_mask)` sets it to EXACTLY 0 wherever Vision
+        # flagged dark material, meaning `l = l*(1-0) + ...*0 = l`,
+        # completely unchanged, regardless of how dark the room starts.
+        # Same fix, same reasoning as the fusion stage: full force in a
+        # normally-exposed room with a real dark accent (photo_needs_lift
+        # near 0, this reduces to the exact old behavior), tapering off
+        # as the whole photo needs more lifting, so this region stops
+        # being singled out for a hard block Vision's own primary/
+        # shadow_recovery tag didn't ask for.
         if dark_material_mask is not None:
-            dark_material_protect = dark_material_protect * (1.0 - dark_material_mask)
+            dark_material_protect = dark_material_protect * (1.0 - dark_material_mask * (1.0 - photo_needs_lift))
         l = (255.0 * np.power(normalized, gamma_map)) * dark_material_protect + l * (1.0 - dark_material_protect)
 
     # Highlight/window protection — compress rather than let anything blow out.
