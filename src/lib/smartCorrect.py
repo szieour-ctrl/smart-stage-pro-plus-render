@@ -333,9 +333,9 @@ def apply_hdr_protect_pullback(post_hdr_img, pre_hdr_img, regions, level2_masks,
 
 
 def detect_surface_consistency_targets(
-    orig_img, corrected_img,
+    orig_img, corrected_img, exclude_mask=None,
     min_area_frac=0.015, flatness_std_max=35.0,
-    gradient_std_ratio=1.4, gradient_std_min_delta=8.0,
+    gradient_std_ratio=1.4, gradient_std_min_delta=8.0, exclude_overlap_max=0.3,
     downscale=0.35, felzenszwalb_scale=300, felzenszwalb_sigma=1.2, felzenszwalb_min_size=200,
 ):
     """Detects continuous real-world surfaces (ceilings, walls, floors)
@@ -359,6 +359,29 @@ def detect_surface_consistency_targets(
     pixels get grouped together (a boundary with an artificial 39-luma
     step is also an edge a segmenter would happily cut along, defeating
     the purpose).
+
+    exclude_mask (Aug 4, 2026, optional -- FIXES A REAL FALSE-POSITIVE
+    CONFIRMED ON A REAL PHOTO): pass dark_material_mask (or a union with
+    furniture_floor_mask) here. Root-caused directly on IMG_8310: dark
+    carved mahogany furniture (dining chairs, a side table), before
+    correction, is so underexposed that its wood-grain texture is
+    crushed into a narrow, low-variance dark range -- it measures as
+    "flat" to the check below for the WRONG reason (underexposure, not
+    genuine material uniformity). When shadow_recovery then correctly
+    reveals that texture, its variance legitimately grows -- and without
+    this exclusion, that legitimate texture recovery gets misread as an
+    "artificial gradient" and forced back toward a near-black flattened
+    target (confirmed: targetL=10.18 on the actual dining set,
+    targetL=34.59 on a side table -- directly undoing the dark-material
+    fix from earlier the same session, on the identical furniture).
+    Vision has already made the judgment that this object needs
+    shadow_recovery with texture preserved; this defers to that rather
+    than re-deciding it from raw pixel statistics. Any segment whose
+    overlap with exclude_mask exceeds exclude_overlap_max (default 30%)
+    is skipped entirely, before the flatness check even runs -- an
+    object Vision has flagged as furniture/dark-material shouldn't be
+    eligible for surface-consistency treatment at all, regardless of how
+    its variance measures.
 
     Returns a list of dicts, one per flagged surface: segId, mask (bool
     ndarray), pixelCount, areaFraction, stdBeforeCorrection,
@@ -389,6 +412,7 @@ def detect_surface_consistency_targets(
     lab_corr = cv2.cvtColor(corrected_img, cv2.COLOR_BGR2LAB).astype(np.float32)
     l_orig = lab_orig[:, :, 0]
     l_corr = lab_corr[:, :, 0]
+    exclude = exclude_mask if exclude_mask is not None else None
 
     targets = []
     for seg_id in np.unique(seg_full):
@@ -396,6 +420,11 @@ def detect_surface_consistency_targets(
         count = int(mask.sum())
         if count < total_px * min_area_frac:
             continue  # too small to be worth a dedicated pass -- most of a photo's segments are furniture/detail anyway
+
+        if exclude is not None:
+            overlap = float(exclude[mask].mean())
+            if overlap > exclude_overlap_max:
+                continue  # Vision already decided this is furniture/dark-material -- defer to that judgment, don't re-litigate it from pixel stats
 
         seg_lab_orig = lab_orig[mask]
         flatness = float(seg_lab_orig[:, 0].std() + seg_lab_orig[:, 1].std() + seg_lab_orig[:, 2].std())
@@ -2136,7 +2165,24 @@ def _apply_exterior_stack(img, args, intensity, level2_regions, wb_threshold=0.1
     # trusted.
     surface_log = []
     if SKIMAGE_AVAILABLE and geometry_ref_img is not None:
-        img, surface_log = apply_surface_consistency(geometry_ref_img, img)
+        # Same false-positive fix as interior (Aug 4, 2026) -- see
+        # detect_surface_consistency_targets()'s exclude_mask docstring.
+        # Ported here preemptively rather than waiting for a confirmed
+        # exterior case, since the mechanism (dark furniture/material
+        # measuring artificially "flat" while underexposed, then getting
+        # its legitimate texture-recovery variance mistaken for an
+        # artificial gradient) isn't specific to interior scenes -- dark
+        # garage doors, stonework, or shaded architectural detail could
+        # hit the identical failure shape.
+        ext_dark_material = level2_regions.get("dark_material_mask")
+        ext_furniture_floor = level2_regions.get("furniture_floor_mask")
+        ext_exclude_mask = None
+        if ext_dark_material is not None or ext_furniture_floor is not None:
+            ext_exclude_mask = np.maximum(
+                ext_dark_material if ext_dark_material is not None else 0.0,
+                ext_furniture_floor if ext_furniture_floor is not None else 0.0,
+            )
+        img, surface_log = apply_surface_consistency(geometry_ref_img, img, exclude_mask=ext_exclude_mask)
         if surface_log:
             modules.append("surface_consistency")
 
@@ -2247,9 +2293,27 @@ def _apply_interior_stack(img, args, adaptive_intensity, level2_regions, wb_thre
     # baseline. Falls back to a no-op automatically if skimage isn't
     # installed (SKIMAGE_AVAILABLE) or if geometry_ref_img wasn't
     # supplied -- never blocks a correction from completing.
+    #
+    # exclude_mask (Aug 4, 2026, CONFIRMED REAL BUG on IMG_8310): without
+    # this, dark carved furniture (dining chairs, a side table) that's
+    # underexposed enough to measure as "flat" gets its legitimate
+    # shadow_recovery texture-reveal mistaken for an artificial gradient
+    # and forced back toward near-black (targetL=10.18 was measured on
+    # the actual dining set in production) -- directly undoing the
+    # dark-material fix from earlier this session, on the identical
+    # furniture. See detect_surface_consistency_targets()'s exclude_mask
+    # docstring for the full root cause.
     surface_log = []
     if SKIMAGE_AVAILABLE and geometry_ref_img is not None:
-        img, surface_log = apply_surface_consistency(geometry_ref_img, img)
+        int_dark_material = level2_regions.get("dark_material_mask")
+        int_furniture_floor = level2_regions.get("furniture_floor_mask")
+        int_exclude_mask = None
+        if int_dark_material is not None or int_furniture_floor is not None:
+            int_exclude_mask = np.maximum(
+                int_dark_material if int_dark_material is not None else 0.0,
+                int_furniture_floor if int_furniture_floor is not None else 0.0,
+            )
+        img, surface_log = apply_surface_consistency(geometry_ref_img, img, exclude_mask=int_exclude_mask)
         if surface_log:
             modules.append("surface_consistency")
 
