@@ -1191,6 +1191,36 @@ def mls_brightness_lift(img, intensity=1.0, dark_material_mask=None, regions=Non
     before_median = float(np.median(l_before))
     before_mean = float(l_before.mean())
 
+    # ── Whole-photo lift-need, computed EARLY (Aug 4, 2026) ──────────────
+    # Root-caused via a real photo (IMG_8310, before_median=90 against a
+    # target of 168): dark_protect below used FIXED absolute luma anchors
+    # (L=40 fully protected, tapering to L=140), with no awareness of
+    # whether the room itself is already dark. Confirmed directly: 83.8%
+    # of that entire photo fell under L<140 (some dark-material dampening
+    # applied) and 47.5% had dark_protect>0.5 (MAJORITY pulled back
+    # toward the original) -- not because half the room is black granite,
+    # but because the room's own median luma (94) sits inside the
+    # "possibly dark material" zone by default. Net effect measured on
+    # that photo: a Vision-flagged primary/shadow_recovery dark-wood
+    # dining set moved -0.21 (net DARKER after correction) while an
+    # ordinary, ungoverned patch of carpet two feet away moved +44,
+    # because dark_protect fought the Level 2 boost on the one region
+    # explicitly asking for it while doing nothing to the region nobody
+    # asked to touch. Sam's own framing, verbatim: "why would dark be
+    # protected in a dark photo? That is creating exactly the result we
+    # got." Dark-material protection exists to preserve an intentional
+    # dark ACCENT against an otherwise normally-exposed room -- that
+    # concept only means something once there IS a normally-exposed room
+    # for it to be an accent against. When the room itself needs major
+    # lifting, protection should back off proportionally, not fire at
+    # full strength as if this were a normally-lit room with one black
+    # countertop. NO CONSERVATIVE DIAL (Sam, explicit): this scales
+    # directly and substantially, not a token nudge -- a photo needing
+    # the full 78-point gap to target ends up with dark-material
+    # pullback at roughly 1/5 its normal strength, not a mild 10-20%
+    # trim.
+    photo_needs_lift = clamp01((168.0 - before_median) / 100.0)
+
     # ── Regional strength map (Aug 2, 2026) ──────────────────────────────
     # Built once, up front, so it can drive both the fusion blend below
     # AND the residual gamma nudge later — same map, two consumers.
@@ -1259,7 +1289,22 @@ def mls_brightness_lift(img, intensity=1.0, dark_material_mask=None, regions=Non
     # protection (1.0) regardless of where it falls on the luma ramp.
     if dark_material_mask is not None:
         dark_protect = np.maximum(dark_protect, dark_material_mask.astype(np.float32))
-    protected_l = fused_l * (1.0 - dark_protect * 0.6) + orig_l * (dark_protect * 0.6)
+
+    # SCALE BY WHOLE-PHOTO LIFT-NEED (Aug 4, 2026): the fixed 0.6 constant
+    # this used to multiply by assumed a normally-exposed room with an
+    # intentional dark accent. In a photo that itself needs major
+    # lifting, that assumption is false, and 0.6 dampens indiscriminately
+    # against Vision's own primary/shadow_recovery instruction on the
+    # same dark-material region -- see photo_needs_lift's definition
+    # above for the full real-photo evidence. Genuinely protect-tagged
+    # fixtures (a firebox opening, a real no_change region) aren't
+    # relying on this alone -- they're already zeroed out by the Level 2
+    # priority/protect path in strength_map below, independent of this
+    # legacy mechanism. This scaling only matters for the case that was
+    # actually broken: a dark-material region ALSO tagged primary/
+    # shadow_recovery, where this used to win the fight it should lose.
+    effective_pullback_strength = 0.6 * (1.0 - photo_needs_lift)
+    protected_l = fused_l * (1.0 - dark_protect * effective_pullback_strength) + orig_l * (dark_protect * effective_pullback_strength)
     lab_hybrid[:, :, 0] = protected_l
     fused = cv2.cvtColor(lab_hybrid, cv2.COLOR_LAB2BGR)
 
@@ -1421,6 +1466,8 @@ def mls_brightness_lift(img, intensity=1.0, dark_material_mask=None, regions=Non
         "residual_need": round(float(residual_need), 3),
         "method": "synthetic_exposure_fusion",
         "level2DarkMaterialMaskApplied": dark_material_mask is not None,
+        "photoNeedsLift": round(float(photo_needs_lift), 3),
+        "darkMaterialPullbackStrength": round(float(effective_pullback_strength), 3),
         "regionalModeApplied": regional_mode,
         "regionalStrengthRange": [round(float(strength_map.min()), 3), round(float(strength_map.max()), 3)] if regional_mode else None,
     }
