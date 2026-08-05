@@ -1647,7 +1647,7 @@ def mls_brightness_lift(img, intensity=1.0, dark_material_mask=None, regions=Non
     }
 
 
-def clean_whites_adaptive(img, intensity=1.0, exclusion_weight=None, regions=None, level2_masks=None):
+def clean_whites_adaptive(img, intensity=1.0, exclusion_weight=None, regions=None, level2_masks=None, photo_needs_lift=0.0):
     """Adaptive MLS Bright clean-whites pass — measures actual likely-white
     architectural surfaces (trim, cabinets, ceilings via LAB chroma+luma)
     and only neutralizes/lifts them if they measurably need it, feathered
@@ -1672,7 +1672,26 @@ def clean_whites_adaptive(img, intensity=1.0, exclusion_weight=None, regions=Non
     chroma/luma, and corrects only those, automatically. There's no
     meaningful "primary" version of that beyond what the measurement
     already computes. Regional input here is protection-only.
-    """
+
+    photo_needs_lift (Aug 4, 2026, optional): root-caused via a real
+    photo (IMG_8310) that the ceiling multipliers below (0.17 for lift,
+    0.46 for neutralize) are themselves already a REDUCTION from an
+    earlier version (0.22, 0.55) made to fix a DIFFERENT real photo (a
+    hallway that was over-lifting). Same constants, two real photos
+    pulling in opposite directions -- confirmed directly: on IMG_8310,
+    white trim measured L~158 at this stage with a fully-saturated gap
+    term (already capped at 1.0, meaning "this needs the maximum
+    possible lift"), yet the fixed 0.17 ceiling still only reached
+    L~170, nowhere near a genuinely clean white. The fixed constant
+    can't serve both cases -- it needs to know how dark the ROOM is, not
+    just how far one surface's own measurement is from target. Same
+    shape of fix as mls_brightness_lift's dark-material scaling: at
+    photo_needs_lift=0 (a normally-exposed room, the case the 0.17/0.46
+    reduction was tuned for), behavior is IDENTICAL to before this
+    parameter existed. Scales up substantially as the whole room needs
+    more lifting -- calibrated by rendering IMG_8310 at several ceiling
+    values and checking the actual resulting white-trim luma, not
+    guessed."""
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
     L, A, B = cv2.split(lab)
 
@@ -1732,7 +1751,26 @@ def clean_whites_adaptive(img, intensity=1.0, exclusion_weight=None, regions=Non
     # near-zero by 65%+ coverage (the room IS predominantly white by
     # design — global corrections already handle it, a second targeted
     # pass on top is redundant and risks exactly this compounding).
-    majority_room_factor = clamp01((0.75 - white_fraction) / (0.75 - 0.50))
+    #
+    # THRESHOLD SHIFTED BY PHOTO_NEEDS_LIFT TOO (Aug 4, 2026): confirmed
+    # directly on IMG_8310 that this taper fires as a FALSE POSITIVE in a
+    # dark room -- whiteFraction measured 59.5% there, well into the
+    # taper band, cutting strength to 0.62x on top of the ceiling fix
+    # just above. But this room isn't predominantly white by design; a
+    # neutral GRAY wall, once lifted by mls_brightness_lift's global
+    # correction, legitimately has low chroma and can cross the L>145
+    # threshold right alongside genuine trim -- the luma/chroma test
+    # alone can't distinguish "this IS white material" from "this is
+    # gray material that got bright enough to look white after global
+    # brightening." Same failure shape as dark_protect: a threshold
+    # calibrated for normal exposure, misfiring once the room itself
+    # needed major lifting. Shifts the whole taper band upward with
+    # photo_needs_lift -- more of the frame has to read white before
+    # this taper doubts it's genuine, in proportion to how much of that
+    # "looks white now" reading is plausibly just global brightening.
+    taper_start = 0.75 + 0.15 * photo_needs_lift
+    taper_end = 0.50 + 0.15 * photo_needs_lift
+    majority_room_factor = clamp01((taper_start - white_fraction) / (taper_start - taper_end))
 
     # REDUCED CEILING (patch, pending validation): report flagged a real
     # photo (IMG_8301, hallway) as over-lifted and flattened even with
@@ -1741,11 +1779,13 @@ def clean_whites_adaptive(img, intensity=1.0, exclusion_weight=None, regions=Non
     # strong on top of that, not the do-no-harm gate). Lowered both
     # multipliers modestly (0.55->0.46, 0.22->0.17) so already-white
     # surfaces get corrected without pushing as hard toward flat/bright.
-    neutralize_strength = clamp01((cast_mag - 1.8) / (10.0 - 1.8)) * 0.46 * intensity * majority_room_factor
+    neutralize_ceiling = 0.46 + 0.40 * photo_needs_lift
+    neutralize_strength = clamp01((cast_mag - 1.8) / (10.0 - 1.8)) * neutralize_ceiling * intensity * majority_room_factor
 
     target_l = 212.0
     l_gap = max(0.0, target_l - mean_l)
-    lift_strength = clamp01(l_gap / 38.0) * 0.17 * intensity * majority_room_factor
+    lift_ceiling = 0.17 + 0.65 * photo_needs_lift
+    lift_strength = clamp01(l_gap / 38.0) * lift_ceiling * intensity * majority_room_factor
     if mean_l > 220.0:
         lift_strength *= 0.15
     elif mean_l > 212.0:
@@ -2076,11 +2116,36 @@ def _apply_exterior_stack(img, args, intensity, level2_regions, wb_threshold=0.1
     )
     if abs(exterior_metrics["after_median_luma"] - exterior_metrics["before_median_luma"]) >= 3:
         modules.append("exterior_daylight_shadow_lift")
+
+    # ── Surface consistency (Aug 4, 2026) ───────────────────────────────
+    # Same mechanism as _apply_interior_stack -- see
+    # apply_surface_consistency()'s docstring. Ported here on request
+    # after the interior wedge case, on the reasoning that the risk shape
+    # is identical: a stucco wall or driveway bordering a `protect` sky
+    # or window region can be split into inconsistently-treated pieces
+    # the same way the interior ceiling was. UNTESTED ON A REAL EXTERIOR
+    # PHOTO as of this patch -- the interior version was calibrated
+    # (blend-strength divisor, boundary feather sigma) against a real,
+    # confirmed artifact (IMG_8310's ceiling); this exterior wiring
+    # reuses those same constants on the assumption they transfer, not
+    # because they've been separately validated for exterior surfaces
+    # (stucco/concrete/sky have different texture and dynamic-range
+    # characteristics than an interior ceiling). Worth deliberately
+    # testing on a real exterior photo with a protect-region-heavy
+    # composition before trusting this the way the interior version is
+    # trusted.
+    surface_log = []
+    if SKIMAGE_AVAILABLE and geometry_ref_img is not None:
+        img, surface_log = apply_surface_consistency(geometry_ref_img, img)
+        if surface_log:
+            modules.append("surface_consistency")
+
     metrics = {
         "whiteBalanceStrength": wb_strength,
         "mixedLightBalance": mixed_light_log,
         "lensCorrectionStrength": lens_strength,
         "exteriorCorrection": exterior_metrics,
+        "surfaceConsistency": surface_log,
     }
     return img, modules, metrics, rotation_deg, denoise_strength
 
@@ -2159,6 +2224,7 @@ def _apply_interior_stack(img, args, adaptive_intensity, level2_regions, wb_thre
     img, white_metrics = clean_whites_adaptive(
         img, intensity=adaptive_intensity, exclusion_weight=combined_exclusion_weight,
         regions=regions, level2_masks=level2_masks,
+        photo_needs_lift=brightness_metrics.get("photoNeedsLift", 0.0),
     )
     if white_metrics.get("applied"):
         modules.append("clean_whites")
