@@ -1943,10 +1943,20 @@ def window_balance(img, regions=None, level2_masks=None):
 
 
 def mls_color_finish(img, intensity=1.0, regions=None, level2_masks=None):
-    """MLS finish: neutral, clean, bright — not editorial. Normalizes
-    saturation toward the calibrated MLS Bright target range and adds a
-    mild clarity/unsharp pass so the image doesn't read as flat after the
-    brightness and white-surface work above.
+    """MLS finish: normalizes saturation toward a calibrated target range
+    and adds a mild clarity/unsharp pass so the image doesn't read as
+    flat after the brightness and white-surface work above.
+
+    PHILOSOPHY UPDATED (Aug 4, 2026): previously documented as "neutral,
+    clean, bright -- not editorial," with the under-saturated branch
+    capped at a maximum +7% boost regardless of the actual gap to a
+    desired look. Recalibrated directly against a real manually-graded
+    reference image (Sam's "Oracle" target for IMG_8310), which measured
+    24% more saturated than Smart Correct's output on the same photo --
+    more than 3x the old ceiling's maximum possible reach. See the
+    constant below for the exact math. This IS now a step toward a
+    styled look, not away from one, at least for the under-saturated
+    case this was calibrated against.
 
     regions / level2_masks (Aug 2, 2026, optional):
     - operation="hue_protection" or "saturation_protection" on any region
@@ -1961,8 +1971,23 @@ def mls_color_finish(img, intensity=1.0, regions=None, level2_masks=None):
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
     sat_mean = float(hsv[:, :, 1].mean())
 
+    # RECALIBRATED AGAINST A REAL TARGET (Aug 4, 2026): the old formula's
+    # philosophy ("neutral, clean, bright -- not editorial") capped the
+    # under-saturated branch at a maximum +7% boost (0.07 * intensity),
+    # full stop, regardless of how far short of the desired look the
+    # photo actually was. Sam supplied a manually-graded reference image
+    # for IMG_8310 ("Oracle") specifically to give this kind of tuning a
+    # real target instead of a guess. Measured directly: Smart Correct's
+    # output on this photo landed at sat_mean=57.8; the Oracle reference
+    # measured 71.4 -- a 23.5% relative increase, more than 3x what the
+    # old ceiling could ever produce even at full intensity. Solved
+    # directly for a coefficient that reaches that at this photo's
+    # measured adaptiveIntensity (0.7): 0.336. The over-saturated (>96)
+    # and normal-band branches are untouched -- this photo's gap was
+    # specifically in the under-saturated case, and there's no
+    # comparable real-photo evidence yet for retuning the other two.
     if sat_mean < 62:
-        factor = 1.0 + 0.07 * intensity
+        factor = 1.0 + 0.336 * intensity
     elif sat_mean > 96:
         factor = 1.0 - 0.08 * intensity
     else:
