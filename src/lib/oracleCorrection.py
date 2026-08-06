@@ -3,15 +3,13 @@ oracleCorrection.py
 
 Oracle-driven correction pass for Smart Correct Level 2.
 
-IMPORTANT — compliance note (see handoff, gotcha #3):
-Any Oracle image used here is an internal, never-delivered analysis input.
-It must never be exposed to or delivered to end users. This module produces
-pixel corrections *guided by* Oracle deltas, gated by recoverability computed
-from the ORIGINAL file alone. The architecture (generative render used only
-as internal calibration/analysis input) has a defensible AB 723 reading, but
-this is a legal call, not an engineering one -- needs John's sign-off before
-any production/user-facing path. This module is prototype/test-harness only
-until that review happens.
+IMPORTANT — labeling requirement: any Oracle Scene Render (including any
+GPT Image 2 output) is a digitally altered image and must be labeled as
+such wherever it is shown or delivered. That labeling requirement is
+what makes this compliant -- not a question still being evaluated.
+Nothing in this module needs to change based on that; it's a delivery/UI
+requirement on whatever surfaces Oracle-derived images, not on the
+math here.
 
 Two image classes handled differently (see handoff Step 2):
   - SAME-ROOM oracle (graded version of the identical photo): per-pixel
