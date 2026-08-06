@@ -189,101 +189,122 @@ def compute_recoverability_map(orig_img):
 
 def compute_oracle_guided_deltas(orig_img, oracle_aligned, external_gate=None):
     """
-    Computes illumination and color-temperature delta maps between an
-    ALREADY-ALIGNED Oracle and the Original. Does not perform alignment --
-    call align_oracle_to_original() first for the same-room case.
+    Computes illumination and color delta maps between an ALREADY-ALIGNED
+    Oracle and the Original. Does not perform alignment -- call
+    align_oracle_to_original() first for the same-room case.
+
+    ALL THREE LAB channels now computed (fixed this session -- see
+    apply_oracle_guided_correction docstring for why leaving 'a' fixed at
+    the Original's value was a real bug, not a simplification: confirmed
+    on a real exterior photo, Oracle's own 'a' channel differed from the
+    Original's by +7 in the sky region, and combining Original's 'a' with
+    Oracle's L/b produced a LAB coordinate that belongs to NEITHER image,
+    converting to an HSV saturation that overshot Oracle's own saturation
+    (198 vs Oracle's 150 vs Original's 68). Moving all three channels
+    together, then clamping (see apply_) is the fix.
 
     external_gate: optional pre-computed float32 gate map (same H x W as
         orig_img, values 0..1), e.g. from
         level2_vision_recoverability.rasterize_vision_gate(). When given,
-        this is used (still feathered -- Vision's boxes have hard edges
-        too, see that module's docstring) INSTEAD OF the classical
-        box-filter classifier. When None (default), falls back to the
-        classical classifier unchanged -- see run_oracle_driven_pipeline
-        for the shadow-mode logic that decides which to pass in
-        production; this function itself has no opinion, it just uses
-        what it's given.
+        used (still feathered) INSTEAD OF the classical box-filter
+        classifier. When None (default), falls back to the classical
+        classifier unchanged.
 
     Returns:
         recoverability_map: float32 gate map, feathered, full-res, aligned to orig_img
         recoverability_classification: uint8 map (0/1/2 = red/yellow/green) from the
-            CLASSICAL classifier specifically, always computed (cheap, no API call)
-            regardless of which gate is actually used -- kept for logging/comparison
-            even when external_gate drives the real correction, so shadow-mode
-            agreement/disagreement is always loggable.
+            CLASSICAL classifier specifically, always computed regardless of gate source.
         illumination_delta: float32, L_oracle - L_original, Gaussian-blurred
-        color_delta: float32, b_oracle - b_original (LAB b channel), Gaussian-blurred
+        color_delta_a: float32, a_oracle - a_original, Gaussian-blurred (NEW)
+        color_delta_b: float32, b_oracle - b_original, Gaussian-blurred
     """
     orig_lab = cv2.cvtColor(orig_img, cv2.COLOR_BGR2LAB).astype(np.float32)
     oracle_lab = cv2.cvtColor(oracle_aligned, cv2.COLOR_BGR2LAB).astype(np.float32)
 
-    L_orig, _, b_orig = cv2.split(orig_lab)
-    L_oracle, _, b_oracle = cv2.split(oracle_lab)
+    L_orig, a_orig, b_orig = cv2.split(orig_lab)
+    L_oracle, a_oracle, b_oracle = cv2.split(oracle_lab)
 
     illum_delta_raw = L_oracle - L_orig
-    color_delta_raw = b_oracle - b_orig
+    color_delta_a_raw = a_oracle - a_orig
+    color_delta_b_raw = b_oracle - b_orig
 
-    illumination_delta = cv2.GaussianBlur(
-        illum_delta_raw, ksize=(0, 0), sigmaX=ILLUM_BLUR_SIGMA
-    )
-    color_delta = cv2.GaussianBlur(
-        color_delta_raw, ksize=(0, 0), sigmaX=COLOR_BLUR_SIGMA
-    )
+    illumination_delta = cv2.GaussianBlur(illum_delta_raw, ksize=(0, 0), sigmaX=ILLUM_BLUR_SIGMA)
+    color_delta_a = cv2.GaussianBlur(color_delta_a_raw, ksize=(0, 0), sigmaX=COLOR_BLUR_SIGMA)
+    color_delta_b = cv2.GaussianBlur(color_delta_b_raw, ksize=(0, 0), sigmaX=COLOR_BLUR_SIGMA)
 
     recoverability_map_raw, recoverability_classification = compute_recoverability_map(orig_img)
+    gate_source_raw = external_gate if external_gate is not None else recoverability_map_raw
+    recoverability_map = cv2.GaussianBlur(gate_source_raw, ksize=(0, 0), sigmaX=GATE_FEATHER_SIGMA)
 
-    if external_gate is not None:
-        gate_source_raw = external_gate
-    else:
-        gate_source_raw = recoverability_map_raw
-
-    # Feather whichever gate is actually being used -- see GATE_FEATHER_SIGMA
-    # note above. recoverability_classification (the discrete classical 0/1/2
-    # map) is returned unfeathered and un-substituted either way, since it's
-    # for logging/comparison, not for multiplying into pixels.
-    recoverability_map = cv2.GaussianBlur(
-        gate_source_raw, ksize=(0, 0), sigmaX=GATE_FEATHER_SIGMA
-    )
-
-    return recoverability_map, recoverability_classification, illumination_delta, color_delta
+    return recoverability_map, recoverability_classification, illumination_delta, color_delta_a, color_delta_b
 
 
-def apply_oracle_guided_correction(orig_img, recoverability_map, illumination_delta, color_delta):
+def apply_oracle_guided_correction(orig_img, oracle_aligned, recoverability_map,
+                                    illumination_delta, color_delta_a, color_delta_b):
     """
     Applies Oracle-guided pixel correction to the ORIGINAL, gated by
     recoverability. Runs directly on the raw original -- deliberately bypasses
-    the existing Vision-region/protect/do-no-harm pipeline (see handoff Step 3):
-    this is an isolated read on what Oracle-guided correction alone produces.
+    the existing Vision-region/protect pipeline entirely for this test.
 
-    L_new = L_orig + illumination_delta * gate
-    b_new = b_orig + color_delta * gate
+    FIXED THIS SESSION -- two real bugs, found on a real exterior photo test
+    (not theoretical): the corrected sky ended up MORE saturated (HSV S=198)
+    than even Oracle itself (S=150), against an Original of S=68.
 
-    Near-white LAB-gamut caveat (see handoff Step 3 note): at very high target
-    L values, achievable chroma compresses. We clip L to [0, 100] and b to LAB's
-    valid range, then flag (not silently fix) any region that got clipped so it
-    shows up as a candidate washed-out artifact in the render-and-look check.
+    Bug 1: only L and b were being moved; 'a' stayed fixed at the Original's
+    value. Confirmed Oracle's own 'a' differs from Original's by a real
+    amount (+7 in the sky test case) -- combining Original's 'a' with
+    Oracle's L/b produces a LAB coordinate that belongs to NEITHER image.
+    Fixed by moving all three channels together, same gate.
+
+    Bug 2 (the actual overshoot-prevention fix, kept even after fixing bug 1,
+    since gate<1.0 blending plus feathering can still occasionally produce a
+    per-pixel value outside either endpoint): every channel is now hard-
+    clamped, per-pixel, to [min(orig, oracle), max(orig, oracle)]. This is
+    the direct implementation of "the corrected image should never look like
+    a DIFFERENT captured moment than either the Original or Oracle" -- it
+    makes an overshoot like the one found this session structurally
+    impossible, not just less likely.
+
+    oracle_aligned: needed now (wasn't before) so the clamp bounds can be
+    computed per-pixel against Oracle's actual LAB values, not just its delta.
 
     Returns:
         corrected_img: BGR uint8 image
-        clip_report: dict with fraction of pixels clipped in L and b, for
-            logging -- per gotcha #2, always check the actual render, this
-            just tells you where to look.
+        clip_report: dict with fraction of pixels clamped in each channel,
+            for logging -- per gotcha #2, always check the actual render,
+            this just tells you where to look. NOTE: "clipped" here now
+            means "hit the [min(orig,oracle),max(orig,oracle)] clamp",
+            not the old 0-255 clamp -- a meaningfully more informative
+            signal (it tells you the raw math wanted to go somewhere
+            neither image supports, not just that it hit format limits).
     """
     orig_lab = cv2.cvtColor(orig_img, cv2.COLOR_BGR2LAB).astype(np.float32)
+    oracle_lab = cv2.cvtColor(oracle_aligned, cv2.COLOR_BGR2LAB).astype(np.float32)
     L_orig, a_orig, b_orig = cv2.split(orig_lab)
+    L_oracle, a_oracle, b_oracle = cv2.split(oracle_lab)
 
     L_new_raw = L_orig + illumination_delta * recoverability_map
-    b_new_raw = b_orig + color_delta * recoverability_map
+    a_new_raw = a_orig + color_delta_a * recoverability_map
+    b_new_raw = b_orig + color_delta_b * recoverability_map
 
-    L_new = np.clip(L_new_raw, 0, 255)
-    b_new = np.clip(b_new_raw, 0, 255)
+    def clamp_to_span(new_raw, orig_ch, oracle_ch):
+        lo = np.minimum(orig_ch, oracle_ch)
+        hi = np.maximum(orig_ch, oracle_ch)
+        clamped = np.clip(new_raw, lo, hi)
+        clamped = np.clip(clamped, 0, 255)  # also enforce valid image range
+        return clamped, float(np.mean(new_raw != clamped))
+
+    L_new, L_clipped_frac = clamp_to_span(L_new_raw, L_orig, L_oracle)
+    a_new, a_clipped_frac = clamp_to_span(a_new_raw, a_orig, a_oracle)
+    b_new, b_clipped_frac = clamp_to_span(b_new_raw, b_orig, b_oracle)
 
     clip_report = {
-        "L_clipped_fraction": float(np.mean(L_new_raw != L_new)),
-        "b_clipped_fraction": float(np.mean(b_new_raw != b_new)),
+        "L_clipped_fraction": L_clipped_frac,
+        "a_clipped_fraction": a_clipped_frac,
+        "b_clipped_fraction": b_clipped_frac,
     }
 
-    corrected_lab = cv2.merge([L_new, a_orig, b_new]).astype(np.uint8)
+    corrected_lab = cv2.merge([L_new, a_new, b_new]).astype(np.uint8)
     corrected_img = cv2.cvtColor(corrected_lab, cv2.COLOR_LAB2BGR)
 
     return corrected_img, clip_report
@@ -405,11 +426,11 @@ def run_oracle_driven_pipeline(orig_img, oracle_img, log_prefix="[ORACLE-DRIVEN]
             vision_gate_comparison = {"shadow_mode": False, "used_for_correction": "vision"}
             print(f"{log_prefix} [VISION-GATE LIVE] Vision gate driving correction (shadow mode off)")
 
-    recov_map, recov_class, illum_delta, color_delta = compute_oracle_guided_deltas(
+    recov_map, recov_class, illum_delta, color_delta_a, color_delta_b = compute_oracle_guided_deltas(
         orig_img, oracle_aligned, external_gate=external_gate
     )
     corrected_img, clip_report = apply_oracle_guided_correction(
-        orig_img, recov_map, illum_delta, color_delta
+        orig_img, oracle_aligned, recov_map, illum_delta, color_delta_a, color_delta_b
     )
 
     total_px = recov_class.size
@@ -437,6 +458,100 @@ def run_oracle_driven_pipeline(orig_img, oracle_img, log_prefix="[ORACLE-DRIVEN]
           f"b={clip_report['b_clipped_fraction']*100:.2f}%")
 
     return corrected_img, report
+
+
+def apply_saturation_cap(orig_img, corrected_img, restricted_mask, max_increase_ratio=1.15,
+                          feather_sigma=None, mask_grid_cols=None):
+    """
+    Scoped saturation ceiling -- applies ONLY inside restricted_mask
+    (e.g. from level2_sky_grass_mask.rasterize_sky_veg_mask), not
+    globally. See conversation: a global cap would recreate the exact
+    over-defensive "Protect" failure mode found earlier this session (the
+    wall-seam/column-wedge artifacts) by restricting correction on content
+    -- wood tone, fabric, a genuinely color-cast wall -- that was never the
+    actual risk and that the governing Oracle prompts explicitly permit
+    correcting. The risk this addresses is specifically named in the
+    exterior prompt (Weather/Sky character/Cloud formations under Identity
+    Preservation; the standalone Vegetation section) -- nowhere else.
+
+    max_increase_ratio: corrected HSV saturation, inside the masked region,
+        is capped at this multiple of the ORIGINAL's saturation at that
+        pixel. Default 1.15 (+15%) is a starting point, not a measured
+        constant -- there is no real-batch data behind this number yet.
+        Revisit once a batch of real exterior photos has been reviewed.
+
+    This is independent of Oracle's own quality -- unlike the
+    [min(orig,oracle),max(orig,oracle)] clamp added earlier this session
+    (which stops the correction from exceeding Oracle but does nothing if
+    Oracle itself is already too saturated), this cap is measured against
+    the ORIGINAL only, so it still holds even when a future Oracle render
+    is flawed in a way nobody caught ahead of time.
+
+    feather_sigma: if None, DERIVED from mask_grid_cols when given (see
+        below), else falls back to GATE_FEATHER_SIGMA. NOT safe to leave
+        at a small fixed constant when the mask came from a coarse grid --
+        found live on a real test: a single wrong grid cell (24-wide grid,
+        ~238px cells on a real photo) left a hard, clearly visible blocky
+        patch, because a 15px feather cannot meaningfully soften a 238px
+        cell against its neighbors. A bbox-sourced mask and a grid-sourced
+        mask need different feather scales; this isn't a one-time tuning
+        fix, it's a structural fact about the mask's own resolution.
+
+    mask_grid_cols: if restricted_mask came from a GRID_COLS x GRID_ROWS
+        classification (level2_sky_grass_mask), pass GRID_COLS here
+        so feather_sigma can be derived proportionally to actual cell size
+        (half a cell width) rather than guessed. This makes an isolated
+        misclassified cell blend into its neighbors instead of showing as
+        a hard block -- the correct response to an occasional wrong cell
+        is for it to fade in gracefully, not to trust every cell as
+        precisely correct.
+
+    Returns: corrected BGR image with the cap applied, and a report dict.
+    """
+    if feather_sigma is None:
+        if mask_grid_cols:
+            cell_width_px = restricted_mask.shape[1] / float(mask_grid_cols)
+            feather_sigma = cell_width_px / 2.0
+        else:
+            feather_sigma = GATE_FEATHER_SIGMA
+
+    mask = cv2.GaussianBlur(restricted_mask.astype(np.float32), ksize=(0, 0), sigmaX=feather_sigma)
+    mask = np.clip(mask, 0.0, 1.0)
+
+    if mask.max() < 1e-6:
+        # No sky/vegetation regions given (module disabled, call failed, or
+        # genuinely none in this photo) -- apply no cap at all, per this
+        # module's "empty regions = apply no cap" contract. Do NOT
+        # interpret an empty mask as "cap everything" or "cap nothing
+        # differently than before" -- it must be a true no-op.
+        return corrected_img, {"applied": False, "reason": "empty_mask", "pixels_capped_fraction": 0.0}
+
+    orig_hsv = cv2.cvtColor(orig_img, cv2.COLOR_BGR2HSV).astype(np.float32)
+    corr_hsv = cv2.cvtColor(corrected_img, cv2.COLOR_BGR2HSV).astype(np.float32)
+
+    orig_s = orig_hsv[:, :, 1]
+    corr_s = corr_hsv[:, :, 1]
+    ceiling = orig_s * max_increase_ratio
+
+    over_ceiling = corr_s > ceiling
+    # Blend toward the ceiling by mask strength rather than hard-clip, so a
+    # partially-confident mask edge doesn't produce a visible saturation
+    # step -- consistent with every other gate in this pipeline being a
+    # continuous blend, not a hard switch.
+    capped_s = corr_s * (1 - mask) + np.minimum(corr_s, ceiling) * mask
+
+    pixels_capped_fraction = float((over_ceiling & (mask > 0.5)).mean())
+
+    new_hsv = corr_hsv.copy()
+    new_hsv[:, :, 1] = capped_s
+    new_hsv = np.clip(new_hsv, 0, 255).astype(np.uint8)
+    result = cv2.cvtColor(new_hsv, cv2.COLOR_HSV2BGR)
+
+    return result, {
+        "applied": True,
+        "max_increase_ratio": max_increase_ratio,
+        "pixels_capped_fraction": pixels_capped_fraction,
+    }
 
 
 # NOTE: different-room aggregate-style path is NOT implemented here.
