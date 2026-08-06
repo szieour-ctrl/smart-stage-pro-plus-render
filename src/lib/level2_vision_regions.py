@@ -184,6 +184,29 @@ fireplace surround bounded tightly to just the stone material, not \
 padded out to include a nearby lamp or table (dark_stone, protect, \
 preserve_black_depth).
 
+CRITICAL, CONFIRMED UNSTABLE ACROSS SEPARATE RUNS OF THE SAME PHOTO: the \
+identical dark mahogany dining set was tagged shadow_recovery/primary in \
+one run ("severely underexposed... needs targeted shadow recovery") and \
+no_change/protect in another ("intentionally very dark-toned... should \
+be protected from shadow lifting") -- opposite judgments, nothing about \
+the actual photo changed between runs. The question that decides this is \
+NOT "is this object dark-colored" -- almost everything in a dim room \
+looks dark regardless of its actual material tone. The question is: is \
+the ROOM ITSELF, overall, well-exposed or underexposed? If the room \
+reads dim/underexposed overall (dark walls, most of the frame in shadow \
+-- the common state of an unedited real estate photo before correction), \
+dark furniture within it is virtually always underexposed FURNITURE that \
+needs the same correction as the rest of the dark room -- tag it \
+shadow_recovery, matching priority to how much it stands out (primary if \
+it's a dominant piece the room lift won't fully reach). Reserve \
+protect/preserve_black_depth for genuinely black material sitting in an \
+otherwise NORMALLY-EXPOSED room -- a black countertop under good kitchen \
+lighting, black leather in a bright, already-well-lit living room. \
+Protecting dark furniture from correction is the rare exception for a \
+room that doesn't need much correction to begin with, not the default -- \
+it should not fire just because a room happens to be dim, which is most \
+real estate photos before correction.
+
 Do NOT include ordinary, evenly-lit content that just needs whatever \
 uniform correction the rest of the frame gets -- that's the default \
 behavior and doesn't need a region entry.
