@@ -554,6 +554,104 @@ def apply_saturation_cap(orig_img, corrected_img, restricted_mask, max_increase_
     }
 
 
+def smooth_deltas_in_mask(illum_delta, color_delta_a, color_delta_b, ceiling_mask,
+                           extra_blur_sigma=None, min_blur_sigma=40.0):
+    """
+    Re-blurs the three Oracle delta maps at a MUCH larger sigma than the
+    pipeline's default (ILLUM_BLUR_SIGMA/COLOR_BLUR_SIGMA=15), scoped to
+    ceiling_mask only, then blended back in proportional to mask
+    confidence. Built for a real, confirmed-repeatable artifact: Flux
+    Kontext's own interior prompt explicitly asks it to preserve
+    "believable luminance gradients" on the ceiling (deliberately, so it
+    doesn't render a flat, sterile ceiling) -- but this pipeline uses
+    Oracle purely as a source of PER-PIXEL DELTAS against the Original,
+    not as a standalone image. Flux's own invented small-scale ceiling
+    variation doesn't spatially match the Original's real lighting
+    pattern, so subtracting the two directly produces visible blotchy,
+    uneven correction on what should read as one continuous painted
+    plane -- confirmed on two separate real photos across two separate
+    sessions, not a one-off render artifact.
+
+    NOT fixed by touching the Oracle prompt: that would reintroduce the
+    exact "Protect"-style over-restraint this pipeline already moved
+    away from once (a deliberately flat ceiling looks cheap/fake as a
+    standalone render). The fix belongs at the delta-APPLICATION stage,
+    where the pipeline decides what to trust from Oracle's render, not
+    at generation -- Flux stays free to render however it wants.
+
+    WHY THIS IS A DIFFERENT SIGMA DERIVATION THAN apply_saturation_cap's
+    mask_grid_cols-based feather_sigma: that function softens the EDGE
+    of a mask (roughly cell-width scale) so a grid boundary doesn't show
+    as a hard step. This function needs the opposite problem solved --
+    heavy smoothing across the WHOLE INTERIOR of a large surface, to
+    average out Oracle's own invented small-scale noise while preserving
+    the surface's real, coarse gradient (brighter near a fixture, dimmer
+    at a far corner). The right scale for that is proportional to the
+    surface's own measured size, not the grid resolution used to detect
+    it.
+
+    ceiling_mask: raw (unfeathered) float32/bool mask, same H x W as the
+        delta maps, from level2_ceiling_mask.rasterize_ceiling_mask(). An
+        empty/all-zero mask (module disabled, call failed, or genuinely
+        no ceiling in this photo) is a true no-op -- returns the input
+        deltas unchanged, per this module's "empty mask = apply nothing"
+        contract, same as apply_saturation_cap.
+
+    extra_blur_sigma: if None, derived from the mask's own measured
+        extent (sqrt of masked pixel area) rather than a fixed constant
+        -- a ceiling spanning most of a wide-angle frame needs much
+        heavier smoothing than a small ceiling sliver in a tight shot.
+        This is a simple, defensible proxy for "how big is this
+        surface," not a measured constant -- revisit once a real batch
+        shows it over- or under-smoothing, same discipline as every
+        other unmeasured constant in this pipeline (see
+        apply_saturation_cap's max_increase_ratio).
+
+    min_blur_sigma: floor so a small/fragmented ceiling detection doesn't
+        get a near-zero derived sigma and effectively skip smoothing --
+        the entire premise here is "ceilings need MORE smoothing than
+        the pipeline's default," not "scale it down to nothing for small
+        ones." 40.0 (roughly 2.5x the pipeline's own ILLUM_BLUR_SIGMA) is
+        a starting floor, not a measured constant.
+
+    Returns (illum_delta_out, color_delta_a_out, color_delta_b_out, report).
+    On an empty mask, the three deltas are returned UNCHANGED (same
+    object references) and report["applied"] is False.
+    """
+    mask = np.clip(ceiling_mask.astype(np.float32), 0.0, 1.0)
+
+    if mask.max() < 1e-6:
+        return illum_delta, color_delta_a, color_delta_b, {
+            "applied": False, "reason": "empty_mask", "extra_blur_sigma": None,
+        }
+
+    if extra_blur_sigma is None:
+        masked_area_px = float(mask.sum())
+        extra_blur_sigma = max(min_blur_sigma, np.sqrt(masked_area_px) * 0.5)
+
+    # Feather the mask itself too, same reasoning as every other gate in
+    # this pipeline (apply_saturation_cap, GATE_FEATHER_SIGMA) -- a hard
+    # mask boundary would otherwise produce a visible seam where heavily-
+    # smoothed ceiling delta meets normally-smoothed wall delta right at
+    # the edge.
+    feathered_mask = cv2.GaussianBlur(mask, ksize=(0, 0), sigmaX=GATE_FEATHER_SIGMA)
+    feathered_mask = np.clip(feathered_mask, 0.0, 1.0)
+
+    def _blend(delta):
+        heavily_smoothed = cv2.GaussianBlur(delta, ksize=(0, 0), sigmaX=extra_blur_sigma)
+        return delta * (1 - feathered_mask) + heavily_smoothed * feathered_mask
+
+    illum_out = _blend(illum_delta)
+    a_out = _blend(color_delta_a)
+    b_out = _blend(color_delta_b)
+
+    return illum_out, a_out, b_out, {
+        "applied": True,
+        "extra_blur_sigma": float(extra_blur_sigma),
+        "masked_area_fraction": float(mask.mean()),
+    }
+
+
 # NOTE: different-room aggregate-style path is NOT implemented here.
 # Per handoff Step 2, that case needs a separate mechanism entirely
 # (global median-L / saturation / warmth calibration, no spatial diff).
