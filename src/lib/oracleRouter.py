@@ -206,13 +206,24 @@ def run_oracle_interior(source_path: str, output_path: str, orig_img) -> dict:
                 "mean_abs_diff": float(diff.mean()),
                 "used_for_correction": "classical",
             }
+            # file=sys.stderr -- NOT plain print(). This module's own CLI
+            # contract (see docstring) requires stdout to contain ONLY the
+            # final json.dumps(result) call; a stray stdout line here
+            # breaks correctPipeline.js's JSON.parse(stdout.trim()) with
+            # exactly the failure mode this line previously caused
+            # ("Unexpected token O in JSON at position 1" -- '[' parsed as
+            # a valid array-open token, then this line's literal text hit
+            # as the next token). Confirmed on a real batch run, not
+            # theoretical -- fixed here, not just diagnosed.
             print(f"[ORACLE-ROUTER] [VISION-GATE SHADOW MODE] mean |vision_gate - classical_gate| = "
-                  f"{vision_gate_comparison['mean_abs_diff']:.3f} (classical still driving correction)")
+                  f"{vision_gate_comparison['mean_abs_diff']:.3f} (classical still driving correction)",
+                  file=sys.stderr)
         else:
             external_gate = vision_gate_raw
             gate_source = "vision"
             vision_gate_comparison = {"shadow_mode": False, "used_for_correction": "vision"}
-            print(f"[ORACLE-ROUTER] [VISION-GATE LIVE] Vision gate driving correction (shadow mode off)")
+            print(f"[ORACLE-ROUTER] [VISION-GATE LIVE] Vision gate driving correction (shadow mode off)",
+                  file=sys.stderr)
 
     routing_report["steps"]["vision_gate_comparison"] = vision_gate_comparison
 
