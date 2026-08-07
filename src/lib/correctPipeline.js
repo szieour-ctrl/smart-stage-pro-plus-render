@@ -25,7 +25,19 @@ const { spawn } = require("child_process");
 
 const { notifyWebhook } = require("./notify");
 
-const CORRECT_PY = path.join(__dirname, "smartCorrect.py");
+// Points at oracleRouter.py, not smartCorrect.py directly, as of this
+// change -- oracleRouter.py has the identical CLI contract (--source,
+// --output, JSON on stdout, error JSON on stderr + exit 1) and internally
+// routes each image to either the Oracle-driven interior pipeline or
+// straight through to this same smartCorrect.py for exteriors / low-
+// confidence scene classification. No other change needed here for the
+// CLI contract itself -- see oracleRouter.py's own docstring for the
+// full routing rationale. correctOneImage() below does not pass
+// --lens-mode or --intensity, same as it never did for smartCorrect.py
+// directly -- oracleRouter.py's argparse defaults (auto / 1.0) apply and
+// get forwarded to smartCorrect.py on any classical-path call, so this
+// is not a behavior change.
+const CORRECT_PY = path.join(__dirname, "oracleRouter.py");
 
 function base64ToExt(mimeType) {
   if (!mimeType) return ".jpg";
