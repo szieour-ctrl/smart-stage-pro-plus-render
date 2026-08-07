@@ -78,6 +78,7 @@ from oracleCorrection import (  # noqa: E402
     align_oracle_to_original,
     compute_oracle_guided_deltas,
     apply_oracle_guided_correction,
+    compute_recoverability_map,
     MIN_ALIGNMENT_INLIERS,
     MAX_MEAN_RESIDUAL_PX,
 )
@@ -160,12 +161,60 @@ def run_oracle_interior(source_path: str, output_path: str, orig_img) -> dict:
     # box-filter gate still drives the actual correction -- external_gate
     # stays None below in that case, matching run_oracle_driven_pipeline's
     # own shadow-mode logic in oracleCorrection.py.
+    #
+    # SHADOW-MODE COMPARISON LOGGING (added -- see handoff open item #3):
+    # oracleCorrection.run_oracle_driven_pipeline() computes and logs
+    # mean |vision_gate - classical_gate| whenever it's given vision_gate_
+    # regions, specifically so a real batch has something to review before
+    # deciding whether RECOVERABILITY_SHADOW_MODE should ever flip to
+    # false. This router does NOT call that function directly (see below)
+    # -- it reimplements the same steps inline instead, so this logging
+    # has to be reimplemented here too, or a real batch run through this
+    # router produces zero comparison data despite shadow mode being on.
+    # Deliberately NOT calling run_oracle_driven_pipeline() itself here:
+    # that function does its own alignment internally via
+    # align_oracle_to_original(), and this router already has
+    # oracle_aligned from the alignment step above -- calling it would
+    # mean a SECOND, independently-seeded RANSAC pass on the same image
+    # pair, which is not guaranteed to reproduce identical inliers/
+    # residuals as the first (cv2.RANSAC has its own internal randomness).
+    # Reusing the alignment this router already computed, once, is the
+    # more correct choice here, not just a shortcut.
     vision_result, vision_report = judge_recoverability(orig_img, oracle_aligned)
     routing_report["steps"]["vision_recoverability"] = vision_report
 
     external_gate = None
-    if not RECOVERABILITY_SHADOW_MODE and vision_result.get("regions"):
-        external_gate = rasterize_vision_gate(vision_result["regions"], orig_img.shape)
+    gate_source = "classical"
+    vision_gate_comparison = None
+
+    # Only log/act on a gate if Vision actually returned something usable
+    # this run -- an empty regions list from a genuine failure (disabled,
+    # missing key, timeout, bad JSON -- see judge_recoverability's own
+    # contract) would just rasterize to an uninformative all-1.0 gate and
+    # compare that against the classical gate, adding noise rather than
+    # signal to the review data.
+    if vision_result.get("error") is None:
+        vision_gate_raw = rasterize_vision_gate(vision_result["regions"], orig_img.shape)
+
+        if RECOVERABILITY_SHADOW_MODE:
+            # Compute classical gate too, purely for comparison logging --
+            # classical gate is what will actually be used below.
+            classical_raw, _ = compute_recoverability_map(orig_img)
+            diff = np.abs(vision_gate_raw - classical_raw)
+            vision_gate_comparison = {
+                "shadow_mode": True,
+                "mean_abs_diff": float(diff.mean()),
+                "used_for_correction": "classical",
+            }
+            print(f"[ORACLE-ROUTER] [VISION-GATE SHADOW MODE] mean |vision_gate - classical_gate| = "
+                  f"{vision_gate_comparison['mean_abs_diff']:.3f} (classical still driving correction)")
+        else:
+            external_gate = vision_gate_raw
+            gate_source = "vision"
+            vision_gate_comparison = {"shadow_mode": False, "used_for_correction": "vision"}
+            print(f"[ORACLE-ROUTER] [VISION-GATE LIVE] Vision gate driving correction (shadow mode off)")
+
+    routing_report["steps"]["vision_gate_comparison"] = vision_gate_comparison
 
     recov_map, recov_class, illum_delta, color_delta_a, color_delta_b = compute_oracle_guided_deltas(
         orig_img, oracle_aligned, external_gate=external_gate
@@ -183,6 +232,7 @@ def run_oracle_interior(source_path: str, output_path: str, orig_img) -> dict:
     return {
         "oracleRouting": routing_report,
         "level0Scene": "interior",
+        "gateSource": gate_source,
         "recoverabilityPct": {
             "red": 100.0 * (recov_class == 0).sum() / total_px,
             "yellow": 100.0 * (recov_class == 1).sum() / total_px,
