@@ -79,6 +79,7 @@ from oracleCorrection import (  # noqa: E402
     compute_oracle_guided_deltas,
     apply_oracle_guided_correction,
     compute_recoverability_map,
+    smooth_deltas_in_mask,
     MIN_ALIGNMENT_INLIERS,
     MAX_MEAN_RESIDUAL_PX,
 )
@@ -86,6 +87,11 @@ from level2_vision_recoverability import (  # noqa: E402
     judge_recoverability,
     rasterize_vision_gate,
     SHADOW_MODE as RECOVERABILITY_SHADOW_MODE,
+)
+from level2_ceiling_mask import (  # noqa: E402
+    identify_ceiling,
+    rasterize_ceiling_mask,
+    SHADOW_MODE as CEILING_MASK_SHADOW_MODE,
 )
 
 SMARTCORRECT_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "smartCorrect.py")
@@ -230,6 +236,34 @@ def run_oracle_interior(source_path: str, output_path: str, orig_img) -> dict:
     recov_map, recov_class, illum_delta, color_delta_a, color_delta_b = compute_oracle_guided_deltas(
         orig_img, oracle_aligned, external_gate=external_gate
     )
+
+    # CEILING-SCOPED DELTA SMOOTHING -- fixes a real, confirmed-repeatable
+    # artifact: Flux Kontext's own invented ceiling texture doesn't
+    # spatially match the Original's real lighting, producing blotchy,
+    # uneven correction on what should read as one continuous surface.
+    # Confirmed on two separate real photos across two separate sessions.
+    # See oracleCorrection.smooth_deltas_in_mask's own docstring for the
+    # full mechanism. Shadow-mode gated like every other Vision addition
+    # here -- identify_ceiling() runs and its result is always logged in
+    # routing_report, but only allowed to actually change illum_delta/
+    # color_delta_a/color_delta_b once CEILING_MASK_SHADOW_MODE is
+    # explicitly turned off after a real batch review. Deliberately NOT
+    # using print() anywhere in this block -- see this router's own
+    # history (VISION-GATE logging previously broke correctPipeline.js's
+    # JSON.parse by writing to stdout) -- all ceiling_mask visibility
+    # goes through routing_report only, which is safe by construction
+    # since it's serialized into the final json.dumps(result) call, not
+    # printed independently.
+    ceiling_result, ceiling_report = identify_ceiling(orig_img)
+    ceiling_smoothing_report = {"applied": False, "reason": "shadow_mode_or_no_grid"}
+    if ceiling_result.get("grid") and not CEILING_MASK_SHADOW_MODE:
+        ceiling_mask = rasterize_ceiling_mask(ceiling_result["grid"], orig_img.shape)
+        illum_delta, color_delta_a, color_delta_b, ceiling_smoothing_report = smooth_deltas_in_mask(
+            illum_delta, color_delta_a, color_delta_b, ceiling_mask
+        )
+    routing_report["steps"]["ceiling_mask"] = ceiling_report
+    routing_report["steps"]["ceiling_smoothing"] = ceiling_smoothing_report
+
     corrected_img, clip_report = apply_oracle_guided_correction(
         orig_img, oracle_aligned, recov_map, illum_delta, color_delta_a, color_delta_b
     )
