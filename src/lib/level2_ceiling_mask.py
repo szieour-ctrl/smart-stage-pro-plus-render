@@ -92,6 +92,35 @@ MAX_VISION_EDGE = 1568  # matches every other Vision module in this codebase
 # shadow mode without a code change if this needs to be pulled back.
 SHADOW_MODE = os.environ.get("LEVEL2_CEILING_MASK_SHADOW_MODE", "false").lower() not in ("false", "0", "")
 
+# PLAUSIBILITY CAP -- confirmed necessary on real production photos, not a
+# theoretical concern: on IMG_8291 across two separate runs, this module's
+# grid classified 68% and then 96.5% of the ENTIRE FRAME as ceiling on a
+# normal eye-level room shot with a standard flat ceiling that visually
+# occupies roughly 15-20% of the frame. That second run fed a near-whole-
+# frame "ceiling" mask into oracleCorrection.apply_illumination_floor
+# downstream, which correctly did its job (raise L toward the MLS Bright
+# target wherever the mask says architecture) on a mask that was wrong --
+# the result was ~84% of the photo pushed toward near-white, a visibly
+# blown-out image with an obvious artifact, not a subtle miscalibration.
+#
+# A malformed grid already degrades to empty per this module's existing
+# contract (see identify_ceiling's docstring) -- but a WELL-FORMED grid
+# that's simply implausible slipped through that check both times, because
+# "malformed" and "implausible" are different failure modes and only the
+# first was guarded against. This cap closes that gap: a grid whose
+# ceiling-cell fraction exceeds MAX_CEILING_COVERAGE_FRACTION is treated
+# the same as a malformed one -- logged with the actual fraction for
+# visibility, degraded to empty, never applied. 0.50 is deliberately
+# generous (a real vaulted-ceiling wide shot could legitimately approach
+# it) while still catching both confirmed failures (0.68, 0.965) with
+# margin. Tune via LEVEL2_CEILING_MAX_COVERAGE_FRACTION if a real batch
+# shows this cap is wrong in either direction -- this number has one
+# real photo's evidence behind the lower bound and zero behind the upper
+# bound, unlike GRID_COLS/GRID_ROWS which reuse an already-validated value.
+MAX_CEILING_COVERAGE_FRACTION = float(
+    os.environ.get("LEVEL2_CEILING_MAX_COVERAGE_FRACTION", "0.50")
+)
+
 # Same grid resolution as level2_sky_grass_mask.py -- reusing an already-
 # validated resolution rather than introducing a third value with no
 # real-photo evidence behind it.
@@ -211,6 +240,19 @@ def identify_ceiling(img) -> tuple:
             not isinstance(row, str) or len(row) != GRID_COLS for row in grid
         ):
             report["error"] = f"malformed_grid (expected {GRID_ROWS}x{GRID_COLS}): {str(grid)[:200]!r}"
+            return {"grid": [], "error": report["error"]}, report
+
+        total_cells = GRID_ROWS * GRID_COLS
+        ceiling_cells = sum(row.count("C") for row in grid)
+        coverage_fraction = ceiling_cells / total_cells if total_cells else 0.0
+        report["coverageFraction"] = coverage_fraction
+
+        if coverage_fraction > MAX_CEILING_COVERAGE_FRACTION:
+            report["error"] = (
+                f"implausible_coverage: grid classified {coverage_fraction*100:.1f}% of frame as "
+                f"ceiling, exceeds plausibility cap of {MAX_CEILING_COVERAGE_FRACTION*100:.0f}% -- "
+                f"degrading to empty per this module's own no-smoothing-on-suspect-data contract"
+            )
             return {"grid": [], "error": report["error"]}, report
 
         return {"grid": grid, "error": None}, report
