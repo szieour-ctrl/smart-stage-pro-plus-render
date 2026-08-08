@@ -518,7 +518,7 @@ def run_oracle_driven_pipeline(orig_img, oracle_img, log_prefix="[ORACLE-DRIVEN]
         # docstring -- CV, not Oracle, should own the brightness ceiling,
         # but that only actually drives pixels once shadow mode is off.
         _shadow_floor_result, illum_floor_shadow = apply_illumination_floor(
-            orig_img, corrected_img, recov_map, architectural_mask
+            orig_img, corrected_img, recov_map, architectural_mask, mask_grid_cols=WALL_TRIM_GRID_COLS
         )
         print(f"{log_prefix} [ILLUM-FLOOR SHADOW MODE] mean_l_before="
               f"{illum_floor_shadow.get('mean_l_before', 0.0):.1f}  "
@@ -541,7 +541,8 @@ def run_oracle_driven_pipeline(orig_img, oracle_img, log_prefix="[ORACLE-DRIVEN]
 
 
 def apply_illumination_floor(orig_img, corrected_img, recoverability_map, architectural_mask,
-                              target_l=212.0, lift_ceiling=0.65, gap_softening=38.0):
+                              target_l=212.0, lift_ceiling=0.65, gap_softening=38.0,
+                              feather_sigma=None, mask_grid_cols=None):
     """
     Raises L (brightness) toward a measured MLS Bright target wherever
     Oracle-guided correction undershot it -- CV OWNS the brightness
@@ -602,16 +603,49 @@ def apply_illumination_floor(orig_img, corrected_img, recoverability_map, archit
     for the specific failure mode confirmed above, and only on the
     surfaces where a uniform target is actually the correct standard.
 
-    architectural_mask: same feathered-by-caller raw mask contract as
-    apply_hue_fidelity_gate -- pass the union of
+    architectural_mask: raw (unfeathered) float32/bool mask, same H x W
+    as orig_img -- SAME CONTRACT AS apply_hue_fidelity_gate, not the
+    "feathered-by-caller" contract this docstring previously (and
+    incorrectly) claimed. Pass the union of
     level2_wall_trim_mask.rasterize_wall_trim_mask() and
     level2_ceiling_mask.rasterize_ceiling_mask(). An empty mask is a true
     no-op, same contract as every other mask-scoped function here.
 
+    feather_sigma / mask_grid_cols: same meaning and same derivation
+    logic as apply_hue_fidelity_gate / apply_saturation_cap -- see those
+    docstrings, not duplicated here.
+
+    FEATHERING FIX (added Aug 2026, IMG_8310 investigation): this
+    function's docstring previously said architectural_mask arrived
+    pre-feathered from the caller -- but apply_hue_fidelity_gate, the
+    sibling function this one's docstring pointed to for "same
+    contract," actually feathers the mask ITSELF internally (see its own
+    cv2.GaussianBlur call). No caller in this codebase ever feathered
+    the mask before passing it here; this function used the raw,
+    nearest-neighbor grid-cell mask directly. That was invisible as long
+    as this function's mask was always empty (wall_trim_mask failing
+    every real run) -- confirmed on a real IMG_8310 run the first time
+    wall_trim_mask actually succeeded and this floor went live: hard
+    rectangular grid-cell edges, visible directly on the corrected
+    photo, exactly matching the classification grid's cell boundaries.
+    This function now feathers architectural_mask itself, with the
+    identical cv2.GaussianBlur + mask_grid_cols-derived sigma approach
+    apply_hue_fidelity_gate already uses -- not a new technique, just
+    applying the one this codebase already validated to the one
+    function that was silently skipping it.
+
     Returns: corrected BGR image with the floor applied, and a report
     dict with the fraction of MASKED pixels the floor actually raised.
     """
-    mask = np.clip(architectural_mask.astype(np.float32), 0.0, 1.0)
+    if feather_sigma is None:
+        if mask_grid_cols:
+            cell_width_px = architectural_mask.shape[1] / float(mask_grid_cols)
+            feather_sigma = cell_width_px / 2.0
+        else:
+            feather_sigma = GATE_FEATHER_SIGMA
+
+    mask = cv2.GaussianBlur(architectural_mask.astype(np.float32), ksize=(0, 0), sigmaX=feather_sigma)
+    mask = np.clip(mask, 0.0, 1.0)
 
     if mask.max() < 1e-6:
         return corrected_img, {
@@ -1013,6 +1047,100 @@ def apply_hue_fidelity_gate(orig_img, corrected_img, architectural_mask,
         "applied": True,
         "a_reverted_fraction": a_reverted_frac,
         "b_reverted_fraction": b_reverted_frac,
+        "masked_area_fraction": float(mask.mean()),
+    }
+
+
+def apply_wall_color_anchor(orig_img, corrected_img, wall_mask, feather_sigma=None, mask_grid_cols=None):
+    """
+    Locks a/b (color) to the Original photo's own true captured values
+    everywhere inside wall_mask. corrected_img's L (brightness) passes
+    through completely unchanged; a/b inside the mask is replaced with
+    the Original's, not gated or partially blended toward it.
+
+    WHY A LOCK, NOT A GATE (added Aug 2026, IMG_8310 investigation):
+    apply_hue_fidelity_gate -- built and validated for WALL data
+    originally (see that function's own docstring evidence, real
+    IMG_8310 wall crops) -- accepts any Oracle color move that shrinks
+    toward neutral without flipping sign. That rule is correct when the
+    TARGET actually is neutral: a ceiling's true paint is white, so a
+    warm capture-lighting cast shrinking toward neutral is genuine cast
+    removal. It is the wrong rule for wall, because a wall's true paint
+    color is usually NOT neutral, and isn't supposed to become neutral --
+    "wall remains its actual beige" (or grey-blue, or whatever the
+    room's real paint color is) was the explicit requirement this
+    function exists to satisfy, not "wall becomes less colorful." A
+    shrink-toward-zero gate will happily accept an Oracle render that's
+    drifted PART of the way toward neutral even when true wall color was
+    never near neutral to begin with -- confirmed as the actual
+    mechanism behind a real production run (IMG_8310) where walls came
+    back visibly cream/tan despite the gate reporting itself as
+    "applied" with real revert activity: the gate was doing its job
+    correctly by ITS OWN rule, and its rule was the wrong one for this
+    surface.
+
+    Locking wall chroma to the Original, unconditionally, inside the
+    mask, removes that failure mode by construction rather than by
+    tuning a threshold: Oracle's a/b for wall pixels is simply never
+    used. This is a deliberately blunter tool than the ceiling gate --
+    appropriate here because "hold the true captured color" is a
+    stricter, simpler requirement than "remove a cast while allowing
+    legitimate hue shift," which is what the ceiling and non-architectural
+    surfaces (furniture, wood, fabric -- see oracleGeneration.py's Color
+    Temperature section) are each allowed to do.
+
+    NOT YET VALIDATED against a real batch -- built directly from this
+    session's IMG_8310 evidence and Sam's stated requirement, same
+    "ship shadow-first, confirm on real photos" discipline as every
+    other gate in this file. Whoever wires this into oracleRouter.py
+    should keep it behind the same WALL_TRIM_MASK_SHADOW_MODE flag the
+    hue-fidelity gate already uses, not default it live.
+
+    wall_mask: raw (unfeathered) float32/bool mask, WALL/TRIM ONLY -- do
+    NOT pass the combined wall+ceiling architectural_mask here. That
+    would lock ceiling's color too, defeating the point: ceiling should
+    still be free to move toward neutral via apply_hue_fidelity_gate,
+    called separately with a ceiling-only mask.
+
+    feather_sigma / mask_grid_cols: same meaning and derivation as
+    apply_hue_fidelity_gate -- see that docstring, not duplicated here.
+
+    Returns: corrected BGR image with wall a/b anchored to the Original,
+    and a report dict with the fraction of the frame this touched.
+    """
+    if feather_sigma is None:
+        if mask_grid_cols:
+            cell_width_px = wall_mask.shape[1] / float(mask_grid_cols)
+            feather_sigma = cell_width_px / 2.0
+        else:
+            feather_sigma = GATE_FEATHER_SIGMA
+
+    mask = cv2.GaussianBlur(wall_mask.astype(np.float32), ksize=(0, 0), sigmaX=feather_sigma)
+    mask = np.clip(mask, 0.0, 1.0)
+
+    if mask.max() < 1e-6:
+        return corrected_img, {
+            "applied": False, "reason": "empty_mask", "masked_area_fraction": 0.0,
+        }
+
+    orig_lab = cv2.cvtColor(orig_img, cv2.COLOR_BGR2LAB).astype(np.float32)
+    corr_lab = cv2.cvtColor(corrected_img, cv2.COLOR_BGR2LAB).astype(np.float32)
+
+    L_corr, a_corr, b_corr = cv2.split(corr_lab)
+    _, a_orig, b_orig = cv2.split(orig_lab)
+
+    # Feathered blend toward the Original's OWN a/b, not toward zero --
+    # this is the entire difference from apply_hue_fidelity_gate. No
+    # per-pixel "allowed" test: inside the mask, Original's true color
+    # wins outright, scaled only by mask confidence at the edge.
+    a_new = a_corr * (1 - mask) + a_orig * mask
+    b_new = b_corr * (1 - mask) + b_orig * mask
+
+    new_lab = cv2.merge([L_corr, np.clip(a_new, 0, 255), np.clip(b_new, 0, 255)]).astype(np.uint8)
+    result = cv2.cvtColor(new_lab, cv2.COLOR_LAB2BGR)
+
+    return result, {
+        "applied": True,
         "masked_area_fraction": float(mask.mean()),
     }
 
