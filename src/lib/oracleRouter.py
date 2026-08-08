@@ -176,6 +176,25 @@ def run_oracle_interior(source_path: str, output_path: str, orig_img) -> dict:
     oracle_aligned, alignment_report = align_oracle_to_original(orig_img, oracle_img)
     routing_report["steps"]["alignment"] = alignment_report
 
+    # DIAGNOSTIC ONLY -- added to directly answer one question: does the
+    # rectangular-artifact issue seen on IMG_8291 originate in Flux
+    # Kontext's own render, or somewhere in this pipeline's own code?
+    # Every file between generation and the final corrected_img has now
+    # been checked (oracleRouter.py, oracleCorrection.py,
+    # level2_ceiling_mask.py, level2_wall_trim_mask.py,
+    # correctPipeline.js, oracleGeneration.py) and none of them draw
+    # anything onto an image -- the one thing never actually inspected is
+    # what Flux itself returned. Same opt-in discipline as
+    # DEBUG_REGIONS_OVERLAY in correctPipeline.js: writes a SEPARATE
+    # file, never touches corrected_img, off by default so this costs
+    # nothing in normal operation. Same file-naming convention (suffix
+    # next to output_path) so it's easy to find.
+    if os.environ.get("ORACLE_DEBUG_SAVE_RENDER", "false").lower() not in ("false", "0", ""):
+        debug_render_path = os.path.splitext(output_path)[0] + "_oracle_render_debug.jpg"
+        cv2.imwrite(debug_render_path, oracle_aligned)
+        print(f"[ORACLE-ROUTER] [DEBUG] saved raw Oracle render to {debug_render_path}",
+              file=sys.stderr)
+
     alignment_ok = (
         alignment_report["n_inliers"] >= MIN_ALIGNMENT_INLIERS
         and alignment_report["mean_residual_px"] is not None
