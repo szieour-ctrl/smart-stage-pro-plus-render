@@ -78,6 +78,7 @@ from oracleCorrection import (  # noqa: E402
     align_oracle_to_original,
     compute_oracle_guided_deltas,
     apply_oracle_guided_correction,
+    apply_hue_fidelity_gate,
     compute_recoverability_map,
     smooth_deltas_in_mask,
     MIN_ALIGNMENT_INLIERS,
@@ -92,6 +93,12 @@ from level2_ceiling_mask import (  # noqa: E402
     identify_ceiling,
     rasterize_ceiling_mask,
     SHADOW_MODE as CEILING_MASK_SHADOW_MODE,
+)
+from level2_wall_trim_mask import (  # noqa: E402
+    identify_wall_trim,
+    rasterize_wall_trim_mask,
+    GRID_COLS as WALL_TRIM_GRID_COLS,
+    SHADOW_MODE as WALL_TRIM_MASK_SHADOW_MODE,
 )
 
 SMARTCORRECT_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "smartCorrect.py")
@@ -268,6 +275,58 @@ def run_oracle_interior(source_path: str, output_path: str, orig_img) -> dict:
         orig_img, oracle_aligned, recov_map, illum_delta, color_delta_a, color_delta_b
     )
     routing_report["steps"]["clip"] = clip_report
+
+    # WALL/TRIM + CEILING ARCHITECTURAL MASK -- feeds the hue-fidelity
+    # gate below. Ceiling identification already ran above for the
+    # smoothing step; reuse that result rather than calling
+    # identify_ceiling() a second time for the same photo.
+    wall_trim_result, wall_trim_report = identify_wall_trim(orig_img)
+    routing_report["steps"]["wall_trim_mask"] = wall_trim_report
+
+    wall_mask = (
+        rasterize_wall_trim_mask(wall_trim_result["grid"], orig_img.shape)
+        if wall_trim_result.get("grid")
+        else np.zeros(orig_img.shape[:2], dtype=np.float32)
+    )
+    ceiling_mask_for_arch = (
+        rasterize_ceiling_mask(ceiling_result["grid"], orig_img.shape)
+        if ceiling_result.get("grid")
+        else np.zeros(orig_img.shape[:2], dtype=np.float32)
+    )
+    architectural_mask = np.clip(wall_mask + ceiling_mask_for_arch, 0.0, 1.0)
+
+    # HUE-FIDELITY GATE -- validated against two separate real photos this
+    # session (IMG_8310, two different Oracle generations of the same
+    # room): a neutral wall's Oracle render can carry a real hue-family
+    # shift (measured as a visible warm/khaki cast both times, confirmed
+    # by direct RGB swatch comparison against the correct target, not
+    # just LAB deltas). The existing [min,max] clamp does nothing to
+    # catch this since it only bounds magnitude, not whether Oracle's own
+    # color endpoint is itself valid. See
+    # oracleCorrection.apply_hue_fidelity_gate's docstring for the full
+    # evidence and mechanism. Shadow-mode gated via
+    # WALL_TRIM_MASK_SHADOW_MODE -- computed and logged every run, only
+    # allowed to change corrected_img once that flag is explicitly turned
+    # off after review. Deliberately NOT wiring in apply_illumination_floor
+    # in this patch -- that fix depends on the same wall_trim_mask Vision
+    # call but is a separate, not-yet-revalidated piece; keeping this
+    # patch to exactly the gate that's been confirmed twice.
+    if WALL_TRIM_MASK_SHADOW_MODE:
+        _hue_shadow_result, hue_gate_shadow = apply_hue_fidelity_gate(
+            orig_img, corrected_img, architectural_mask, mask_grid_cols=WALL_TRIM_GRID_COLS
+        )
+        print(f"[ORACLE-ROUTER] [HUE-GATE SHADOW MODE] architectural coverage="
+              f"{hue_gate_shadow.get('masked_area_fraction', 0.0)*100:.1f}%  "
+              f"would-revert a={hue_gate_shadow.get('a_reverted_fraction', 0.0)*100:.1f}% "
+              f"b={hue_gate_shadow.get('b_reverted_fraction', 0.0)*100:.1f}% "
+              f"(NOT applied -- shadow mode, corrected_img unchanged)", file=sys.stderr)
+    else:
+        corrected_img, hue_gate_shadow = apply_hue_fidelity_gate(
+            orig_img, corrected_img, architectural_mask, mask_grid_cols=WALL_TRIM_GRID_COLS
+        )
+        print(f"[ORACLE-ROUTER] [HUE-GATE LIVE] applied to corrected_img "
+              f"(shadow mode off)", file=sys.stderr)
+    routing_report["steps"]["hue_fidelity_gate"] = hue_gate_shadow
 
     ok = cv2.imwrite(output_path, corrected_img)
     if not ok:
