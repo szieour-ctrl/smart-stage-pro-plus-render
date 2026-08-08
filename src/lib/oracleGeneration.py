@@ -76,35 +76,6 @@ Oracle Scene Render -- a digitally altered image. That's not a caveat
 for this module to enforce (see oracleCorrection.py's own note on this),
 it's a fact about anything this function returns, and it must be labeled
 wherever shown, per the settled position this project already reached.
-
-SEED PINNING (added Aug 2026, IMG_8310 investigation): fal.ai's own
-docs state "the same seed and the same prompt given to the same
-version of the model will output the same image every time." Before
-this change, no seed was sent, so every call got a fresh, unpinned
-render -- confirmed in production via two runs of the SAME photo one
-hour apart with two different fal_request_ids and measurably different
-clip fractions (L_clipped_fraction 0.335 vs 0.348). Since
-oracleCorrection.py's classical correction (gateSource="classical")
-diffs the Original against whatever this module returns, that
-unpinned variance was flowing straight into the "corrected" output as
-run-to-run noise -- indistinguishable, without this fix, from noise
-caused by an actual code change to a Vision/masking module elsewhere
-in the pipeline. That confound is the real problem this fixes: it's
-what makes A/B-testing any OTHER pipeline change (e.g.
-level2_wall_trim_mask.py's grid-parsing fixes) trustworthy, since the
-render itself is now held constant across reruns of the same photo.
-
-_derive_seed() hashes the Original photo's own bytes (SHA-256,
-truncated to 32 bits) rather than using one fixed seed for every
-request. This keeps the property that matters -- the SAME photo always
-gets the SAME render, so reruns are comparable -- without collapsing
-an entire multi-photo batch onto one seed, which would be a different
-and unwanted kind of uniformity (there's no reason two different
-listing photos should be pinned to identical Flux noise). Deliberately
-keyed on image bytes, not on a filename or listing ID this module
-doesn't have visibility into -- the actual pixels are the only input
-this function receives that uniquely and stably identifies "the same
-photo" across reruns.
 """
 
 import os
@@ -112,7 +83,6 @@ import json
 import time
 import random
 import base64
-import hashlib
 import logging
 import urllib.error
 import urllib.request
@@ -327,24 +297,6 @@ Final Objective
 The finished image should appear indistinguishable from a professionally photographed and professionally edited architectural real estate photograph captured under the exact same physical conditions. Improve only the quality of the photograph. Never improve the property."""
 
 
-def _derive_seed(image_bytes: bytes) -> int:
-    """
-    Deterministic per-photo seed for fal.ai's Flux Kontext `seed`
-    parameter -- see module docstring's "SEED PINNING" section for why
-    this exists. SHA-256 over the Original photo's own bytes, truncated
-    to the first 4 bytes (32 bits, big-endian) as an unsigned int. Not
-    cryptographic use -- SHA-256 here purely for a stable, well-distributed
-    mapping from arbitrary photo bytes to a fixed-width integer, nothing
-    about collision resistance matters for this purpose. The SAME photo
-    (identical bytes) always yields the SAME seed, so reruns of one
-    photo are comparable; different photos get different seeds because
-    their bytes differ, so a batch doesn't collapse onto one render
-    style.
-    """
-    digest = hashlib.sha256(image_bytes).digest()
-    return int.from_bytes(digest[:4], "big")
-
-
 def _detect_mime_type(image_bytes: bytes) -> str:
     """
     Magic-byte sniff, stdlib only -- no python-magic dependency. Only the
@@ -413,12 +365,10 @@ def _call_flux_kontext_edit(image_bytes: bytes, prompt: str) -> dict:
     }
 
     submit_url = f"{FAL_QUEUE_BASE}/{ORACLE_MODEL}"
-    seed = _derive_seed(image_bytes)
     submit_body = {
         "prompt": prompt,
         "image_url": _build_data_uri(image_bytes),
         "output_format": OUTPUT_FORMAT,
-        "seed": seed,
         # aspect_ratio deliberately omitted -- Kontext preserves the
         # input image's own aspect ratio when it isn't specified, which
         # is what a correction task needs (same framing in, same framing
@@ -440,7 +390,7 @@ def _call_flux_kontext_edit(image_bytes: bytes, prompt: str) -> dict:
     status_url = submit_payload.get("status_url") or f"{submit_url}/requests/{request_id}/status"
     response_url = submit_payload.get("response_url") or f"{submit_url}/requests/{request_id}"
 
-    logger.info(f"oracleGeneration: fal.ai request queued -- request_id={request_id} seed={seed} "
+    logger.info(f"oracleGeneration: fal.ai request queued -- request_id={request_id} "
                 f"(recoverable via fal.ai dashboard even if this process dies)")
 
     final_status = None
@@ -481,7 +431,6 @@ def _call_flux_kontext_edit(image_bytes: bytes, prompt: str) -> dict:
     return {
         "image_bytes": image_bytes_out,
         "fal_request_id": request_id,
-        "seed_requested": seed,
         "seed": result_payload.get("seed"),
     }
 
@@ -514,8 +463,6 @@ def generate_oracle_scene(orig_image_bytes: bytes, is_exterior: bool) -> tuple:
         "is_exterior": is_exterior,
         "attempts": 0,
         "fal_request_id": None,
-        "seed_requested": None,
-        "seed": None,
         "error": None,
     }
 
@@ -537,8 +484,6 @@ def generate_oracle_scene(orig_image_bytes: bytes, is_exterior: bool) -> tuple:
             result = _call_flux_kontext_edit(orig_image_bytes, prompt)
             report["error"] = None
             report["fal_request_id"] = result.get("fal_request_id")
-            report["seed_requested"] = result.get("seed_requested")
-            report["seed"] = result.get("seed")
             return result["image_bytes"], report
 
         except urllib.error.HTTPError as e:
