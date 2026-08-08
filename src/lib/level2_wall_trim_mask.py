@@ -39,6 +39,47 @@ GRID RESOLUTION: reuses the 24x18 grid already validated for sky/
 vegetation and ceiling identification, rather than inventing a third
 resolution with no evidence behind it -- same discipline noted in the
 ceiling mask module.
+
+GRID DIMENSION TOLERANCE (added Aug 2026, IMG_8310 investigation):
+Vision's adherence to "exactly GRID_ROWS x GRID_COLS" is not perfectly
+deterministic call-to-call. A real production case: an 18x23 grid --
+correct row count, every single row identically 23 characters, one
+column narrow -- was previously discarded outright by a strict
+`len(row) != GRID_COLS` equality check, even though it cleanly and
+consistently identified three real vertical wall regions in the photo
+(left wall, a center wall segment between furniture, right wall/window
+trim). That grid was real, usable classification data, not garbage --
+but the old check couldn't distinguish "one column short, otherwise
+perfectly self-consistent" from "actually incoherent," and treated both
+identically: degrade to empty, apply nothing.
+
+identify_wall_trim() now accepts a grid whose actual dimensions are
+within GRID_DIM_TOLERANCE of GRID_ROWS x GRID_COLS, PROVIDED every row
+is still the same length as every other row (internal consistency is
+still required -- inconsistent row lengths, or dimensions outside
+tolerance, still degrade to empty, same contract as before). This widens
+what counts as recoverable; it does not remove the safety net.
+
+rasterize_wall_trim_mask() derives its pixel mapping from the grid's
+ACTUAL shape, not the GRID_ROWS/GRID_COLS constants. This matters: if a
+23-wide grid were resized as though it were 24-wide, every column
+boundary after column 0 would be off by a fraction of a cell, compounding
+rightward across the row -- a real, visible misalignment between the
+mask and the true wall edge, i.e. exactly the kind of artifact this
+tolerance change is meant to avoid introducing. Building the cell grid
+at its own (rows, cols) and letting cv2.resize scale THAT to the image's
+(w, h) keeps column 0 and the last column pinned to the true left/right
+edges regardless of the exact column count in between.
+
+Known follow-up, out of scope for this module: oracleCorrection.py's
+apply_hue_fidelity_gate (and any other caller) that derives a feather
+blur radius from `image_width / GRID_COLS` as "one cell in pixels" will
+be very slightly off (~4% at a one-column miss) when fed a near-miss
+grid, since the true per-cell pixel width is `image_width / actual_cols`.
+This is a minor feather-radius inaccuracy, not a correctness bug, and
+does not reproduce the banding artifact this change fixes -- but it's a
+real, known imprecision worth closing in oracleCorrection.py at some
+point rather than leaving implicit.
 """
 
 import os
@@ -70,6 +111,17 @@ MAX_VISION_EDGE = int(os.environ.get("LEVEL2_WALL_TRIM_MASK_MAX_EDGE", "1024"))
 
 GRID_COLS = 24
 GRID_ROWS = 18
+
+# Max allowed absolute deviation, per axis, between a returned grid's
+# actual row/column count and GRID_ROWS/GRID_COLS for that grid to be
+# treated as recoverable near-miss data rather than malformed. See the
+# module docstring's "GRID DIMENSION TOLERANCE" section for the real
+# case (18x23) that motivated this. Deliberately conservative -- this is
+# about tolerating a one-or-two-cell miss from an otherwise clean,
+# self-consistent grid, not about accepting wildly wrong dimensions.
+GRID_DIM_TOLERANCE = int(os.environ.get("LEVEL2_WALL_TRIM_MASK_DIM_TOLERANCE", "2"))
+
+_VALID_CHARS = frozenset("A.")
 
 SYSTEM_PROMPT = """You are classifying a grid overlaid on a real estate interior photograph into a {rows}x{cols} grid of cells (row 1 to {rows} top to bottom, column A to {last_col} left to right).
 
@@ -163,15 +215,24 @@ def _call_vision_api(image_b64: str, media_type: str) -> dict:
 
 def identify_wall_trim(img) -> tuple:
     """
-    Classifies a decoded image (cv2/numpy array, BGR) into a GRID_ROWS x
-    GRID_COLS grid of 'A' (wall/trim) / '.' (other) cells via Vision.
+    Classifies a decoded image (cv2/numpy array, BGR) into a grid of 'A'
+    (wall/trim) / '.' (other) cells via Vision, targeting GRID_ROWS x
+    GRID_COLS but accepting a near-miss grid (see GRID_DIM_TOLERANCE and
+    the module docstring's "GRID DIMENSION TOLERANCE" section) so long as
+    it is internally consistent -- every row the same length as every
+    other row.
 
-    Returns (result, report). result["grid"] is a list of GRID_ROWS
-    strings, each GRID_COLS characters ('A'/'.'), or [] on any failure.
-    Never raises. Callers must treat an empty/malformed grid as "no
-    architectural surface identified" -- see rasterize_wall_trim_mask,
-    same "empty = apply nothing" contract as every other mask module
-    here.
+    Returns (result, report). result["grid"] is a list of strings, each
+    the same length as each other (GRID_COLS, or within tolerance of it),
+    or [] on any failure. Never raises. Callers must treat an
+    empty/malformed grid as "no architectural surface identified" -- see
+    rasterize_wall_trim_mask, same "empty = apply nothing" contract as
+    every other mask module here.
+
+    report["dimension_mismatch"] is set (and logged) when an accepted
+    grid's actual shape differs from GRID_ROWS x GRID_COLS, so a
+    near-miss acceptance stays visible in diagnostics rather than being
+    silently absorbed.
     """
     report = {
         "enabled": WALL_TRIM_MASK_ENABLED,
@@ -199,14 +260,59 @@ def identify_wall_trim(img) -> tuple:
         parsed = _call_vision_api(image_b64, "image/jpeg")
 
         grid = parsed.get("grid")
-        if not isinstance(grid, list) or len(grid) != GRID_ROWS or any(
-            not isinstance(row, str) or len(row) != GRID_COLS for row in grid
-        ):
-            report["error"] = f"malformed_grid (expected {GRID_ROWS}x{GRID_COLS}): {str(grid)[:2000]!r}"
+
+        if not isinstance(grid, list) or not grid or any(not isinstance(row, str) for row in grid):
+            report["error"] = f"malformed_grid (not a non-empty list of strings): {str(grid)[:2000]!r}"
             return {"grid": [], "error": report["error"]}, report
 
+        actual_rows = len(grid)
+        row_lengths = {len(row) for row in grid}
+
+        if len(row_lengths) != 1:
+            # Rows disagree with EACH OTHER on length -- this is the
+            # genuinely chaotic failure mode, not a clean near-miss.
+            # There's no safe way to rasterize inconsistent row widths
+            # into a rectangular grid, so this still degrades to empty
+            # regardless of GRID_DIM_TOLERANCE.
+            report["error"] = (
+                f"malformed_grid (inconsistent row lengths {sorted(row_lengths)}, "
+                f"rows must all match each other): {str(grid)[:2000]!r}"
+            )
+            return {"grid": [], "error": report["error"]}, report
+
+        actual_cols = row_lengths.pop()
+
+        bad_chars = {ch for row in grid for ch in row} - _VALID_CHARS
+        if bad_chars:
+            report["error"] = f"malformed_grid (invalid characters {sorted(bad_chars)}): {str(grid)[:2000]!r}"
+            return {"grid": [], "error": report["error"]}, report
+
+        row_delta = abs(actual_rows - GRID_ROWS)
+        col_delta = abs(actual_cols - GRID_COLS)
+
+        if row_delta > GRID_DIM_TOLERANCE or col_delta > GRID_DIM_TOLERANCE:
+            report["error"] = (
+                f"malformed_grid (got {actual_rows}x{actual_cols}, expected "
+                f"{GRID_ROWS}x{GRID_COLS}, outside tolerance of {GRID_DIM_TOLERANCE}): "
+                f"{str(grid)[:2000]!r}"
+            )
+            return {"grid": [], "error": report["error"]}, report
+
+        if row_delta or col_delta:
+            # Within tolerance but not an exact match -- accepted.
+            # rasterize_wall_trim_mask derives pixel mapping from this
+            # grid's ACTUAL shape, not the GRID_ROWS/GRID_COLS constants,
+            # so this does not introduce cumulative column-boundary
+            # drift -- see that function's docstring.
+            report["dimension_mismatch"] = f"{actual_rows}x{actual_cols} vs expected {GRID_ROWS}x{GRID_COLS}"
+            logger.info(
+                f"level2_wall_trim_mask: accepted near-miss grid "
+                f"{actual_rows}x{actual_cols} (expected {GRID_ROWS}x{GRID_COLS}, "
+                f"within tolerance {GRID_DIM_TOLERANCE})"
+            )
+
         n_wall_cells = sum(row.count("A") for row in grid)
-        report["wall_trim_cell_fraction"] = n_wall_cells / float(GRID_ROWS * GRID_COLS)
+        report["wall_trim_cell_fraction"] = n_wall_cells / float(actual_rows * actual_cols)
 
         return {"grid": grid, "error": None}, report
 
@@ -218,30 +324,53 @@ def identify_wall_trim(img) -> tuple:
 
 def rasterize_wall_trim_mask(grid: List[str], img_shape) -> np.ndarray:
     """
-    Turns a GRID_ROWS x GRID_COLS character grid ('A'/anything else) into
-    a raw (unfeathered) float32 mask, same H x W as img_shape, 1.0 in
-    wall/trim cells, 0.0 elsewhere. Upsampled with nearest-neighbor (a
-    grid cell is a hard category, not a value to interpolate) then left
-    for the CALLER to feather -- same one-feather-step-only discipline as
-    every other gate in this pipeline (see
-    oracleCorrection.apply_saturation_cap /
-    apply_hue_fidelity_gate's mask_grid_cols parameter, which this
-    module's GRID_COLS is meant to be passed into directly).
+    Turns a character grid ('A'/anything else) into a raw (unfeathered)
+    float32 mask, same H x W as img_shape, 1.0 in wall/trim cells, 0.0
+    elsewhere. Upsampled with nearest-neighbor (a grid cell is a hard
+    category, not a value to interpolate) then left for the CALLER to
+    feather -- same one-feather-step-only discipline as every other gate
+    in this pipeline (see oracleCorrection.apply_saturation_cap /
+    apply_hue_fidelity_gate's mask_grid_cols parameter).
 
-    An empty or malformed grid returns an all-zero mask -- "apply
-    nothing," per this module's contract, same as
+    Pixel mapping is derived from the grid's ACTUAL shape (row count, and
+    each row's length -- every row must match every other row) rather
+    than the GRID_ROWS/GRID_COLS constants. This matters as of the
+    GRID_DIM_TOLERANCE change in identify_wall_trim: that function can
+    now hand this one a near-miss grid (e.g. 18x23, one column narrow).
+    If this function built its cell array at a fixed (GRID_ROWS,
+    GRID_COLS) regardless of the grid's real dimensions, or resized as
+    though the source were 24 cells wide when it's actually 23, every
+    column boundary after column 0 would be off by a fraction of a cell,
+    compounding rightward across the row -- a real, visible misalignment
+    between the mask and the true wall edge. Building cell_grid at the
+    grid's own (rows, cols) and letting cv2.resize scale THAT to (w, h)
+    keeps column 0 and the last column pinned to the true left/right
+    edges regardless of the exact column count in between.
+
+    An empty grid, or one with inconsistent row lengths, returns an
+    all-zero mask -- "apply nothing," per this module's contract, same as
     level0_sky_vegetation_mask.rasterize_sky_veg_mask and
-    level2_ceiling_mask.rasterize_ceiling_mask.
+    level2_ceiling_mask.rasterize_ceiling_mask. This function performs
+    its own consistency check independent of identify_wall_trim's, since
+    it can be called directly with a raw grid by other callers in this
+    pipeline.
     """
     h, w = img_shape[:2]
 
-    if not grid or len(grid) != GRID_ROWS:
+    if not grid or any(not isinstance(row, str) for row in grid):
         return np.zeros((h, w), dtype=np.float32)
 
-    cell_grid = np.zeros((GRID_ROWS, GRID_COLS), dtype=np.float32)
+    actual_rows = len(grid)
+    row_lengths = {len(row) for row in grid}
+    if len(row_lengths) != 1:
+        return np.zeros((h, w), dtype=np.float32)
+
+    actual_cols = row_lengths.pop()
+    if actual_cols == 0:
+        return np.zeros((h, w), dtype=np.float32)
+
+    cell_grid = np.zeros((actual_rows, actual_cols), dtype=np.float32)
     for r, row in enumerate(grid):
-        if not isinstance(row, str) or len(row) != GRID_COLS:
-            return np.zeros((h, w), dtype=np.float32)
         for c, ch in enumerate(row):
             if ch == "A":
                 cell_grid[r, c] = 1.0
