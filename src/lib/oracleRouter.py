@@ -79,6 +79,7 @@ from oracleCorrection import (  # noqa: E402
     compute_oracle_guided_deltas,
     apply_oracle_guided_correction,
     apply_hue_fidelity_gate,
+    apply_illumination_floor,
     compute_recoverability_map,
     smooth_deltas_in_mask,
     MIN_ALIGNMENT_INLIERS,
@@ -102,6 +103,25 @@ from level2_wall_trim_mask import (  # noqa: E402
 )
 
 SMARTCORRECT_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "smartCorrect.py")
+
+# ILLUMINATION FLOOR -- oracleCorrection.apply_illumination_floor is classical
+# CV (no Vision call), so unlike the wall/trim, ceiling, and recoverability
+# gates it has no level2_ module of its own to own this constant -- defined
+# here instead. Was previously computed shadow-only and discarded inside
+# oracleCorrection.run_oracle_driven_pipeline() itself (that function is
+# deliberately never called by this router -- see run_oracle_interior's own
+# docstring) and was explicitly NOT wired into this router when the
+# hue-fidelity gate was added, per that patch's own comment: "a separate,
+# not-yet-revalidated piece." Wired in live (default apply, not shadow-first)
+# now that ceiling_smoothing and the hue-fidelity gate are both confirmed
+# firing correctly on real photos (IMG_8291, IMG_8310) but walls/ceiling
+# still weren't reaching the MLS Bright brightness target -- this is the
+# missing piece, not a replacement for either of those. Kill switch:
+# ORACLE_ILLUM_FLOOR_SHADOW_MODE=true reverts to compute-and-log-only
+# without a code change, same discipline as every other gate here.
+ILLUM_FLOOR_SHADOW_MODE = os.environ.get(
+    "ORACLE_ILLUM_FLOOR_SHADOW_MODE", "false"
+).lower() not in ("false", "0", "")
 
 
 def run_classical_only(source_path: str, output_path: str, lens_mode: str, intensity: float) -> dict:
@@ -327,6 +347,37 @@ def run_oracle_interior(source_path: str, output_path: str, orig_img) -> dict:
         print(f"[ORACLE-ROUTER] [HUE-GATE LIVE] applied to corrected_img "
               f"(shadow mode off)", file=sys.stderr)
     routing_report["steps"]["hue_fidelity_gate"] = hue_gate_shadow
+
+    # ILLUMINATION FLOOR -- see oracleCorrection.apply_illumination_floor's
+    # own docstring for the full mechanism and evidence: Oracle's own
+    # render can undershoot the MLS Bright brightness target on walls/
+    # ceiling/trim (confirmed on IMG_8253/IMG_8317 as a mean-L lift of only
+    # +1.6 to +2.2 out of 255), and apply_oracle_guided_correction's clamp
+    # silently inherits that conservatism as a hard ceiling on the final
+    # correction. Same architectural_mask as the hue-fidelity gate above
+    # (walls/ceiling/trim only) and the same recov_map already computed
+    # earlier in this function -- no new Vision call, no new mask. Only
+    # RAISES L, never lowers it, never touches a/b, so this is orthogonal
+    # to the hue gate above; call order between the two doesn't matter.
+    if ILLUM_FLOOR_SHADOW_MODE:
+        _floor_shadow_result, illum_floor_report = apply_illumination_floor(
+            orig_img, corrected_img, recov_map, architectural_mask
+        )
+        print(f"[ORACLE-ROUTER] [ILLUM-FLOOR SHADOW MODE] mean_l_before="
+              f"{illum_floor_report.get('mean_l_before', 0.0):.1f}  "
+              f"lift_strength={illum_floor_report.get('lift_strength', 0.0):.2f}  "
+              f"would-raise={illum_floor_report.get('floor_raised_fraction', 0.0)*100:.1f}% "
+              f"of masked pixels (NOT applied -- shadow mode, corrected_img unchanged)",
+              file=sys.stderr)
+    else:
+        corrected_img, illum_floor_report = apply_illumination_floor(
+            orig_img, corrected_img, recov_map, architectural_mask
+        )
+        print(f"[ORACLE-ROUTER] [ILLUM-FLOOR LIVE] applied to corrected_img "
+              f"(shadow mode off) mean_l_before={illum_floor_report.get('mean_l_before', 0.0):.1f} "
+              f"raised={illum_floor_report.get('floor_raised_fraction', 0.0)*100:.1f}% of masked pixels",
+              file=sys.stderr)
+    routing_report["steps"]["illumination_floor"] = illum_floor_report
 
     ok = cv2.imwrite(output_path, corrected_img)
     if not ok:
