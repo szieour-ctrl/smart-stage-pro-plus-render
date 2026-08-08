@@ -1,23 +1,37 @@
 """
 oracleGeneration.py
 
-The actual GPT Image 2 call that was the missing piece all last session --
-every test up to now used Oracle images supplied by hand. This is what
-produces them live, in the pipeline, from a given Original photo.
+Produces the Oracle Scene Render -- a live, in-pipeline generative render
+of a given Original photo, used purely as a per-pixel delta source by
+oracleCorrection.py's alignment + LAB correction step. Never shipped to
+the client directly.
 
-ENDPOINT CHOICE: OpenAI's Image API has two endpoints -- images.generate
-(text-to-image, nothing to correct FROM) and images.edit (modify an
-existing image per a prompt). This pipeline is correcting an existing
-photo, not generating a new scene, so images.edit is the right one --
-POST https://api.openai.com/v1/images/edits, model "gpt-image-2".
+ENDPOINT: fal.ai's Flux Kontext [pro] image-editing model
+(fal-ai/flux-pro/kontext), NOT OpenAI's GPT Image 2. This module was
+originally built against OpenAI's images.edit endpoint; that version is
+now retired. The switch was made on real measured evidence, not
+preference: head-to-head testing found Flux Kontext's alignment quality
+at 2847/2857 inliers (0.65px mean residual) vs GPT Image 2's 32/68
+inliers on the same photo, plus 3-8s latency vs up to ~2 minutes for
+GPT Image 2 -- which also removes this module from the OpenAI
+organization-wide 50 IPM limit that PRO staging (gpt-image-2) already
+consumes.
 
-STDLIB ONLY, NO SDK -- same discipline as level0_scene_classifier.py's
-own documented reasoning (an SDK dependency that isn't in requirements.txt
-degrades silently to a missing-module failure in production, confirmed
-as a real incident there). images.edit needs multipart/form-data (it
-takes a real image file, not JSON), which urllib doesn't build for you --
-_encode_multipart below does it by hand rather than reaching for
-`requests` or the `openai` package.
+AUTH: FAL_KEY, NOT OPENAI_API_KEY. This is fal.ai's own conventional env
+var name. If generate_oracle_scene() reports missing_FAL_KEY despite the
+key being present on Railway, check the Railway variable is spelled
+exactly "FAL_KEY" before assuming anything else is wrong -- this project
+already burned a session on the equivalent OpenAI-key-name confusion.
+
+TRANSPORT: plain REST via fal.ai's queue endpoints (submit / status /
+result), stdlib only -- no `requests` package, no `@fal-ai/client` SDK.
+Mirrors the same explicit queue.submit() / queue.status() / queue.result()
+pattern already established in klingMotion.js and ltxMotion.js, just
+over urllib since this module is Python. Submitting a fire-and-poll job
+rather than a single blocking call also gives this module a request_id
+that's recoverable from the fal.ai dashboard even if the Railway process
+dies mid-poll -- the same reasoning that shaped the video pipeline's own
+polling design.
 
 PROMPT SELECTION: takes is_exterior directly rather than re-deriving
 scene type -- level0_scene_classifier.py's resolve_scene_type() is
@@ -32,67 +46,30 @@ vegetation saturation (measured on a real photo: sky +122%, vegetation
 +45%, both violating v1's own stated rules). v2 explicitly tightens Sky,
 Lawn, and Trees-and-Shrubs by name and adds a general Critical Rule
 ("if a correction would make the property appear in better physical
-condition than the captured photo supports, do not perform it"). Keep
-using v2 going forward; only revisit if a real batch shows it still
-overshoots (see handoff: re-check oracleCorrection.py's saturation-cap
-trigger rate once this is live -- if v2 is holding, the caps should fire
-much less often than they did against v1's output).
+condition than the captured photo supports, do not perform it").
 
 INTERIOR now uses v4 (Smart_Correct_Oracle_Interior_v3.docx naming lags one
 version behind the actual prompt text below -- rename the docx to v4 next
 time it's regenerated). History:
-v1 -> v2: v1's language was restrained-by-default ("carefully balanced
-exposure," "subtle local contrast," "do not... flatten contrast") with no
-explicit permission to recover aggressively -- confirmed on a real photo
-(Flux Kontext, IMG_8310): the interior result was a near-total no-op
-across the ENTIRE room (wall/fireplace/carpet all within ~1-3 L points of
-the raw Original), not selective protection of one dark object. v2 added
-an explicit "Dynamic Range: recover shadow/highlight/midtone" instruction
-(mirroring what already worked in the exterior prompt) plus a "Furniture
-and Materials in Shadow -- Recover, Do Not Protect" section naming the
-exact failure level2_vision_regions.py had already documented once and
-this file hadn't carried over.
+v1 -> v2: v1's language was restrained-by-default with no explicit
+permission to recover aggressively -- confirmed on a real photo (Flux
+Kontext, IMG_8310): the interior result was a near-total no-op across
+the ENTIRE room. v2 added an explicit "Dynamic Range: recover
+shadow/highlight/midtone" instruction plus a "Furniture and Materials
+in Shadow -- Recover, Do Not Protect" section.
 v2 -> v3: v2's abstract "fully recover" language still weakly adopted --
 confirmed on the SAME photo, chair L stayed at 42.8 (vs raw Original's
-42.0, a near no-op). v3 named "MLS Bright" explicitly, 11 times, as a
-concrete industry-standard target instead of an abstract instruction --
-chair L jumped to 73.6 with recovered carving detail (std 74.7, exceeding
-the GPT-based Oracle's own 69.9). This was the single highest-leverage
-fix of the whole prompt-iteration history -- naming a recognizable style
-beat every version of more forceful abstract phrasing.
+42.0, a near no-op). v3 named "MLS Bright" explicitly, 11 times -- chair
+L jumped to 73.6 with recovered carving detail (std 74.7, exceeding the
+GPT-based Oracle's own 69.9). This was the single highest-leverage fix
+of the whole prompt-iteration history.
 v3 -> v4: v3's aggressive brightness push was found (real photo,
 side-by-side against a separately-generated "Strobe" render of the same
-room) to carry a consistent, whole-frame warm color-temperature bias --
-measured at every position across the wall, not localized to one area:
-+3.3 mean LAB-b shift vs the Strobe version's +1.1, present uniformly
-along the room's own real warm-to-cool lighting gradient (both renders
-correctly preserved that real gradient's SHAPE; v3 just ran uniformly
-warmer than accurate at every point along it). v3 had no instruction
-treating brightness and color temperature as independent -- every
-instruction pushed exposure harder, nothing protected white balance while
-that happened. v4 adds a dedicated "Color Temperature -- Independent of
-Brightness" section stating this directly, tightens the Walls section to
-name the specific real-vs-not-real distinction (natural brightness
-falloff across a wall is real and should stay; a color-temperature shift
-across a wall is not real and must not appear), and adds warm color drift
-as a named third failure mode in Critical Rule, alongside under- and
-over-correction. Keep using v4 going forward; only revisit if a real
-batch still shows a warm bias.
-
-TIMEOUT AND RETRY: image generation can take up to ~2 minutes for a
-complex prompt (this is OpenAI's own stated guidance, not a guess) --
-sized very differently from this codebase's Vision calls, which are
-never given more than 30s. Retries use exponential backoff WITH jitter,
-also per OpenAI's own guidance -- jitter specifically matters here
-because a fleet of Railway workers retrying in lockstep after a shared
-rate-limit response would all land on the rate limiter at the same
-instant otherwise.
-
-ORG VERIFICATION GOTCHA: OpenAI gates the GPT Image model family behind
-API Organization Verification in the developer console. If every call
-fails identically on the very first attempt, check that BEFORE assuming
-the code is wrong -- it will look like an auth failure, not a "not
-verified yet" failure, from this module's vantage point.
+room) to carry a consistent, whole-frame warm color-temperature bias:
++3.3 mean LAB-b shift vs the Strobe version's +1.1. v4 adds a dedicated
+"Color Temperature -- Independent of Brightness" section stating this
+directly, and adds warm color drift as a named third failure mode in
+Critical Rule, alongside under- and over-correction.
 
 LABELING: every image this module produces is, by definition, the
 Oracle Scene Render -- a digitally altered image. That's not a caveat
@@ -102,13 +79,11 @@ wherever shown, per the settled position this project already reached.
 """
 
 import os
-import io
 import json
 import time
 import random
 import base64
 import logging
-import mimetypes
 import urllib.error
 import urllib.request
 from typing import Optional
@@ -116,33 +91,64 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 ORACLE_GENERATION_ENABLED = os.environ.get("ORACLE_GENERATION_ENABLED", "true").lower() not in ("false", "0", "")
-# NOTE: confirm this is the exact env var name used when the OpenAI key was
-# added to Railway -- "OPENAI_API_KEY" is the OpenAI SDK's own conventional
-# name and the most likely match, but this wasn't confirmed against the
-# actual Railway config this session. If generate_oracle_scene() reports
-# missing_OPENAI_API_KEY despite the key being added, check the Railway
-# variable name matches this exactly before assuming anything else is wrong.
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-ORACLE_MODEL = os.environ.get("ORACLE_GENERATION_MODEL", "gpt-image-2")
-TIMEOUT_SECONDS = int(os.environ.get("ORACLE_GENERATION_TIMEOUT_SECONDS", "150"))  # generation can
-# take up to ~2 min per OpenAI's own guidance -- do not shrink this to match
-# the Vision calls' timeouts elsewhere in this codebase, it's a different
-# kind of call with a materially different latency profile.
+
+# fal.ai's standard auth env var -- NOT OPENAI_API_KEY. See module
+# docstring's "AUTH" section: this is flagged as previously confused
+# with the OpenAI key name, not just a code-level rename.
+FAL_API_KEY = os.environ.get("FAL_KEY", "")
+
+# Endpoint ID for fal.ai's Flux Kontext [pro] image-editing model, per
+# fal.ai's own API docs (fal.ai/models/fal-ai/flux-pro/kontext/api).
+# Overridable via env in case a cheaper/faster Kontext variant (e.g.
+# fal-ai/flux-kontext/dev) is ever worth testing against a real batch --
+# do not change the default without re-running the same head-to-head
+# validation this session ran for gpt-image-2 vs Flux Kontext pro.
+ORACLE_MODEL = os.environ.get("ORACLE_GENERATION_MODEL", "fal-ai/flux-pro/kontext")
+
+FAL_QUEUE_BASE = "https://queue.fal.run"
+
+# Timeout for each individual HTTP call to fal.ai's queue endpoints
+# (submit / poll / fetch-result) -- these are quick control-plane calls,
+# NOT the generation itself, which is tracked separately via polling
+# below.
+HTTP_TIMEOUT_SECONDS = int(os.environ.get("ORACLE_GENERATION_HTTP_TIMEOUT_SECONDS", "30"))
+
+# How often to poll fal.ai for job completion, and how many times to poll
+# before giving up on a single submit/poll/result cycle. Sized around
+# this session's measured Flux Kontext latency (3-8s) with generous
+# headroom, NOT copied from the video pipeline's 10s/90-attempt (15 min)
+# settings -- those are sized for Kling/LTX video jobs, a completely
+# different latency class. 60 * 2s = 120s ceiling, ~15-40x the measured
+# render time -- same margin-over-observed-time ratio the video pipeline
+# uses, just scaled to a much faster job. Revisit if production Flux
+# Kontext calls are routinely slower than this session's measurements.
+POLL_INTERVAL_SECONDS = float(os.environ.get("ORACLE_GENERATION_POLL_INTERVAL_SECONDS", "2.0"))
+MAX_POLL_ATTEMPTS = int(os.environ.get("ORACLE_GENERATION_MAX_POLL_ATTEMPTS", "60"))
+
+# Retries the ENTIRE submit->poll->result cycle on transient failure.
+# Fewer attempts and a shorter base backoff than the old OpenAI version
+# (3 retries / 2.0s base carried over unchanged from OpenAI's ~2-minute
+# guidance) -- Flux Kontext's fast, consistent latency doesn't call for
+# the same posture. Still jittered: the reason for jitter (a fleet of
+# Railway workers retrying a shared rate-limit hit in lockstep) doesn't
+# depend on which API is on the other end.
 MAX_RETRIES = int(os.environ.get("ORACLE_GENERATION_MAX_RETRIES", "3"))
-BASE_BACKOFF_SECONDS = 2.0
-IMAGE_SIZE = os.environ.get("ORACLE_GENERATION_SIZE", "1536x1024")  # closest supported size to
-# this pipeline's typical 4:3/3:2 listing-photo aspect ratios; revisit if a
-# real batch shows OpenAI's supported size list doesn't fit well.
-IMAGE_QUALITY = os.environ.get("ORACLE_GENERATION_QUALITY", "high")
+BASE_BACKOFF_SECONDS = float(os.environ.get("ORACLE_GENERATION_BASE_BACKOFF_SECONDS", "1.0"))
+
+# png, not fal's own default (jpeg) -- oracleCorrection.py computes
+# per-pixel LAB deltas between this render and the Original. JPEG
+# compression artifacts in the Oracle render would leak directly into
+# that delta as false correction signal. Do not change this default
+# without checking oracleCorrection.py's alignment/delta code can
+# tolerate the change.
+OUTPUT_FORMAT = os.environ.get("ORACLE_GENERATION_OUTPUT_FORMAT", "png")
 
 
 # ---- Prompt text, embedded directly (not read from the .docx at runtime) ----
 # Sourced verbatim from Smart_Correct_Oracle_v1-Prompt.docx (interior) and
 # Smart_Correct_Exterior_Oracle_v2.docx (exterior, v2 -- see module
 # docstring for why v2 and not v1). Embedded as constants so this module
-# has no runtime dependency on the docx files or a document-reading step --
-# same self-containment reasoning as every other prompt-driven module in
-# this codebase keeping its prompt as a Python string, not an external file.
+# has no runtime dependency on the docx files or a document-reading step.
 # IF EITHER PROMPT DOCX IS REVISED AGAIN, THIS MUST BE UPDATED TO MATCH --
 # there is no automated sync between the docx and this constant.
 
@@ -291,86 +297,158 @@ Final Objective
 The finished image should appear indistinguishable from a professionally photographed and professionally edited architectural real estate photograph captured under the exact same physical conditions. Improve only the quality of the photograph. Never improve the property."""
 
 
-def _encode_multipart(fields: dict, files: dict) -> tuple:
+def _detect_mime_type(image_bytes: bytes) -> str:
     """
-    Hand-built multipart/form-data body, stdlib only. fields: str->str.
-    files: str-> (filename, bytes, content_type). Returns (body_bytes,
-    content_type_header_value).
+    Magic-byte sniff, stdlib only -- no python-magic dependency. Only the
+    two formats this pipeline actually produces (PNG from screenshots/
+    Cloudinary derivatives, JPEG from camera originals) need to be
+    distinguished; anything else falls back to PNG rather than guessing
+    wrong and mislabeling the data URI.
     """
-    boundary = f"----OracleGen{random.randint(10**15, 10**16 - 1)}"
-    parts = []
-
-    for name, value in fields.items():
-        parts.append(f"--{boundary}\r\n".encode())
-        parts.append(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode())
-        parts.append(f"{value}\r\n".encode())
-
-    for name, (filename, data, content_type) in files.items():
-        parts.append(f"--{boundary}\r\n".encode())
-        parts.append(
-            f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'.encode()
-        )
-        parts.append(f"Content-Type: {content_type}\r\n\r\n".encode())
-        parts.append(data)
-        parts.append(b"\r\n")
-
-    parts.append(f"--{boundary}--\r\n".encode())
-    body = b"".join(parts)
-    return body, f"multipart/form-data; boundary={boundary}"
+    if image_bytes[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if image_bytes[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    return "image/png"
 
 
-def _call_openai_edit(image_bytes: bytes, prompt: str) -> dict:
+def _build_data_uri(image_bytes: bytes) -> str:
     """
-    Single attempt, no retry logic here (see generate_oracle_scene for
-    retry/backoff). Raises on any failure -- caller handles it.
+    fal.ai's file-input fields (image_url here) accept either a hosted
+    URL or a base64 data URI -- per fal.ai's own docs. This pipeline has
+    no existing step that uploads the Original photo to a public URL
+    before Oracle generation runs, so a data URI is the simpler, more
+    self-contained choice (no new Cloudinary round-trip dependency added
+    to this module just to satisfy fal.ai's input format). Revisit if a
+    real batch shows the data-URI path meaningfully slower than a hosted
+    URL would be -- fal.ai's own docs note large base64 payloads can
+    affect request performance, but this pipeline's photo sizes haven't
+    been checked against that threshold yet.
     """
-    fields = {
-        "model": ORACLE_MODEL,
+    mime_type = _detect_mime_type(image_bytes)
+    b64 = base64.b64encode(image_bytes).decode("ascii")
+    return f"data:{mime_type};base64,{b64}"
+
+
+def _http_json(method: str, url: str, headers: dict, body: Optional[dict] = None) -> dict:
+    """
+    Single stdlib HTTP call to a fal.ai queue endpoint, JSON in and out.
+    Raises urllib.error.HTTPError on 4xx/5xx (caller handles retry
+    logic) or ValueError on an unparseable/non-JSON response body.
+    """
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECONDS) as resp:
+        raw = resp.read().decode("utf-8")
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"non_json_response: {raw[:300]!r}") from e
+
+
+def _call_flux_kontext_edit(image_bytes: bytes, prompt: str) -> dict:
+    """
+    Single submit->poll->result cycle against fal.ai's Flux Kontext [pro]
+    queue endpoint. No retry logic here (see generate_oracle_scene for
+    retry/backoff across whole cycles) -- raises on any failure, caller
+    handles it. Mirrors the explicit queue.submit() / queue.status() /
+    queue.result() pattern already established in klingMotion.js and
+    ltxMotion.js, just via plain REST since this module is Python stdlib
+    only rather than the @fal-ai/client JS SDK those files use.
+    """
+    if not FAL_API_KEY:
+        raise ValueError("missing_FAL_KEY")
+
+    auth_headers = {
+        "Authorization": f"Key {FAL_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    submit_url = f"{FAL_QUEUE_BASE}/{ORACLE_MODEL}"
+    submit_body = {
         "prompt": prompt,
-        "size": IMAGE_SIZE,
-        "quality": IMAGE_QUALITY,
-        # moderation left at OpenAI's default ("auto") deliberately -- this
-        # pipeline has no reason to request the more permissive "low" tier,
-        # every input here is a real estate listing photo.
+        "image_url": _build_data_uri(image_bytes),
+        "output_format": OUTPUT_FORMAT,
+        # aspect_ratio deliberately omitted -- Kontext preserves the
+        # input image's own aspect ratio when it isn't specified, which
+        # is what a correction task needs (same framing in, same framing
+        # out). Setting an explicit aspect_ratio here would risk Flux
+        # reframing/cropping the photo relative to the Original, which
+        # would break oracleCorrection.py's alignment step downstream.
     }
-    files = {
-        "image": ("original.png", image_bytes, "image/png"),
+    submit_payload = _http_json("POST", submit_url, auth_headers, submit_body)
+
+    request_id = submit_payload.get("request_id")
+    if not request_id:
+        raise ValueError(f"submit_missing_request_id: {str(submit_payload)[:300]!r}")
+
+    # Prefer the URLs fal.ai's own response hands back (per fal.ai's docs,
+    # the REST API's response includes URLs for each operation) -- fall
+    # back to constructing the standard queue paths only if those keys
+    # are absent, so a future response-shape change degrades gracefully
+    # instead of breaking outright.
+    status_url = submit_payload.get("status_url") or f"{submit_url}/requests/{request_id}/status"
+    response_url = submit_payload.get("response_url") or f"{submit_url}/requests/{request_id}"
+
+    logger.info(f"oracleGeneration: fal.ai request queued -- request_id={request_id} "
+                f"(recoverable via fal.ai dashboard even if this process dies)")
+
+    final_status = None
+    for attempt in range(1, MAX_POLL_ATTEMPTS + 1):
+        time.sleep(POLL_INTERVAL_SECONDS)
+        status_payload = _http_json("GET", status_url, auth_headers)
+        status = status_payload.get("status")
+
+        if status == "COMPLETED":
+            final_status = status_payload
+            break
+        if status == "FAILED" or status == "ERROR":
+            raise ValueError(f"fal_request_failed: {str(status_payload)[:300]!r}")
+        # IN_QUEUE / IN_PROGRESS -- keep polling.
+
+    if final_status is None:
+        raise TimeoutError(
+            f"fal.ai request {request_id} did not complete within "
+            f"{MAX_POLL_ATTEMPTS * POLL_INTERVAL_SECONDS:.0f}s of polling. "
+            f"Check this request_id directly on the fal.ai dashboard -- "
+            f"generation may have finished even if polling here gave up."
+        )
+
+    result_payload = _http_json("GET", response_url, auth_headers)
+    images = result_payload.get("images")
+    if not images or not isinstance(images, list) or "url" not in images[0]:
+        raise ValueError(f"unexpected_response_shape: {str(result_payload)[:300]!r}")
+
+    image_url = images[0]["url"]
+
+    # Download the actual image bytes from fal.ai's CDN. This is a plain
+    # public media URL, not an authenticated fal.ai API endpoint -- no
+    # Authorization header needed or sent here.
+    download_req = urllib.request.Request(image_url, method="GET")
+    with urllib.request.urlopen(download_req, timeout=HTTP_TIMEOUT_SECONDS) as resp:
+        image_bytes_out = resp.read()
+
+    return {
+        "image_bytes": image_bytes_out,
+        "fal_request_id": request_id,
+        "seed": result_payload.get("seed"),
     }
-    body, content_type = _encode_multipart(fields, files)
-
-    req = urllib.request.Request(
-        "https://api.openai.com/v1/images/edits",
-        data=body,
-        headers={
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "Content-Type": content_type,
-        },
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=TIMEOUT_SECONDS) as resp:
-        payload = json.loads(resp.read().decode("utf-8"))
-
-    data = payload.get("data")
-    if not data or not isinstance(data, list) or "b64_json" not in data[0]:
-        raise ValueError(f"unexpected_response_shape: {str(payload)[:300]!r}")
-
-    image_b64 = data[0]["b64_json"]
-    return {"image_bytes": base64.b64decode(image_b64)}
 
 
 def generate_oracle_scene(orig_image_bytes: bytes, is_exterior: bool) -> tuple:
     """
-    Calls GPT Image 2 (images.edit) to produce an Oracle Scene Render from
-    a given Original photo's raw bytes (PNG or JPEG). Selects the interior
-    or exterior prompt based on is_exterior -- MUST be the same value this
-    pipeline run already got from level0_scene_classifier.resolve_scene_type(),
-    not re-derived here.
+    Calls fal.ai's Flux Kontext [pro] endpoint to produce an Oracle Scene
+    Render from a given Original photo's raw bytes (PNG or JPEG). Selects
+    the interior or exterior prompt based on is_exterior -- MUST be the
+    same value this pipeline run already got from
+    level0_scene_classifier.resolve_scene_type(), not re-derived here.
 
-    Retries with exponential backoff + jitter (OpenAI's own stated
-    guidance for this endpoint) on transient failures -- timeouts, 429/5xx.
-    Does NOT retry on 4xx errors other than 429 (bad request, auth, org
-    verification) -- those won't succeed on retry and burning MAX_RETRIES
-    attempts on a guaranteed-repeat failure just adds latency for nothing.
+    Retries the full submit->poll->result cycle with exponential backoff
+    + jitter on transient failures -- HTTP timeouts, 429/5xx on submit,
+    fal.ai queue FAILED status, or a poll timeout. Does NOT retry on a
+    non-429/5xx HTTPError on the submit call itself (bad request, bad
+    key) -- those won't succeed on retry and burning MAX_RETRIES attempts
+    on a guaranteed-repeat failure just adds latency for nothing.
 
     Returns (oracle_image_bytes, report). oracle_image_bytes is None on
     any failure after retries exhausted -- callers MUST treat None as
@@ -384,15 +462,16 @@ def generate_oracle_scene(orig_image_bytes: bytes, is_exterior: bool) -> tuple:
         "model": ORACLE_MODEL,
         "is_exterior": is_exterior,
         "attempts": 0,
+        "fal_request_id": None,
         "error": None,
     }
 
     if not ORACLE_GENERATION_ENABLED:
         report["error"] = "disabled_via_env"
         return None, report
-    if not OPENAI_API_KEY:
-        logger.warning("oracleGeneration: missing OPENAI_API_KEY, degrading to None")
-        report["error"] = "missing_OPENAI_API_KEY"
+    if not FAL_API_KEY:
+        logger.warning("oracleGeneration: missing FAL_KEY, degrading to None")
+        report["error"] = "missing_FAL_KEY"
         return None, report
 
     prompt = EXTERIOR_ORACLE_PROMPT if is_exterior else INTERIOR_ORACLE_PROMPT
@@ -402,8 +481,9 @@ def generate_oracle_scene(orig_image_bytes: bytes, is_exterior: bool) -> tuple:
         report["attempts"] = attempt
         report["called"] = True
         try:
-            result = _call_openai_edit(orig_image_bytes, prompt)
+            result = _call_flux_kontext_edit(orig_image_bytes, prompt)
             report["error"] = None
+            report["fal_request_id"] = result.get("fal_request_id")
             return result["image_bytes"], report
 
         except urllib.error.HTTPError as e:
@@ -415,22 +495,22 @@ def generate_oracle_scene(orig_image_bytes: bytes, is_exterior: bool) -> tuple:
             last_error = f"HTTPError {e.code}: {body_snippet}"
 
             # Only retry on 429 (rate limit) or 5xx (transient server error).
-            # A 400/401/403 (bad request, bad key, org not verified) will
-            # fail identically every time -- stop immediately rather than
-            # burn the full retry budget on a guaranteed repeat.
+            # A 400/401/403 (bad request, bad key) will fail identically
+            # every time -- stop immediately rather than burn the full
+            # retry budget on a guaranteed repeat.
             retryable = e.code == 429 or 500 <= e.code < 600
             if not retryable or attempt == MAX_RETRIES:
                 break
 
-        except Exception as e:  # noqa: BLE001 -- timeouts, connection errors, bad response shape
+        except Exception as e:  # noqa: BLE001 -- timeouts, connection errors, fal FAILED status, poll timeout, bad response shape
             last_error = f"{type(e).__name__}: {e}"
             if attempt == MAX_RETRIES:
                 break
 
-        # Exponential backoff with jitter, per OpenAI's own guidance for this
-        # endpoint -- jitter matters here specifically because multiple
-        # Railway workers retrying a shared rate-limit hit in lockstep would
-        # otherwise all land on the limiter at the same instant.
+        # Exponential backoff with jitter -- jitter matters here specifically
+        # because multiple Railway workers retrying a shared rate-limit hit
+        # in lockstep would otherwise all land on the limiter at the same
+        # instant.
         sleep_s = BASE_BACKOFF_SECONDS * (2 ** (attempt - 1)) + random.uniform(0, 1.0)
         logger.warning(f"oracleGeneration: attempt {attempt}/{MAX_RETRIES} failed ({last_error}), "
                         f"retrying in {sleep_s:.1f}s")
