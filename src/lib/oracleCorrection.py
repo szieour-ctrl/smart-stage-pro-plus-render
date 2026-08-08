@@ -481,6 +481,7 @@ def run_oracle_driven_pipeline(orig_img, oracle_img, log_prefix="[ORACLE-DRIVEN]
     # caller. See run_oracle_driven_pipeline's docstring for why this
     # stays shadow-only here even though the plumbing exists.
     hue_gate_shadow = None
+    illum_floor_shadow = None
     if wall_trim_grid is not None or ceiling_grid is not None:
         from level2_wall_trim_mask import rasterize_wall_trim_mask, GRID_COLS as WALL_TRIM_GRID_COLS
         wall_mask = (
@@ -510,7 +511,23 @@ def run_oracle_driven_pipeline(orig_img, oracle_img, log_prefix="[ORACLE-DRIVEN]
               f"b={hue_gate_shadow.get('b_reverted_fraction', 0.0)*100:.1f}% "
               f"(NOT applied -- shadow mode, corrected_img unchanged)")
 
+        # --- Illumination floor: SAME shadow-mode posture. Computes what
+        # it WOULD raise on architectural surfaces if Oracle's own
+        # brightness delta undershot the measured MLS Bright target, logs
+        # it, discards the result. See apply_illumination_floor's
+        # docstring -- CV, not Oracle, should own the brightness ceiling,
+        # but that only actually drives pixels once shadow mode is off.
+        _shadow_floor_result, illum_floor_shadow = apply_illumination_floor(
+            orig_img, corrected_img, recov_map, architectural_mask
+        )
+        print(f"{log_prefix} [ILLUM-FLOOR SHADOW MODE] mean_l_before="
+              f"{illum_floor_shadow.get('mean_l_before', 0.0):.1f}  "
+              f"lift_strength={illum_floor_shadow.get('lift_strength', 0.0):.2f}  "
+              f"would-raise={illum_floor_shadow.get('floor_raised_fraction', 0.0)*100:.1f}% of masked pixels "
+              f"(NOT applied -- shadow mode, corrected_img unchanged)")
+
     report["hue_gate_shadow"] = hue_gate_shadow
+    report["illum_floor_shadow"] = illum_floor_shadow
 
     print(f"{log_prefix} alignment: {alignment_report['n_inliers']}/{alignment_report['n_matches']} "
           f"inliers, mean residual {alignment_report['mean_residual_px']:.2f}px")
@@ -521,6 +538,124 @@ def run_oracle_driven_pipeline(orig_img, oracle_img, log_prefix="[ORACLE-DRIVEN]
           f"b={clip_report['b_clipped_fraction']*100:.2f}%")
 
     return corrected_img, report
+
+
+def apply_illumination_floor(orig_img, corrected_img, recoverability_map, architectural_mask,
+                              target_l=212.0, lift_ceiling=0.65, gap_softening=38.0):
+    """
+    Raises L (brightness) toward a measured MLS Bright target wherever
+    Oracle-guided correction undershot it -- CV OWNS the brightness
+    ceiling here, Oracle does not. SCOPED to architectural_mask
+    (walls/ceiling/trim, same mask apply_hue_fidelity_gate consumes) --
+    NOT frame-wide. See "SCOPING" note below for why; this was a real
+    bug in the first version of this function, caught by rendering it
+    against a real photo before shipping, not by reasoning alone.
+
+    PROBLEM THIS FIXES: apply_oracle_guided_correction()'s clamp bounds
+    L_new to [min(L_orig, L_oracle), max(L_orig, L_oracle)] -- meaning
+    Oracle's OWN delta is the hard ceiling on how bright correction can
+    push a pixel. Confirmed on two real photos this session (already-
+    decently-lit kitchen and living room, not dark rooms): Oracle's own
+    render only lifted mean L by +1.6 to +2.2 (out of a 0-255 range),
+    and the correction pipeline faithfully passed that through almost
+    unchanged (+1.3 to +1.9 final) -- visibly "barely moved the needle,"
+    confirmed by direct visual comparison, not just the numbers. This
+    isn't a correction-math bug (the clamp is doing exactly what it was
+    built to do) -- it's an architectural mismatch: Oracle's job is to
+    generate a plausible bright-target RENDER for CV to extract signal
+    from, not to decide how bright the final correction is allowed to
+    get. When Oracle itself renders conservatively, that conservatism
+    was silently inherited as a hard ceiling.
+
+    SCOPING (why architectural_mask, not the whole frame): the first
+    version of this function applied the same target_l to every pixel in
+    the frame. Rendered against a real photo (IMG_8253), the result was
+    visibly wrong -- floor tile, black appliances, and the dark cherry
+    wood island all washed toward the same brightness, producing a flat,
+    hazy look, exactly the artificial-HDR failure mode the Oracle prompt
+    explicitly warns against. A dark wood island next to a bright wall is
+    correct, real, captured lighting, not a defect to erase. Walls,
+    ceiling, and trim are the surfaces with an actual "should read one
+    continuous target tone" standard (per oracleGeneration.py's own Walls
+    and Ceiling sections); furniture, floor, and cabinetry don't share
+    that standard and must be left to Oracle's own delta (and the
+    existing clamp) rather than this floor.
+
+    NOT A NEW STANDARD: target_l=212.0, lift_ceiling, and the gap-based
+    scaling shape are taken directly from smartCorrect.py's own
+    mls_brightness_lift, the validated classical-CV brightness target
+    already used on the non-Oracle path -- this deliberately reuses the
+    existing standard rather than inventing a second one. NOTE: this
+    version does NOT yet reproduce mls_brightness_lift's photo_needs_lift
+    room-darkness scaling (that formula wasn't available to pull from in
+    this session) -- lift_ceiling here is a flat 0.65 regardless of how
+    dark the room is overall. Revisit once smartCorrect.py's exact
+    photo_needs_lift computation can be cross-checked, so both paths
+    apply the identical standard, not two similar-but-different ones.
+
+    WHY A FLOOR, NOT A REPLACEMENT: this only RAISES L_new when it falls
+    short of the computed floor -- it never lowers a pixel Oracle already
+    pushed brighter than the floor, and it never touches a/b. Oracle's
+    delta is still the primary driver when it's doing real work (e.g.
+    IMG_8310's walls, where Oracle's own lift was already large and this
+    floor should be a near no-op there); this only engages as a backstop
+    for the specific failure mode confirmed above, and only on the
+    surfaces where a uniform target is actually the correct standard.
+
+    architectural_mask: same feathered-by-caller raw mask contract as
+    apply_hue_fidelity_gate -- pass the union of
+    level2_wall_trim_mask.rasterize_wall_trim_mask() and
+    level2_ceiling_mask.rasterize_ceiling_mask(). An empty mask is a true
+    no-op, same contract as every other mask-scoped function here.
+
+    Returns: corrected BGR image with the floor applied, and a report
+    dict with the fraction of MASKED pixels the floor actually raised.
+    """
+    mask = np.clip(architectural_mask.astype(np.float32), 0.0, 1.0)
+
+    if mask.max() < 1e-6:
+        return corrected_img, {
+            "applied": False, "reason": "empty_mask", "floor_raised_fraction": 0.0,
+        }
+
+    orig_lab = cv2.cvtColor(orig_img, cv2.COLOR_BGR2LAB).astype(np.float32)
+    corr_lab = cv2.cvtColor(corrected_img, cv2.COLOR_BGR2LAB).astype(np.float32)
+
+    L_orig, a_orig, b_orig = cv2.split(orig_lab)
+    L_corr, a_corr, b_corr = cv2.split(corr_lab)
+
+    # Room-darkness measure taken from the FULL original frame (matches
+    # smartCorrect.py's mls_brightness_lift, which also measures mean_l
+    # room-wide) even though the floor itself only APPLIES inside the
+    # mask -- how dark the whole room is should still inform how hard to
+    # push the walls, a genuinely dark room's walls need more lift than a
+    # generally bright room's walls do.
+    mean_l = float(L_orig.mean())
+    l_gap = max(0.0, target_l - mean_l)
+    lift_strength = min(1.0, l_gap / gap_softening) * lift_ceiling
+
+    per_pixel_gap = np.maximum(0.0, target_l - L_orig)
+    floor_L_masked = L_orig + per_pixel_gap * lift_strength * recoverability_map
+
+    # Blend the floor in only where the mask says so, feathered edge
+    # already assumed baked into architectural_mask by the caller (same
+    # convention as apply_hue_fidelity_gate/apply_saturation_cap).
+    floor_L = L_corr * (1 - mask) + np.maximum(L_corr, floor_L_masked) * mask
+    L_new = np.clip(floor_L, 0, 255)
+
+    floor_raised_fraction = float(((L_new > L_corr + 0.5) & (mask > 0.5)).mean())
+
+    new_lab = cv2.merge([L_new, a_corr, b_corr]).astype(np.uint8)
+    result = cv2.cvtColor(new_lab, cv2.COLOR_LAB2BGR)
+
+    return result, {
+        "applied": True,
+        "mean_l_before": mean_l,
+        "l_gap": l_gap,
+        "lift_strength": lift_strength,
+        "masked_area_fraction": float(mask.mean()),
+        "floor_raised_fraction": floor_raised_fraction,
+    }
 
 
 def apply_saturation_cap(orig_img, corrected_img, restricted_mask, max_increase_ratio=1.15,
@@ -614,6 +749,124 @@ def apply_saturation_cap(orig_img, corrected_img, restricted_mask, max_increase_
         "applied": True,
         "max_increase_ratio": max_increase_ratio,
         "pixels_capped_fraction": pixels_capped_fraction,
+    }
+
+
+def apply_global_hue_angle_gate(orig_img, corrected_img, max_hue_drift_degrees=8.0,
+                                 min_chroma_for_hue_check=6.0):
+    """
+    WHOLE-FRAME hue-angle preservation -- no mask, applies to every pixel.
+    Distinct from apply_hue_fidelity_gate (scoped to architectural
+    surfaces, enforces the stricter "a/b must move toward neutral" rule).
+    This function enforces a deliberately weaker, more general rule so it
+    is safe to run everywhere, including on furniture, wood, and fabric
+    where hue_fidelity_gate's rule would be actively wrong to apply.
+
+    COMPLIANCE BASIS (stated by the person operating this pipeline, not
+    a style call this function is making on its own): if Oracle's own
+    generative step introduces a color that was not in the captured
+    Original, correcting it back is what AB 723 requires, and that
+    requirement doesn't stop at architectural surfaces -- it applies
+    anywhere in the frame. This function is the whole-image version of
+    that principle.
+
+    WHY HUE ANGLE, NOT MAGNITUDE: v5's own Wood Furniture section wants
+    wood to get MORE saturated as correction reveals it properly --
+    "fully recover true wood tone and grain at full brightness... reveal
+    real carving, joinery, and surface detail." That's a legitimate,
+    intended chroma/brightness increase, not an alteration. Rejecting it
+    (the way apply_hue_fidelity_gate's "must shrink toward neutral" rule
+    would, if applied here) would undo real, wanted correction. What
+    actually distinguishes legitimate correction from invention is
+    whether the pixel's HUE FAMILY changed -- reddish-brown wood getting
+    richer and brighter is still reddish-brown; a neutral wall reading
+    green is a different hue family entirely. This function measures and
+    enforces exactly that distinction, and only that distinction: hue
+    angle (arctan2(b,a)) held within max_hue_drift_degrees of the
+    Original's own hue angle; chroma (saturation) and L (brightness) are
+    both left completely free to move via Oracle's own delta.
+
+    min_chroma_for_hue_check: pixels near-neutral in the ORIGINAL (low
+    chroma -- true grays, whites, blacks) have an unstable, noisy hue
+    angle by definition (a/b near zero, so small sensor/render noise
+    produces large apparent angle swings with no real color behind them).
+    Below this chroma threshold, hue angle isn't a meaningful signal to
+    gate on at all -- those pixels are handled by apply_hue_fidelity_gate
+    instead (when inside the architectural mask) or left alone (when
+    outside it, since a true neutral pixel outside architecture -- e.g.
+    a white ceramic mug -- has no stated standard requiring correction
+    here).
+
+    NOT YET VALIDATED end-to-end through the live pipeline -- tested only
+    against the real photo pairs available this session. Confirmed on
+    IMG_8310's drifted wall: even at a fairly tight 6-degree threshold,
+    this recovers hue angle (a returns to ~0, near-neutral) but does NOT
+    fully restore the b-channel to the Original's true magnitude (stays
+    ~+15 vs the Original's +9.8) -- because this function deliberately
+    preserves Oracle's chroma gain along the corrected angle rather than
+    forcing a return to the Original's exact saturation, which is what
+    keeps it safe to run on wood/fabric. CONSEQUENCE: this is a backstop
+    for the whole frame, not a substitute for apply_hue_fidelity_gate's
+    stricter "shrink toward neutral" rule where that rule is safe to
+    apply (Vision-identified architectural surfaces). Use both, layered:
+    this one everywhere (catches egregious full-frame hue rotation,
+    no Vision dependency, safe on furniture/wood), the stricter one
+    scoped to walls/ceiling/trim (fully restores true neutral there).
+    8 degrees is a reasoned starting point given that calibration result,
+    not a measured constant -- revisit against a larger real batch.
+
+    Returns: corrected BGR image with hue rotation reverted (chroma and
+    L preserved from the input), and a report dict with the fraction of
+    frame that triggered the gate and the mean hue drift measured.
+    """
+    orig_lab = cv2.cvtColor(orig_img, cv2.COLOR_BGR2LAB).astype(np.float32)
+    corr_lab = cv2.cvtColor(corrected_img, cv2.COLOR_BGR2LAB).astype(np.float32)
+
+    L_corr, a_corr, b_corr = cv2.split(corr_lab)
+    _, a_orig, b_orig = cv2.split(orig_lab)
+
+    a_orig_s = a_orig - 128.0
+    b_orig_s = b_orig - 128.0
+    a_corr_s = a_corr - 128.0
+    b_corr_s = b_corr - 128.0
+
+    orig_chroma = np.sqrt(a_orig_s ** 2 + b_orig_s ** 2)
+    corr_chroma = np.sqrt(a_corr_s ** 2 + b_corr_s ** 2)
+
+    orig_hue_rad = np.arctan2(b_orig_s, a_orig_s)
+    corr_hue_rad = np.arctan2(b_corr_s, a_corr_s)
+
+    orig_hue_deg = np.degrees(orig_hue_rad)
+    corr_hue_deg = np.degrees(corr_hue_rad)
+    # Signed circular difference, then absolute -- handles the wraparound
+    # at +-180 degrees correctly (e.g. 179 vs -179 is a 2-degree drift,
+    # not a 358-degree one).
+    hue_diff = np.abs(((corr_hue_deg - orig_hue_deg + 180.0) % 360.0) - 180.0)
+
+    meaningful = orig_chroma > min_chroma_for_hue_check
+    violates = meaningful & (hue_diff > max_hue_drift_degrees)
+
+    # Violating pixels: keep Oracle's chroma (the legitimate saturation/
+    # brightness-linked gain) but project it back onto the ORIGINAL's hue
+    # angle -- discards only the rotation, keeps everything else Oracle
+    # did.
+    a_projected = corr_chroma * np.cos(orig_hue_rad)
+    b_projected = corr_chroma * np.sin(orig_hue_rad)
+
+    a_new_s = np.where(violates, a_projected, a_corr_s)
+    b_new_s = np.where(violates, b_projected, b_corr_s)
+
+    a_new = np.clip(a_new_s + 128.0, 0, 255)
+    b_new = np.clip(b_new_s + 128.0, 0, 255)
+
+    new_lab = cv2.merge([L_corr, a_new, b_new]).astype(np.uint8)
+    result = cv2.cvtColor(new_lab, cv2.COLOR_LAB2BGR)
+
+    return result, {
+        "applied": True,
+        "max_hue_drift_degrees": max_hue_drift_degrees,
+        "violated_fraction": float(violates.mean()),
+        "mean_hue_drift_all_pixels": float(hue_diff[meaningful].mean()) if meaningful.any() else 0.0,
     }
 
 
