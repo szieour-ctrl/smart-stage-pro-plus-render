@@ -199,11 +199,11 @@ def _call_vision_api(image_b64: str, media_type: str) -> dict:
         raise ValueError(f"empty_response_text (stop_reason={payload.get('stop_reason')!r})")
     brace_start = text.find("{")
     if brace_start == -1:
-        raise ValueError(f"no_json_object_found -- raw_text={text[:300]!r}")
+        raise ValueError(f"no_json_object_found -- raw_text={text[:2000]!r}")
     try:
         return json.JSONDecoder().raw_decode(text, brace_start)[0]
     except json.JSONDecodeError as e:
-        raise ValueError(f"{e} -- raw_text={text[:300]!r}") from e
+        raise ValueError(f"{e} -- raw_text={text[:2000]!r}") from e
 
 
 def identify_ceiling(img) -> tuple:
@@ -239,7 +239,7 @@ def identify_ceiling(img) -> tuple:
         if not isinstance(grid, list) or len(grid) != GRID_ROWS or any(
             not isinstance(row, str) or len(row) != GRID_COLS for row in grid
         ):
-            report["error"] = f"malformed_grid (expected {GRID_ROWS}x{GRID_COLS}): {str(grid)[:200]!r}"
+            report["error"] = f"malformed_grid (expected {GRID_ROWS}x{GRID_COLS}): {str(grid)[:2000]!r}"
             return {"grid": [], "error": report["error"]}, report
 
         total_cells = GRID_ROWS * GRID_COLS
