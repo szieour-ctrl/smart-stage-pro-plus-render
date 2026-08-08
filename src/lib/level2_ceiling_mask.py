@@ -82,11 +82,15 @@ CEILING_MASK_MODEL = os.environ.get("LEVEL2_CEILING_MASK_MODEL", "claude-haiku-4
 TIMEOUT_SECONDS = int(os.environ.get("LEVEL2_CEILING_MASK_TIMEOUT_SECONDS", "20"))
 MAX_VISION_EDGE = 1568  # matches every other Vision module in this codebase
 
-# Ships OFF (i.e. computed/logged, not applied) by default -- see module
-# docstring for why this module's shadow-mode bar is higher than level2_
-# sky_grass_mask.py's. Flip via LEVEL2_CEILING_MASK_SHADOW_MODE=false
-# only after reviewing a real batch's ceiling_mask reports.
-SHADOW_MODE = os.environ.get("LEVEL2_CEILING_MASK_SHADOW_MODE", "true").lower() not in ("false", "0", "")
+# Was OFF by default (computed/logged, not applied) pending a real-batch
+# review -- see module docstring for why this bar was set higher than
+# level2_sky_grass_mask.py's. Flipped to apply-by-default after the dull-
+# ceiling pattern was confirmed across multiple production photos and
+# traced to this gate; Railway has no LEVEL2_CEILING_MASK_SHADOW_MODE var
+# set, so this default is what actually governs production. Still fully
+# overridable via LEVEL2_CEILING_MASK_SHADOW_MODE=true to re-enable
+# shadow mode without a code change if this needs to be pulled back.
+SHADOW_MODE = os.environ.get("LEVEL2_CEILING_MASK_SHADOW_MODE", "false").lower() not in ("false", "0", "")
 
 # Same grid resolution as level2_sky_grass_mask.py -- reusing an already-
 # validated resolution rather than introducing a third value with no
