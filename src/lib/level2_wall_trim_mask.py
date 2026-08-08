@@ -114,6 +114,42 @@ change to test whether it improves grid reliability, same as it
 apparently does for ceiling. If a real batch shows this doesn't help,
 the fix is reverting this one function, not questioning the tolerance
 or consistency logic elsewhere in this file.
+
+PER-ROW LENGTH TOLERANCE (added Aug 2026, same investigation as
+PROMPT STRUCTURE above): the PROMPT STRUCTURE change was tested on a
+real IMG_8310 run and worked -- 17 of 18 rows came back exactly
+GRID_COLS characters. But the 18th row was one character short, in a
+long run of repeated 'A's -- the same narrow miscounting failure this
+module's own docstring already documents for level2_ceiling_mask.py on
+this exact photo. Before this change, identify_wall_trim's "rows must
+all match each other" check had zero tolerance: one short row killed
+the entire grid, discarding 17 rows of clean, usable data over a
+single character.
+
+identify_wall_trim now computes the grid's majority (mode) row length
+and pads or truncates any row within ROW_LEN_TOLERANCE characters of
+that mode to match it, before the dimension-tolerance check against
+GRID_ROWS x GRID_COLS runs. A short row is padded by repeating its own
+trailing character (the best available guess for "which character was
+undercounted" without inventing new information); a long row is
+truncated. Rows further from the mode than ROW_LEN_TOLERANCE still
+hard-reject the whole grid -- this is deliberately about forgiving a
+narrow miscount on a few rows, not absorbing genuine chaos. The first
+IMG_8310 investigation's wall_trim failure (row lengths 26-41 chars,
+no consistent pattern, spread across many rows) would still correctly
+reject under this tolerance -- verified against that real data, not
+just reasoned about.
+
+Known imprecision, not a correctness bug: padding with the row's own
+last character is a heuristic, not a certainty -- on the real case
+that motivated this, the short row's last character happened to be
+'.', so the padded cell became '.' rather than 'A', even though the
+long run of 'A's immediately before it makes 'A' the more likely true
+value. This affects at most ROW_LEN_TOLERANCE cells out of the whole
+grid (432 cells at 18x24) per malformed row, in the same direction the
+module already errs (uncertain cells default toward "not wall" here,
+consistent with this pipeline's existing caution around potentially
+over-claiming architectural surface).
 """
 
 import os
@@ -122,6 +158,7 @@ import base64
 import logging
 import urllib.error
 import urllib.request
+from collections import Counter
 from typing import List, Optional
 
 import cv2
@@ -154,6 +191,25 @@ GRID_ROWS = 18
 # about tolerating a one-or-two-cell miss from an otherwise clean,
 # self-consistent grid, not about accepting wildly wrong dimensions.
 GRID_DIM_TOLERANCE = int(os.environ.get("LEVEL2_WALL_TRIM_MASK_DIM_TOLERANCE", "2"))
+
+# Max allowed absolute deviation, per ROW, between an individual row's
+# length and the grid's own majority row length, for that row to be
+# padded/truncated to match rather than the whole grid being rejected
+# as inconsistent. See the module docstring's "PER-ROW LENGTH
+# TOLERANCE" section for the real case (IMG_8310, second investigation)
+# that motivated this: 17 of 18 rows exactly correct, one row a single
+# character short in a long same-character run -- previously this
+# killed the entire grid via the "rows must all match each other"
+# check, discarding 17 rows of clean data over one row's narrow
+# miscount. Deliberately separate from GRID_DIM_TOLERANCE (which
+# governs the grid's OVERALL shape against GRID_ROWS x GRID_COLS) --
+# this one governs individual rows against each other, a different
+# question. Same conservative-tolerance philosophy: forgive a narrow
+# miscount, still reject genuine chaos (many rows, wildly different
+# lengths -- see the wall_trim row-length data from the first IMG_8310
+# investigation: 26-41 chars, no pattern -- that case has multiple rows
+# far outside this tolerance and still correctly degrades to empty).
+ROW_LEN_TOLERANCE = int(os.environ.get("LEVEL2_WALL_TRIM_MASK_ROW_LEN_TOLERANCE", "2"))
 
 _VALID_CHARS = frozenset("A.")
 
@@ -307,19 +363,58 @@ def identify_wall_trim(img) -> tuple:
             return {"grid": [], "error": report["error"]}, report
 
         actual_rows = len(grid)
-        row_lengths = {len(row) for row in grid}
+        row_len_list = [len(row) for row in grid]
+        row_lengths = set(row_len_list)
 
         if len(row_lengths) != 1:
-            # Rows disagree with EACH OTHER on length -- this is the
-            # genuinely chaotic failure mode, not a clean near-miss.
-            # There's no safe way to rasterize inconsistent row widths
-            # into a rectangular grid, so this still degrades to empty
-            # regardless of GRID_DIM_TOLERANCE.
-            report["error"] = (
-                f"malformed_grid (inconsistent row lengths {sorted(row_lengths)}, "
-                f"rows must all match each other): {str(grid)[:2000]!r}"
+            # Rows disagree with each other on length. Before treating
+            # this as chaotic garbage, check whether it's a narrow
+            # near-miss on a few rows rather than genuine inconsistency
+            # -- see ROW_LEN_TOLERANCE's docstring for the real case
+            # this handles. Majority row length wins; any row within
+            # ROW_LEN_TOLERANCE of it gets padded/truncated to match.
+            # A row further off than that means the response really is
+            # inconsistent -- still degrades to empty, same contract as
+            # before, just with an actual tolerance window instead of
+            # zero.
+            mode_len, _count = Counter(row_len_list).most_common(1)[0]
+            too_far = [i for i, n in enumerate(row_len_list) if abs(n - mode_len) > ROW_LEN_TOLERANCE]
+
+            if too_far:
+                report["error"] = (
+                    f"malformed_grid (inconsistent row lengths {sorted(row_lengths)}, "
+                    f"rows must all match each other): {str(grid)[:2000]!r}"
+                )
+                return {"grid": [], "error": report["error"]}, report
+
+            normalized = []
+            changed = []
+            for i, row in enumerate(grid):
+                diff = mode_len - len(row)
+                if diff > 0:
+                    # Short row -- pad by repeating its own last
+                    # character. The real case this handles is a
+                    # miscounted run of the SAME repeated character
+                    # (e.g. one 'A' dropped from a long wall run), so
+                    # extending with that row's own trailing character
+                    # is the best available guess, not an arbitrary
+                    # choice of 'A' or '.' that would bias the count
+                    # toward wall or non-wall.
+                    pad_char = row[-1] if row else "."
+                    row = row + pad_char * diff
+                    changed.append(f"row {i + 1}: padded +{diff} ({pad_char!r})")
+                elif diff < 0:
+                    row = row[:mode_len]
+                    changed.append(f"row {i + 1}: truncated {-diff}")
+                normalized.append(row)
+
+            grid = normalized
+            report["row_length_normalized"] = f"target_len={mode_len}: " + "; ".join(changed)
+            logger.info(
+                f"level2_wall_trim_mask: normalized row lengths {sorted(row_lengths)} "
+                f"-> uniform {mode_len} ({report['row_length_normalized']})"
             )
-            return {"grid": [], "error": report["error"]}, report
+            row_lengths = {mode_len}
 
         actual_cols = row_lengths.pop()
 
