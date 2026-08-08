@@ -79,6 +79,7 @@ from oracleCorrection import (  # noqa: E402
     compute_oracle_guided_deltas,
     apply_oracle_guided_correction,
     apply_hue_fidelity_gate,
+    apply_wall_color_anchor,
     apply_illumination_floor,
     compute_recoverability_map,
     smooth_deltas_in_mask,
@@ -343,29 +344,60 @@ def run_oracle_interior(source_path: str, output_path: str, orig_img) -> dict:
     # catch this since it only bounds magnitude, not whether Oracle's own
     # color endpoint is itself valid. See
     # oracleCorrection.apply_hue_fidelity_gate's docstring for the full
-    # evidence and mechanism. Shadow-mode gated via
-    # WALL_TRIM_MASK_SHADOW_MODE -- computed and logged every run, only
-    # allowed to change corrected_img once that flag is explicitly turned
-    # off after review. Deliberately NOT wiring in apply_illumination_floor
-    # in this patch -- that fix depends on the same wall_trim_mask Vision
-    # call but is a separate, not-yet-revalidated piece; keeping this
-    # patch to exactly the gate that's been confirmed twice.
+    # evidence and mechanism.
+    #
+    # SCOPING CHANGE (Aug 2026, second IMG_8310 investigation): this gate
+    # now runs on ceiling_mask_for_arch ALONE, not the combined wall+
+    # ceiling architectural_mask it used before. Wall gets its own,
+    # different treatment immediately below (apply_wall_color_anchor) --
+    # see that function's docstring for why wall and ceiling need
+    # opposite rules, not the same one. Confirmed on a real production
+    # run that the combined mask was the actual mechanism behind walls
+    # coming back visibly cream/tan: the gate was working exactly as
+    # designed, on a rule that's correct for ceiling and wrong for wall.
+    #
+    # Shadow-mode gated via WALL_TRIM_MASK_SHADOW_MODE -- computed and
+    # logged every run, only allowed to change corrected_img once that
+    # flag is explicitly turned off after review.
     if WALL_TRIM_MASK_SHADOW_MODE:
         _hue_shadow_result, hue_gate_shadow = apply_hue_fidelity_gate(
-            orig_img, corrected_img, architectural_mask, mask_grid_cols=WALL_TRIM_GRID_COLS
+            orig_img, corrected_img, ceiling_mask_for_arch, mask_grid_cols=WALL_TRIM_GRID_COLS
         )
-        print(f"[ORACLE-ROUTER] [HUE-GATE SHADOW MODE] architectural coverage="
+        print(f"[ORACLE-ROUTER] [HUE-GATE SHADOW MODE] ceiling coverage="
               f"{hue_gate_shadow.get('masked_area_fraction', 0.0)*100:.1f}%  "
               f"would-revert a={hue_gate_shadow.get('a_reverted_fraction', 0.0)*100:.1f}% "
               f"b={hue_gate_shadow.get('b_reverted_fraction', 0.0)*100:.1f}% "
               f"(NOT applied -- shadow mode, corrected_img unchanged)", file=sys.stderr)
     else:
         corrected_img, hue_gate_shadow = apply_hue_fidelity_gate(
-            orig_img, corrected_img, architectural_mask, mask_grid_cols=WALL_TRIM_GRID_COLS
+            orig_img, corrected_img, ceiling_mask_for_arch, mask_grid_cols=WALL_TRIM_GRID_COLS
         )
-        print(f"[ORACLE-ROUTER] [HUE-GATE LIVE] applied to corrected_img "
+        print(f"[ORACLE-ROUTER] [HUE-GATE LIVE] applied to ceiling region "
               f"(shadow mode off)", file=sys.stderr)
     routing_report["steps"]["hue_fidelity_gate"] = hue_gate_shadow
+
+    # WALL COLOR ANCHOR -- see oracleCorrection.apply_wall_color_anchor's
+    # docstring for the full mechanism and evidence. Wall's true paint
+    # color is not neutral and isn't supposed to become neutral, unlike
+    # ceiling above -- this locks wall a/b to the Original's own captured
+    # values rather than gating Oracle's move toward zero. Same shadow-
+    # mode flag as the hue-fidelity gate, since it depends on the same
+    # wall_trim_mask Vision call -- NOT yet validated against a real
+    # batch, ship shadow-first same as everything else here.
+    if WALL_TRIM_MASK_SHADOW_MODE:
+        _wall_anchor_shadow_result, wall_color_anchor_report = apply_wall_color_anchor(
+            orig_img, corrected_img, wall_mask, mask_grid_cols=WALL_TRIM_GRID_COLS
+        )
+        print(f"[ORACLE-ROUTER] [WALL-ANCHOR SHADOW MODE] wall coverage="
+              f"{wall_color_anchor_report.get('masked_area_fraction', 0.0)*100:.1f}% "
+              f"(NOT applied -- shadow mode, corrected_img unchanged)", file=sys.stderr)
+    else:
+        corrected_img, wall_color_anchor_report = apply_wall_color_anchor(
+            orig_img, corrected_img, wall_mask, mask_grid_cols=WALL_TRIM_GRID_COLS
+        )
+        print(f"[ORACLE-ROUTER] [WALL-ANCHOR LIVE] applied to wall region "
+              f"(shadow mode off)", file=sys.stderr)
+    routing_report["steps"]["wall_color_anchor"] = wall_color_anchor_report
 
     # ILLUMINATION FLOOR -- see oracleCorrection.apply_illumination_floor's
     # own docstring for the full mechanism and evidence: Oracle's own
@@ -373,14 +405,26 @@ def run_oracle_interior(source_path: str, output_path: str, orig_img) -> dict:
     # ceiling/trim (confirmed on IMG_8253/IMG_8317 as a mean-L lift of only
     # +1.6 to +2.2 out of 255), and apply_oracle_guided_correction's clamp
     # silently inherits that conservatism as a hard ceiling on the final
-    # correction. Same architectural_mask as the hue-fidelity gate above
-    # (walls/ceiling/trim only) and the same recov_map already computed
-    # earlier in this function -- no new Vision call, no new mask. Only
-    # RAISES L, never lowers it, never touches a/b, so this is orthogonal
-    # to the hue gate above; call order between the two doesn't matter.
+    # correction. Still uses the COMBINED architectural_mask (wall +
+    # ceiling) deliberately -- unlike the two hue functions above,
+    # brightness scoping is not part of this session's separation fix,
+    # per Sam's explicit instruction not to push ceiling brightness any
+    # further; this only touches L, never a/b, so it doesn't reintroduce
+    # the wall/ceiling hue-conflation problem those two functions above
+    # just fixed. Same recov_map already computed earlier in this
+    # function -- no new Vision call, no new mask.
+    #
+    # FEATHERING FIX (Aug 2026, IMG_8310 investigation): mask_grid_cols
+    # is now passed here -- it previously was not, even though the
+    # hue-fidelity gate call right above it always has. apply_
+    # illumination_floor's own docstring now documents why that omission
+    # produced hard rectangular grid-cell edges the first time this
+    # floor actually went live on a real photo (wall_trim_mask
+    # succeeding for the first time this session exposed a bug that had
+    # been sitting here, unreachable, all along).
     if ILLUM_FLOOR_SHADOW_MODE:
         _floor_shadow_result, illum_floor_report = apply_illumination_floor(
-            orig_img, corrected_img, recov_map, architectural_mask
+            orig_img, corrected_img, recov_map, architectural_mask, mask_grid_cols=WALL_TRIM_GRID_COLS
         )
         print(f"[ORACLE-ROUTER] [ILLUM-FLOOR SHADOW MODE] mean_l_before="
               f"{illum_floor_report.get('mean_l_before', 0.0):.1f}  "
@@ -390,7 +434,7 @@ def run_oracle_interior(source_path: str, output_path: str, orig_img) -> dict:
               file=sys.stderr)
     else:
         corrected_img, illum_floor_report = apply_illumination_floor(
-            orig_img, corrected_img, recov_map, architectural_mask
+            orig_img, corrected_img, recov_map, architectural_mask, mask_grid_cols=WALL_TRIM_GRID_COLS
         )
         print(f"[ORACLE-ROUTER] [ILLUM-FLOOR LIVE] applied to corrected_img "
               f"(shadow mode off) mean_l_before={illum_floor_report.get('mean_l_before', 0.0):.1f} "
