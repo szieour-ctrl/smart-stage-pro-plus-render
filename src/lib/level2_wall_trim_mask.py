@@ -139,7 +139,26 @@ def _call_vision_api(image_b64: str, media_type: str) -> dict:
         text = text.strip("`")
         if text.lower().startswith("json"):
             text = text[4:]
-    return json.loads(text.strip())
+    text = text.strip()
+
+    # Same defensive extraction as level2_ceiling_mask.py's _call_vision_api
+    # -- previously this was a bare json.loads(text.strip()), which raises
+    # a JSONDecodeError carrying only a line/column position, with NO raw
+    # model output captured anywhere in the resulting error. That's a worse
+    # diagnostic gap than the malformed_grid truncation fixed below: on a
+    # parse failure, there was literally nothing to look at. Finding the
+    # first '{' and raw-decoding from there also tolerates a model response
+    # with leading or trailing prose around the JSON object, which a bare
+    # json.loads does not.
+    if not text:
+        raise ValueError(f"empty_response_text (stop_reason={payload.get('stop_reason')!r})")
+    brace_start = text.find("{")
+    if brace_start == -1:
+        raise ValueError(f"no_json_object_found -- raw_text={text[:2000]!r}")
+    try:
+        return json.JSONDecoder().raw_decode(text, brace_start)[0]
+    except json.JSONDecodeError as e:
+        raise ValueError(f"{e} -- raw_text={text[:2000]!r}") from e
 
 
 def identify_wall_trim(img) -> tuple:
@@ -183,7 +202,7 @@ def identify_wall_trim(img) -> tuple:
         if not isinstance(grid, list) or len(grid) != GRID_ROWS or any(
             not isinstance(row, str) or len(row) != GRID_COLS for row in grid
         ):
-            report["error"] = f"malformed_grid (expected {GRID_ROWS}x{GRID_COLS}): {str(grid)[:200]!r}"
+            report["error"] = f"malformed_grid (expected {GRID_ROWS}x{GRID_COLS}): {str(grid)[:2000]!r}"
             return {"grid": [], "error": report["error"]}, report
 
         n_wall_cells = sum(row.count("A") for row in grid)
