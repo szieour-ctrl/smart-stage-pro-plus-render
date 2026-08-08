@@ -350,7 +350,8 @@ MAX_MEAN_RESIDUAL_PX = 8.0
 
 
 def run_oracle_driven_pipeline(orig_img, oracle_img, log_prefix="[ORACLE-DRIVEN]",
-                                vision_gate_regions=None, vision_report=None):
+                                vision_gate_regions=None, vision_report=None,
+                                wall_trim_grid=None, ceiling_grid=None):
     """
     Single labeled entry point for the same-room Oracle-driven path:
     align -> (hard alignment-quality check) -> compute deltas -> apply correction.
@@ -373,6 +374,28 @@ def run_oracle_driven_pipeline(orig_img, oracle_img, log_prefix="[ORACLE-DRIVEN]
     vision_report: the report dict from judge_recoverability(), for logging
         alongside alignment_report/clip_report. Optional; only meaningful
         if vision_gate_regions is also given.
+
+    wall_trim_grid: optional ["grid"] output of
+        level2_wall_trim_mask.identify_wall_trim(). ceiling_grid: optional
+        ["grid"] output of level2_ceiling_mask.identify_ceiling(). When
+        either is given, rasterized and UNIONed into a single
+        architectural-surface mask (see apply_hue_fidelity_gate and
+        level2_wall_trim_mask's module docstring for why ceiling is a
+        separate Vision call unioned in here, not part of wall_trim's own
+        category). SHADOW MODE, same posture as vision_gate_regions and
+        every other Vision gate in this pipeline: this function computes
+        the mask and logs its coverage/would-be effect
+        (a_reverted_fraction / b_reverted_fraction from
+        apply_hue_fidelity_gate, run but NOT applied to corrected_img) --
+        it does NOT call apply_hue_fidelity_gate on the returned
+        corrected_img yet. Callers wanting the gate LIVE must call
+        apply_hue_fidelity_gate explicitly themselves on this function's
+        output, same as apply_saturation_cap and smooth_deltas_in_mask
+        are already caller-invoked rather than auto-applied here. This
+        keeps the rollout discipline identical across every gate in this
+        module: compute, log, review a real batch, THEN wire live -- do
+        not skip straight to auto-applying just because the shadow-mode
+        plumbing for vision_gate_regions already exists above.
 
     Returns:
         corrected_img, report: dict merging alignment_report, clip_report,
@@ -449,6 +472,46 @@ def run_oracle_driven_pipeline(orig_img, oracle_img, log_prefix="[ORACLE-DRIVEN]
             "green": 100.0 * (recov_class == 2).sum() / total_px,
         },
     }
+
+    # --- Hue-fidelity gate: SHADOW MODE ONLY, same posture as the Vision
+    # recoverability gate above. Computes the architectural mask and runs
+    # apply_hue_fidelity_gate to find out what IT WOULD DO, logs that,
+    # and discards the result -- corrected_img returned below is always
+    # the pre-gate version until this is explicitly wired live by a
+    # caller. See run_oracle_driven_pipeline's docstring for why this
+    # stays shadow-only here even though the plumbing exists.
+    hue_gate_shadow = None
+    if wall_trim_grid is not None or ceiling_grid is not None:
+        from level2_wall_trim_mask import rasterize_wall_trim_mask, GRID_COLS as WALL_TRIM_GRID_COLS
+        wall_mask = (
+            rasterize_wall_trim_mask(wall_trim_grid, orig_img.shape)
+            if wall_trim_grid is not None
+            else np.zeros(orig_img.shape[:2], dtype=np.float32)
+        )
+        ceiling_mask_for_hue = np.zeros(orig_img.shape[:2], dtype=np.float32)
+        if ceiling_grid is not None:
+            try:
+                from level2_ceiling_mask import rasterize_ceiling_mask
+                ceiling_mask_for_hue = rasterize_ceiling_mask(ceiling_grid, orig_img.shape)
+            except ImportError:
+                print(f"{log_prefix} level2_ceiling_mask not importable, "
+                      f"hue-gate shadow test proceeding with wall/trim only")
+
+        architectural_mask = np.clip(wall_mask + ceiling_mask_for_hue, 0.0, 1.0)
+
+        _shadow_result, hue_gate_shadow = apply_hue_fidelity_gate(
+            orig_img, corrected_img, architectural_mask, mask_grid_cols=WALL_TRIM_GRID_COLS
+        )
+        # _shadow_result deliberately discarded -- shadow mode never
+        # changes what this function returns.
+        print(f"{log_prefix} [HUE-GATE SHADOW MODE] architectural coverage="
+              f"{hue_gate_shadow.get('masked_area_fraction', 0.0)*100:.1f}%  "
+              f"would-revert a={hue_gate_shadow.get('a_reverted_fraction', 0.0)*100:.1f}% "
+              f"b={hue_gate_shadow.get('b_reverted_fraction', 0.0)*100:.1f}% "
+              f"(NOT applied -- shadow mode, corrected_img unchanged)")
+
+    report["hue_gate_shadow"] = hue_gate_shadow
+
     print(f"{log_prefix} alignment: {alignment_report['n_inliers']}/{alignment_report['n_matches']} "
           f"inliers, mean residual {alignment_report['mean_residual_px']:.2f}px")
     print(f"{log_prefix} gate source: {report['gate_source']}")
@@ -551,6 +614,153 @@ def apply_saturation_cap(orig_img, corrected_img, restricted_mask, max_increase_
         "applied": True,
         "max_increase_ratio": max_increase_ratio,
         "pixels_capped_fraction": pixels_capped_fraction,
+    }
+
+
+def apply_hue_fidelity_gate(orig_img, corrected_img, architectural_mask,
+                             feather_sigma=None, mask_grid_cols=None):
+    """
+    Scoped hue-fidelity constraint -- applies ONLY inside architectural_mask
+    (e.g. Vision-identified walls/ceiling/trim, same rasterization pattern
+    as level2_sky_grass_mask / level2_ceiling_mask), not globally.
+
+    PROBLEM THIS FIXES: apply_oracle_guided_correction() trusts Oracle's a/b
+    (color) channels exactly as much as its L (brightness) channel, clamped
+    only to [min(orig,oracle), max(orig,oracle)] -- a magnitude bound, not
+    a direction bound. Confirmed on a real photo (IMG_8310, dining/living
+    room): a neutral gray wall's Oracle render carried a real hue-family
+    shift, not just a brightness lift -- LAB a went from +1.9 (orig) to
+    -1.0 (Oracle) on one wall region and -2.3 to -3.9 on another; b went
+    from +9.8 to +16.2 and from -4.6 to +1.4 -- crossing from cool to warm
+    outright on the second region. The existing clamp does nothing here:
+    it only bounds how far a pixel can move, not whether Oracle's own
+    endpoint value is itself correct, and a globally-biased Oracle render
+    stays fully "in bounds" of its own bad value.
+
+    ROOT CAUSE, why this is scoped and not global: this is a known
+    generative-rendering failure mode specifically on underexposed rooms --
+    weak real signal in a dark room gives Flux more room to default toward
+    a statistically "plausible" neutral color rather than the actual
+    captured one (a same-session photo of a well-lit room, same style of
+    region, showed no measurable a/b drift -- the failure tracks how dark
+    the original region was, not a universal Oracle bias). A global hue
+    lock would recreate the exact over-defensive "Protect" failure this
+    pipeline already moved away from once -- wood tone, fabric, and
+    genuinely color-cast walls are explicitly ALLOWED to shift hue as
+    part of legitimate cast removal (see oracleGeneration.py's Color
+    Temperature -- Independent of Brightness section). This gate is
+    deliberately scoped to Vision-identified architectural/neutral
+    surfaces only (walls, ceiling, trim) -- the same category of surface
+    the governing prompt already treats as "must hold true captured
+    color," never furniture, fabric, or wood.
+
+    WHAT "toward neutral" MEANS, per-pixel per-channel (a and b handled
+    independently): Oracle's move is accepted only if it reduces the
+    channel's distance from true zero (LAB neutral) without crossing zero
+    -- i.e. genuine color-cast neutralization. Any move that INCREASES
+    magnitude or FLIPS SIGN is rejected outright for that pixel/channel,
+    and the already-corrected image's Original value is kept instead.
+    This deliberately does NOT touch L -- brightness recovery is
+    untouched by this gate, still fully driven by Oracle via
+    apply_oracle_guided_correction. Only the already-corrected image's
+    a/b channels, inside the mask, are re-evaluated against this rule.
+
+    Prototyped against the real IMG_8310 wall crops before being written
+    here: with this rule applied, both wall regions kept L at Oracle's
+    full target (71/75, unchanged) while a/b returned to within ~1 LAB
+    unit of the Original's true near-neutral values, instead of the
+    uncorrected pipeline's +16.2b / sign-flipped-to-warm result. NOT yet
+    re-run through the live pipeline on a real batch -- a hand-computed
+    prototype on two crops is not the same as confirming this end-to-end.
+
+    architectural_mask: raw (unfeathered) float32/bool mask, same H x W
+        as orig_img, from a Vision-identified walls/ceiling/trim
+        classifier -- NOT YET BUILT as of this function. Follow the same
+        grid-based pattern as level2_sky_grass_mask.py /
+        level2_ceiling_mask.py rather than a bbox approach, per this
+        module's established reasoning for why bbox failed twice on real
+        photos. Until that classifier exists, this function is dead code
+        with no caller -- see run_oracle_driven_pipeline, which does NOT
+        call this yet, same as apply_saturation_cap and
+        smooth_deltas_in_mask are also caller-invoked, not auto-wired.
+        An empty/all-zero mask (module not yet wired in, disabled, or
+        genuinely no architectural surface detected) is a true no-op --
+        returns corrected_img unchanged, same "empty mask = apply
+        nothing" contract as apply_saturation_cap and
+        smooth_deltas_in_mask.
+
+    feather_sigma / mask_grid_cols: same meaning and same derivation
+        logic as apply_saturation_cap -- see that docstring, not
+        duplicated here. Same failure mode (hard mask edge -> visible
+        seam), same fix (feather proportional to source grid resolution).
+
+    Returns: corrected BGR image with the gate applied, and a report dict
+        with the fraction of masked pixels where Oracle's a/b move was
+        rejected and reverted toward Original -- always check the actual
+        render, this just tells you where to look, same as every other
+        report dict in this module.
+    """
+    if feather_sigma is None:
+        if mask_grid_cols:
+            cell_width_px = architectural_mask.shape[1] / float(mask_grid_cols)
+            feather_sigma = cell_width_px / 2.0
+        else:
+            feather_sigma = GATE_FEATHER_SIGMA
+
+    mask = cv2.GaussianBlur(architectural_mask.astype(np.float32), ksize=(0, 0), sigmaX=feather_sigma)
+    mask = np.clip(mask, 0.0, 1.0)
+
+    if mask.max() < 1e-6:
+        return corrected_img, {
+            "applied": False, "reason": "empty_mask",
+            "a_reverted_fraction": 0.0, "b_reverted_fraction": 0.0,
+        }
+
+    orig_lab = cv2.cvtColor(orig_img, cv2.COLOR_BGR2LAB).astype(np.float32)
+    corr_lab = cv2.cvtColor(corrected_img, cv2.COLOR_BGR2LAB).astype(np.float32)
+
+    L_corr, a_corr, b_corr = cv2.split(corr_lab)
+    _, a_orig, b_orig = cv2.split(orig_lab)
+
+    # OpenCV stores LAB a/b as 0-255 with 128 as the neutral (zero) point.
+    # Recenter to signed values so "toward zero" and "sign flip" mean the
+    # actual neutral-axis crossing, not an artifact of the 0-255 encoding.
+    a_orig_s = a_orig - 128.0
+    b_orig_s = b_orig - 128.0
+    a_corr_s = a_corr - 128.0
+    b_corr_s = b_corr - 128.0
+
+    def constrain_toward_neutral(orig_s, corr_s):
+        same_sign = np.sign(orig_s) == np.sign(corr_s)
+        shrank = np.abs(corr_s) <= np.abs(orig_s)
+        allowed = same_sign & shrank
+        constrained_s = np.where(allowed, corr_s, orig_s)
+        reverted_fraction = float((~allowed).mean())
+        return constrained_s, reverted_fraction
+
+    a_constrained_s, a_reverted_frac = constrain_toward_neutral(a_orig_s, a_corr_s)
+    b_constrained_s, b_reverted_frac = constrain_toward_neutral(b_orig_s, b_corr_s)
+
+    # Blend by mask strength, same reasoning as apply_saturation_cap -- a
+    # partially-confident mask edge should not produce a visible seam.
+    a_new_s = a_corr_s * (1 - mask) + a_constrained_s * mask
+    b_new_s = b_corr_s * (1 - mask) + b_constrained_s * mask
+
+    a_new = np.clip(a_new_s + 128.0, 0, 255)
+    b_new = np.clip(b_new_s + 128.0, 0, 255)
+
+    new_lab = cv2.merge([L_corr, a_new, b_new]).astype(np.uint8)
+    result = cv2.cvtColor(new_lab, cv2.COLOR_LAB2BGR)
+
+    # Reverted fractions are computed over the WHOLE frame for simplicity;
+    # they understate the effective in-mask impact where mask < 1. Cross-
+    # reference against masked_area_fraction if an in-mask-only rate is
+    # needed for logging.
+    return result, {
+        "applied": True,
+        "a_reverted_fraction": a_reverted_frac,
+        "b_reverted_fraction": b_reverted_frac,
+        "masked_area_fraction": float(mask.mean()),
     }
 
 
