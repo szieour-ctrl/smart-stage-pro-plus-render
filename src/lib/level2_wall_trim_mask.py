@@ -80,6 +80,40 @@ This is a minor feather-radius inaccuracy, not a correctness bug, and
 does not reproduce the banding artifact this change fixes -- but it's a
 real, known imprecision worth closing in oracleCorrection.py at some
 point rather than leaving implicit.
+
+PROMPT STRUCTURE (added Aug 2026, second IMG_8310 investigation):
+GRID_DIM_TOLERANCE (above) widened what counts as recoverable, but a
+real production run on IMG_8310 after that patch still failed --
+this time with row lengths of [24, 25, 28] WITHIN THE SAME grid, a
+genuinely inconsistent response that tolerance can't and shouldn't
+absorb (see the "rows disagree with EACH OTHER" branch in
+identify_wall_trim -- that check is untouched by this change and still
+correctly rejects that failure mode).
+
+Real side-by-side data from that investigation: level2_ceiling_mask.py
+puts its full instructions and the image TOGETHER in a single user
+turn. This module previously put instructions in the API `system`
+field and gave the user turn only "Classify this photo's grid." On the
+same IMG_8310 photo, in the same session, ceiling's grid came back
+correct in row count and off by exactly one character on a handful of
+rows (a narrow, comprehensible miscount); this module's grid came back
+with row lengths bouncing all over the place with no consistent
+pattern (a much more severe failure). That is the most concrete,
+evidence-backed lead available for why this module's grid quality is
+worse than ceiling's on the same input -- not proof, since the two
+classifiers ask about different visual categories, but a real
+structural difference correlated with a real severity gap on real data.
+
+_call_vision_api now puts the full instructional prompt and the image
+together in one user-turn `content` list (text block first, then
+image), with no separate `system` field -- matching level2_ceiling_mask.py's
+structure. Nothing about the classification task, the grid contract,
+or any of the failure-mode handling in identify_wall_trim /
+rasterize_wall_trim_mask changed -- this is purely a request-structure
+change to test whether it improves grid reliability, same as it
+apparently does for ceiling. If a real batch shows this doesn't help,
+the fix is reverting this one function, not questioning the tolerance
+or consistency logic elsewhere in this file.
 """
 
 import os
@@ -153,7 +187,15 @@ def _encode_for_vision(img) -> Optional[tuple]:
 def _call_vision_api(image_b64: str, media_type: str) -> dict:
     """Raw urllib.request call, no SDK -- same pattern as every other Vision
     module in this codebase (level0_scene_classifier.py, level2_diagnosis.py,
-    level0_sky_vegetation_mask.py, level2_ceiling_mask.py)."""
+    level0_sky_vegetation_mask.py, level2_ceiling_mask.py).
+
+    PROMPT STRUCTURE (Aug 2026, second IMG_8310 investigation -- see module
+    docstring's "PROMPT STRUCTURE" section for the real-photo evidence):
+    instructions and image are combined into a single user-turn `content`
+    list, no separate `system` field -- matching level2_ceiling_mask.py's
+    structure, which produced measurably better grid consistency on the
+    same real photo. Text block comes first, then the image, in that
+    single user message."""
     last_col = chr(ord('A') + GRID_COLS - 1)
     prompt_text = SYSTEM_PROMPT.format(cols=GRID_COLS, rows=GRID_ROWS, last_col=last_col)
 
@@ -161,12 +203,11 @@ def _call_vision_api(image_b64: str, media_type: str) -> dict:
         "model": WALL_TRIM_MASK_MODEL,
         "max_tokens": 1536,  # sized for GRID_ROWS strings of GRID_COLS chars each,
         # plus JSON overhead -- comfortably more than 24x18=432 chars needs.
-        "system": prompt_text,
         "messages": [{
             "role": "user",
             "content": [
+                {"type": "text", "text": prompt_text},
                 {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": image_b64}},
-                {"type": "text", "text": "Classify this photo's grid."},
             ],
         }],
     }).encode("utf-8")
