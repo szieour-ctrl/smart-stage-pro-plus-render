@@ -211,6 +211,44 @@ GRID_DIM_TOLERANCE = int(os.environ.get("LEVEL2_WALL_TRIM_MASK_DIM_TOLERANCE", "
 # far outside this tolerance and still correctly degrades to empty).
 ROW_LEN_TOLERANCE = int(os.environ.get("LEVEL2_WALL_TRIM_MASK_ROW_LEN_TOLERANCE", "2"))
 
+# PLAUSIBILITY CAP (added Aug 2026, IMG_8291 investigation) -- mirrors
+# level2_ceiling_mask.py's MAX_CEILING_COVERAGE_FRACTION, closing the
+# same gap for this sibling module: a WELL-FORMED, internally-consistent
+# grid can still be wrong about how much of the frame is plausibly wall/
+# trim, and neither GRID_DIM_TOLERANCE nor ROW_LEN_TOLERANCE catch that --
+# both only check the grid's SHAPE and internal agreement, never whether
+# its content is a sane answer.
+#
+# Confirmed necessary on real production data, not theoretical: four
+# separate identify_wall_trim() calls on the exact same original photo
+# (IMG_8291) returned wall_trim_cell_fraction of 22.0%, 50.3%, 0%
+# (malformed_grid that run), and 51.1% -- the same pixels, wildly
+# different answers. 22% is a plausible reading for that room (a
+# living/dining/kitchen combo shot with a lot of open floor and
+# furniture). ~50% is not, for the same photo -- and a mask that size
+# feeding downstream consumers (apply_wall_color_anchor, and critically
+# apply_illumination_floor, which is live-by-default and reads this
+# mask directly regardless of THIS module's own shadow state) pushed a
+# visible brightness glow/halo around furniture silhouettes on a real
+# corrected image, not a subtle miscalibration.
+#
+# 0.40 is set with real headroom above the confirmed-good 22% reading
+# (roughly 1.8x) while sitting clearly below both confirmed-bad readings
+# (50.3%, 51.1%) -- deliberately more conservative than ceiling's 0.50,
+# because wall/trim's own confirmed failures cluster much closer to a
+# "normal" reading than ceiling's did (0.68/0.965 vs. a normal ~15-20%
+# ceiling), so the same 0.50 cap would only barely catch one of the two
+# confirmed failures here and would sit uncomfortably close to plausible
+# heavy-trim shots (a tight hallway, a close doorway crop). This has
+# ONE real photo's evidence behind it (one good reading, two bad),
+# same caveat the ceiling module's cap carries -- tune via
+# LEVEL2_WALL_TRIM_MAX_COVERAGE_FRACTION if a real batch shows this
+# wrong in either direction, same discipline as every other unmeasured
+# constant in this pipeline.
+MAX_WALL_TRIM_COVERAGE_FRACTION = float(
+    os.environ.get("LEVEL2_WALL_TRIM_MAX_COVERAGE_FRACTION", "0.40")
+)
+
 _VALID_CHARS = frozenset("A.")
 
 SYSTEM_PROMPT = """You are classifying a grid overlaid on a real estate interior photograph into a {rows}x{cols} grid of cells (row 1 to {rows} top to bottom, column A to {last_col} left to right).
@@ -448,7 +486,25 @@ def identify_wall_trim(img) -> tuple:
             )
 
         n_wall_cells = sum(row.count("A") for row in grid)
-        report["wall_trim_cell_fraction"] = n_wall_cells / float(actual_rows * actual_cols)
+        wall_trim_cell_fraction = n_wall_cells / float(actual_rows * actual_cols)
+        report["wall_trim_cell_fraction"] = wall_trim_cell_fraction
+
+        # PLAUSIBILITY CAP -- see MAX_WALL_TRIM_COVERAGE_FRACTION's module-
+        # level comment for the real-photo evidence. This grid passed every
+        # SHAPE check above (dimensions, internal row-length consistency) --
+        # this is a separate, later check on whether its CONTENT is a sane
+        # answer, same "malformed vs. implausible are different failure
+        # modes" distinction level2_ceiling_mask.py's identical cap draws.
+        # Degrades to empty, same contract as every other rejection path in
+        # this function -- callers already treat empty as "no architectural
+        # surface identified," so this needs no new caller-side handling.
+        if wall_trim_cell_fraction > MAX_WALL_TRIM_COVERAGE_FRACTION:
+            report["error"] = (
+                f"implausible_coverage: grid classified {wall_trim_cell_fraction*100:.1f}% of frame "
+                f"as wall/trim, exceeds plausibility cap of {MAX_WALL_TRIM_COVERAGE_FRACTION*100:.0f}% "
+                f"-- degrading to empty per this module's own no-application-on-suspect-data contract"
+            )
+            return {"grid": [], "error": report["error"]}, report
 
         return {"grid": grid, "error": None}, report
 
