@@ -47,6 +47,46 @@ GATE_RED = 0.0
 ILLUM_BLUR_SIGMA = 15
 COLOR_BLUR_SIGMA = 15
 
+# ---- §2C: recoverability-adaptive delta resolution ----
+# ILLUM_BLUR_SIGMA above is applied UNIFORMLY across the whole frame by
+# default -- confirmed this session (redesign plan §2C) to be throwing
+# away real, Oracle-rendered local detail before correction ever sees it:
+# a chair's shadow detail visible in Oracle's raw render, genuinely
+# absent from the corrected output, because the Gaussian blur smoothing
+# the delta erased it before apply_recoverability_weighted_correction's
+# green reach fraction (§2A) ever got a chance to use it. Pushing green's
+# reach to 1.0 is pointless if the signal reaching that ceiling has
+# already had its local detail averaged out.
+#
+# FIX: illumination_delta is now a feathered per-pixel BLEND between a
+# lightly-blurred "detail" version (DETAIL_BLUR_SIGMA) and the existing
+# heavily-blurred "smooth" version (ILLUM_BLUR_SIGMA), driven by
+# classification -- GREEN leans toward the detail version, RED and
+# YELLOW both stay on the heavy default.
+#
+# NOTE this is a DIFFERENT split than §2A's reach fractions: §2A treats
+# yellow as its own asymmetric middle case (channel-split reach). Here,
+# yellow is grouped WITH red, not given its own blend point -- reach
+# fractions are about how far to TRUST a correction target; this is about
+# whether there's real local detail worth preserving in the delta signal
+# in the first place, and yellow's "not clearly either" classification
+# argues for keeping noise suppression on rather than assuming real
+# texture is present under an unconfident read.
+#
+# COLOR (a/b) deltas are deliberately NOT given this treatment -- stay on
+# the fixed COLOR_BLUR_SIGMA everywhere, all classes. Local per-pixel hue
+# variation at this spatial scale is much more often sensor noise than
+# real recoverable color detail (unlike L, which carries real carving/
+# texture/shadow structure); reducing hue smoothing risks introducing
+# color artifacts, not recovering anything genuine. Same L-vs-ab
+# asymmetry §2A's yellow reach fractions are built on.
+#
+# DETAIL_BLUR_SIGMA is a starting point, not a measured constant --
+# env-overridable, same discipline as every other unmeasured constant in
+# this pipeline. Small enough to preserve real local structure, not so
+# small that ordinary sensor noise reads as "detail."
+DETAIL_BLUR_SIGMA = float(os.environ.get("ORACLE_DETAIL_BLUR_SIGMA", "4.0"))
+
 # Gate feathering sigma. The recoverability gate is a hard 3-level classification
 # (0.0/0.5/1.0) computed per-pixel-neighborhood from the Original. Used raw, its
 # boundaries trace object silhouettes (e.g. a dark chair in shadow reads "red"
@@ -246,30 +286,44 @@ def compute_oracle_guided_deltas(orig_img, oracle_aligned, external_gate=None):
     Oracle and the Original. Does not perform alignment -- call
     align_oracle_to_original() first for the same-room case.
 
-    ALL THREE LAB channels now computed (fixed this session -- see
+    ALL THREE LAB channels now computed (fixed a prior session -- see
     apply_oracle_guided_correction docstring for why leaving 'a' fixed at
-    the Original's value was a real bug, not a simplification: confirmed
-    on a real exterior photo, Oracle's own 'a' channel differed from the
-    Original's by +7 in the sky region, and combining Original's 'a' with
-    Oracle's L/b produced a LAB coordinate that belongs to NEITHER image,
-    converting to an HSV saturation that overshot Oracle's own saturation
-    (198 vs Oracle's 150 vs Original's 68). Moving all three channels
-    together, then clamping (see apply_) is the fix.
+    the Original's value was a real bug, not a simplification).
+
+    §2C -- illumination_delta is now RECOVERABILITY-ADAPTIVE, not a single
+    fixed-sigma blur: green-classified pixels get a feathered blend toward
+    a lightly-blurred "detail" version (DETAIL_BLUR_SIGMA) so real local
+    structure Oracle actually rendered isn't smoothed away before
+    apply_recoverability_weighted_correction's green reach fraction can
+    use it; red/yellow stay on the pipeline's original heavy blur
+    (ILLUM_BLUR_SIGMA). See DETAIL_BLUR_SIGMA's module-level comment for
+    full reasoning, including why color_delta_a/b do NOT get this same
+    treatment. This requires computing recoverability_classification
+    BEFORE the L blur now (order changed from prior versions of this
+    function, which computed classification last).
 
     external_gate: optional pre-computed float32 gate map (same H x W as
         orig_img, values 0..1), e.g. from
         level2_vision_recoverability.rasterize_vision_gate(). When given,
         used (still feathered) INSTEAD OF the classical box-filter
-        classifier. When None (default), falls back to the classical
-        classifier unchanged.
+        classifier for the correction-weighting recoverability_map
+        returned below. Does NOT affect the §2C adaptive L blur, which
+        always keys off the CLASSICAL classification specifically (an
+        external float trust map has no red/yellow/green identity to
+        blend blur sigmas against) -- same classical-only convention
+        apply_recoverability_weighted_correction uses.
 
     Returns:
         recoverability_map: float32 gate map, feathered, full-res, aligned to orig_img
         recoverability_classification: uint8 map (0/1/2 = red/yellow/green) from the
             CLASSICAL classifier specifically, always computed regardless of gate source.
-        illumination_delta: float32, L_oracle - L_original, Gaussian-blurred
-        color_delta_a: float32, a_oracle - a_original, Gaussian-blurred (NEW)
-        color_delta_b: float32, b_oracle - b_original, Gaussian-blurred
+        illumination_delta: float32, L_oracle - L_original, recoverability-adaptive blend
+            of a light detail-preserving blur (green) and the pipeline's default heavy
+            blur (red/yellow) -- see §2C note above.
+        color_delta_a: float32, a_oracle - a_original, Gaussian-blurred at COLOR_BLUR_SIGMA,
+            uniform across all classes (unchanged from prior versions)
+        color_delta_b: float32, b_oracle - b_original, Gaussian-blurred at COLOR_BLUR_SIGMA,
+            uniform across all classes (unchanged from prior versions)
     """
     orig_lab = cv2.cvtColor(orig_img, cv2.COLOR_BGR2LAB).astype(np.float32)
     oracle_lab = cv2.cvtColor(oracle_aligned, cv2.COLOR_BGR2LAB).astype(np.float32)
@@ -281,13 +335,33 @@ def compute_oracle_guided_deltas(orig_img, oracle_aligned, external_gate=None):
     color_delta_a_raw = a_oracle - a_orig
     color_delta_b_raw = b_oracle - b_orig
 
-    illumination_delta = cv2.GaussianBlur(illum_delta_raw, ksize=(0, 0), sigmaX=ILLUM_BLUR_SIGMA)
-    color_delta_a = cv2.GaussianBlur(color_delta_a_raw, ksize=(0, 0), sigmaX=COLOR_BLUR_SIGMA)
-    color_delta_b = cv2.GaussianBlur(color_delta_b_raw, ksize=(0, 0), sigmaX=COLOR_BLUR_SIGMA)
-
+    # Classification computed BEFORE the L blur now -- §2C needs it to
+    # decide, per pixel, how much local detail to preserve. external_gate
+    # still overrides the GATE MAP returned below for correction
+    # weighting, but the adaptive L blur always uses the classical
+    # classification, per this function's own docstring above.
     recoverability_map_raw, recoverability_classification = compute_recoverability_map(orig_img)
     gate_source_raw = external_gate if external_gate is not None else recoverability_map_raw
     recoverability_map = cv2.GaussianBlur(gate_source_raw, ksize=(0, 0), sigmaX=GATE_FEATHER_SIGMA)
+
+    # ---- §2C: recoverability-adaptive L blur ----
+    # Feathered green mask, same GATE_FEATHER_SIGMA every other
+    # classification-derived mask in this module uses -- a hard mask
+    # boundary here would reproduce the same object-silhouette artifact
+    # already confirmed and fixed once (see GATE_FEATHER_SIGMA's comment).
+    green_mask_raw = (recoverability_classification == 2).astype(np.float32)
+    green_mask = cv2.GaussianBlur(green_mask_raw, ksize=(0, 0), sigmaX=GATE_FEATHER_SIGMA)
+    green_mask = np.clip(green_mask, 0.0, 1.0)
+
+    illum_delta_detail = cv2.GaussianBlur(illum_delta_raw, ksize=(0, 0), sigmaX=DETAIL_BLUR_SIGMA)
+    illum_delta_smooth = cv2.GaussianBlur(illum_delta_raw, ksize=(0, 0), sigmaX=ILLUM_BLUR_SIGMA)
+    illumination_delta = illum_delta_smooth * (1 - green_mask) + illum_delta_detail * green_mask
+
+    # Color (a/b) deltas: unchanged, fixed COLOR_BLUR_SIGMA everywhere --
+    # deliberately NOT given the adaptive treatment. See DETAIL_BLUR_SIGMA's
+    # module-level comment for why.
+    color_delta_a = cv2.GaussianBlur(color_delta_a_raw, ksize=(0, 0), sigmaX=COLOR_BLUR_SIGMA)
+    color_delta_b = cv2.GaussianBlur(color_delta_b_raw, ksize=(0, 0), sigmaX=COLOR_BLUR_SIGMA)
 
     return recoverability_map, recoverability_classification, illumination_delta, color_delta_a, color_delta_b
 
@@ -400,18 +474,14 @@ def apply_recoverability_weighted_correction(orig_img, oracle_aligned, recoverab
     photos regardless of classifier confidence; hue drift on an uncertain
     pixel is the one that costs something under AB 723).
 
-    WHAT THIS DOES NOT YET FIX: illumination_delta/color_delta_a/b are
-    still the pipeline's default Gaussian-blurred deltas (ILLUM_BLUR_SIGMA/
-    COLOR_BLUR_SIGMA=15) -- this function does NOT implement the redesign
-    plan's §2C (recoverability-adaptive delta resolution, less/no blur in
-    green regions so real local detail Oracle actually rendered isn't
-    smoothed away before it ever reaches this clamp). Green pixels here
-    get the full REACH ceiling, but the delta signal feeding that reach
-    may still be a smoothed average rather than the sharp local detail
-    Oracle rendered. If a green region still looks flatter than expected
-    after this ships, that's very likely §2C's gap, not this function's --
-    the redesign plan flagged these two as tightly coupled and meant to be
-    built together; tonight only §2A landed.
+    WHAT THIS DOES NOT YET FIX (as of §2A alone -- §2C has since landed,
+    see compute_oracle_guided_deltas): illumination_delta is now
+    recoverability-adaptive at the source (light blur in green, heavy
+    blur in red/yellow) -- green pixels here should be getting real local
+    detail, not just a wider reach ceiling on an already-smoothed signal.
+    color_delta_a/b remain fixed-blur everywhere, unchanged, by design
+    (see DETAIL_BLUR_SIGMA's module-level comment for why hue doesn't get
+    the same adaptive treatment).
 
     FEATHERING: recoverability_classification is the hard 0/1/2 map from
     compute_recoverability_map, not the already-feathered recoverability_map
