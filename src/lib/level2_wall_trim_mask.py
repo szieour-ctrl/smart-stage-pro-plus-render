@@ -150,6 +150,24 @@ grid (432 cells at 18x24) per malformed row, in the same direction the
 module already errs (uncertain cells default toward "not wall" here,
 consistent with this pipeline's existing caution around potentially
 over-claiming architectural surface).
+
+GRID OVERLAY (added Aug 2026, same investigation that produced the
+batch data behind the tolerance work above): _encode_for_vision now
+draws an actual grid onto the image via visionGridOverlay.
+draw_grid_overlay() before sending it to Vision. Every dimension-
+mismatch and row-length-inconsistency failure documented in this
+docstring up to this point was treated as a Vision-reliability problem
+to work around with tolerance logic on the RESPONSE side -- but an
+audit of every file between image capture and this API call (see
+oracleRouter.py's own "DIAGNOSTIC ONLY" comment, written for an
+unrelated artifact investigation) found that no file in this pipeline
+ever drew a grid onto the image the prompt describes. The tolerance
+work above remains correct and necessary regardless -- Vision responses
+will never be perfectly deterministic even with a real grid visible --
+but it was, at best, only ever going to forgive noise around a call
+that had no boundary reference to begin with. HYPOTHESIS-DRIVEN, NOT
+YET CONFIRMED: see visionGridOverlay.py's own docstring for the full
+reasoning and the re-test plan against a real batch.
 """
 
 import os
@@ -163,6 +181,8 @@ from typing import List, Optional
 
 import cv2
 import numpy as np
+
+from visionGridOverlay import draw_grid_overlay
 
 logger = logging.getLogger(__name__)
 
@@ -251,7 +271,7 @@ MAX_WALL_TRIM_COVERAGE_FRACTION = float(
 
 _VALID_CHARS = frozenset("A.")
 
-SYSTEM_PROMPT = """You are classifying a grid overlaid on a real estate interior photograph into a {rows}x{cols} grid of cells (row 1 to {rows} top to bottom, column A to {last_col} left to right).
+SYSTEM_PROMPT = """You are classifying a grid overlaid on a real estate interior photograph into a {rows}x{cols} grid of cells (row 1 to {rows} top to bottom, column A to {last_col} left to right). The grid lines and labels are drawn directly on the image -- use them to judge cell boundaries precisely, do not estimate.
 
 Classify each cell as 'A' (architectural -- a painted WALL surface, or TRIM/MOLDING: baseboards, door casings, window casings, crown molding, wainscoting) or '.' (other -- everything else: furniture, floor, ceiling, windows/glass, artwork, mirrors, fixtures, decor, doors themselves excluding their trim, fabric, rugs).
 
@@ -272,7 +292,14 @@ def _encode_for_vision(img) -> Optional[tuple]:
     h, w = img.shape[:2]
     scale = min(1.0, MAX_VISION_EDGE / float(max(h, w)))
     small = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA) if scale < 1.0 else img
-    ok, buf = cv2.imencode(".jpg", small, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
+
+    # GRID OVERLAY (Aug 2026) -- see module docstring. draw_grid_overlay
+    # always returns a copy, so this never mutates `small` (which, when
+    # scale == 1.0 above, is a direct reference to the caller's array,
+    # not a copy).
+    gridded = draw_grid_overlay(small, GRID_ROWS, GRID_COLS)
+
+    ok, buf = cv2.imencode(".jpg", gridded, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
     if not ok:
         return None
     return base64.b64encode(buf.tobytes()).decode("ascii"), small.shape[:2]
