@@ -48,6 +48,27 @@ vaulted break), and a rectangle union handles that badly. A coarse grid,
 classified cell by cell, handles irregular and interrupted shapes
 without this failure mode by construction.
 
+GRID OVERLAY (added Aug 2026, ceiling_mask / wall_trim_mask reliability
+investigation): _encode_for_vision now draws an actual grid onto the
+image via visionGridOverlay.draw_grid_overlay() before sending it to
+Vision. Previously this prompt told the model the image was "overlaid
+with a grid" when no file in this pipeline ever drew one (confirmed by
+an audit across every file between capture and this API call -- see
+oracleRouter.py's own "DIAGNOSTIC ONLY" comment, written for an
+unrelated artifact investigation, which explicitly checked this and
+found nothing drew onto the image anywhere). This is the most concrete
+available explanation for this module's severe overcoverage failures on
+real batches (ceiling read as 90-100% of frame on 17 of 19 real photos
+in one batch, against a normal room's real ~15-20%) -- asking a model to
+partition an image into cells with no visual reference for where those
+cells fall is exactly the kind of task that produces confident, wrong,
+whole-surface misreads on a large uniform region like a ceiling.
+HYPOTHESIS-DRIVEN, NOT YET CONFIRMED: unlike MAX_CEILING_COVERAGE_
+FRACTION below (which has specific real-photo evidence behind its
+value), this fix has not yet been validated against a real batch. See
+visionGridOverlay.py's own docstring for the full reasoning and the
+re-test plan.
+
 SHADOW MODE: ships computing and logging only, same phased-rollout
 discipline as level0_scene_classifier.py and level2_vision_
 recoverability.py before it. Unlike level2_sky_grass_mask.py's more
@@ -61,6 +82,20 @@ before this drives correction. ENABLED is a separate kill switch on top
 of that. Any failure degrades to "no mask" -- the caller must treat an
 empty/malformed grid as "apply no smoothing," never as "the whole photo
 is ceiling."
+
+RAILWAY VARIABLE GOTCHA (found Aug 2026, do not repeat): the
+SHADOW_MODE line below reads env var default "false" -- i.e. LIVE by
+default -- which directly contradicts this docstring's own claim of
+"default true" above. That claim was true when this module was first
+written; a later change (see the comment directly above SHADOW_MODE's
+assignment) flipped the code default to live without updating this
+docstring, and Railway had no LEVEL2_CEILING_MASK_SHADOW_MODE var set
+to override it either way -- meaning this module ran live in production,
+silently, for an unknown period, while every doc describing it said
+shadow. Always verify the ACTUAL os.environ.get(...) default in code,
+never trust a docstring's claimed default, when auditing any shadow-mode
+flag in this codebase -- this is not the only module where that gap has
+been found.
 """
 
 import os
@@ -73,6 +108,8 @@ from typing import Optional, List
 
 import cv2
 import numpy as np
+
+from visionGridOverlay import draw_grid_overlay
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +127,12 @@ MAX_VISION_EDGE = 1568  # matches every other Vision module in this codebase
 # set, so this default is what actually governs production. Still fully
 # overridable via LEVEL2_CEILING_MASK_SHADOW_MODE=true to re-enable
 # shadow mode without a code change if this needs to be pulled back.
+#
+# SET LEVEL2_CEILING_MASK_SHADOW_MODE=true ON RAILWAY -- see module
+# docstring's "RAILWAY VARIABLE GOTCHA" section. This default is LIVE,
+# not shadow, and was found running live in production with no batch
+# validation behind it and a 0/19 real-batch pass rate once actually
+# reviewed.
 SHADOW_MODE = os.environ.get("LEVEL2_CEILING_MASK_SHADOW_MODE", "false").lower() not in ("false", "0", "")
 
 # PLAUSIBILITY CAP -- confirmed necessary on real production photos, not a
@@ -128,7 +171,7 @@ GRID_COLS = int(os.environ.get("LEVEL2_CEILING_GRID_COLS", "24"))
 GRID_ROWS = int(os.environ.get("LEVEL2_CEILING_GRID_ROWS", "18"))
 
 
-SYSTEM_PROMPT = """You are looking at a real estate interior photograph, overlaid with a {cols}x{rows} grid (columns lettered A-{last_col}, rows numbered 1-{rows}, top-left cell is A1).
+SYSTEM_PROMPT = """You are looking at a real estate interior photograph, overlaid with a {cols}x{rows} grid (columns lettered A-{last_col}, rows numbered 1-{rows}, top-left cell is A1). The grid lines and labels are drawn directly on the image -- use them to judge cell boundaries precisely, do not estimate.
 
 For EVERY cell, classify what's predominantly in it: "ceiling" or "other".
 
@@ -149,7 +192,14 @@ def _encode_for_vision(img) -> Optional[tuple]:
     h, w = img.shape[:2]
     scale = min(1.0, MAX_VISION_EDGE / float(max(h, w)))
     small = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA) if scale < 1.0 else img
-    ok, buf = cv2.imencode(".jpg", small, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
+
+    # GRID OVERLAY (Aug 2026) -- see module docstring. draw_grid_overlay
+    # always returns a copy, so this never mutates `small` (which, when
+    # scale == 1.0 above, is a direct reference to the caller's array,
+    # not a copy).
+    gridded = draw_grid_overlay(small, GRID_ROWS, GRID_COLS)
+
+    ok, buf = cv2.imencode(".jpg", gridded, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
     if not ok:
         return None
     return base64.b64encode(buf.tobytes()).decode("ascii"), small.shape[:2]
