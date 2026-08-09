@@ -1355,6 +1355,28 @@ def apply_wall_color_anchor(orig_img, corrected_img, wall_mask, feather_sigma=No
     through completely unchanged; a/b inside the mask is replaced with
     the Original's, not gated or partially blended toward it.
 
+    FRAMING (§2B, redesign plan reframe -- Sam, this session): this is
+    NOT "distrust Oracle on walls" and it is not a confidence judgment at
+    all -- it belongs in the same category as "architecture/geometry
+    never moves" or "don't invent a fixture that wasn't there." Wall
+    paint color is a fixed, physical property of the room, the same as
+    camera position or furniture placement -- AB 723 doesn't permit
+    misrepresenting it regardless of how confident or reliable Oracle's
+    render happens to be on any given photo. That's why this function is
+    unconditional or nothing (fully locked inside wall_mask), rather than
+    a trust-weighted reach the way apply_recoverability_weighted_correction
+    (§2A) treats furniture, carpet, and everything else Oracle is allowed
+    to interpret with varying confidence. Recoverability classification
+    (red/yellow/green) answers "how much do we trust Oracle's guess
+    here" -- that question doesn't apply to wall color at all, because
+    wall color was never Oracle's to guess. Nothing about the mechanism
+    below changes with this reframe -- same lock, same mask contract,
+    same shadow-mode discipline. Only the reasoning for WHY it's a lock
+    is being stated correctly here, since the original version of this
+    docstring implied a confidence-based rationale ("Flux's hue drift")
+    that isn't actually why walls are locked -- they'd be locked even if
+    Oracle's wall hue were perfectly reliable on every photo.
+
     WHY A LOCK, NOT A GATE (added Aug 2026, IMG_8310 investigation):
     apply_hue_fidelity_gate -- built and validated for WALL data
     originally (see that function's own docstring evidence, real
@@ -1374,7 +1396,9 @@ def apply_wall_color_anchor(orig_img, corrected_img, wall_mask, feather_sigma=No
     back visibly cream/tan despite the gate reporting itself as
     "applied" with real revert activity: the gate was doing its job
     correctly by ITS OWN rule, and its rule was the wrong one for this
-    surface.
+    surface. This section explains why a GATE specifically fails here --
+    the FRAMING note above explains why the fix is a hard rule rather
+    than a better-tuned gate.
 
     Locking wall chroma to the Original, unconditionally, inside the
     mask, removes that failure mode by construction rather than by
