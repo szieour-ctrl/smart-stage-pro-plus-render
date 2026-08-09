@@ -78,7 +78,6 @@ from oracleCorrection import (  # noqa: E402
     align_oracle_to_original,
     compute_oracle_guided_deltas,
     apply_oracle_guided_correction,
-    apply_recoverability_weighted_correction,
     apply_hue_fidelity_gate,
     apply_wall_color_anchor,
     apply_illumination_floor,
@@ -86,15 +85,6 @@ from oracleCorrection import (  # noqa: E402
     smooth_deltas_in_mask,
     MIN_ALIGNMENT_INLIERS,
     MAX_MEAN_RESIDUAL_PX,
-    # Aliased deliberately -- NOT the same thing as RECOVERABILITY_SHADOW_MODE
-    # imported below from level2_vision_recoverability. That flag controls
-    # WHICH CLASSIFIER drives correction (Vision vs the classical box-filter
-    # gate). This one controls WHICH CLAMP MECHANISM is live once a
-    # classification source is already chosen (the old classification-blind
-    # clamp, or the new §2A classification-weighted one). Two independent
-    # shadow-mode flags with easy-to-confuse names, genuinely different
-    # questions -- see the call site below for how each is actually used.
-    RECOVERABILITY_WEIGHTED_SHADOW_MODE as RECOV_WEIGHTED_SHADOW_MODE,
 )
 from level2_vision_recoverability import (  # noqa: E402
     judge_recoverability,
@@ -321,72 +311,10 @@ def run_oracle_interior(source_path: str, output_path: str, orig_img) -> dict:
     routing_report["steps"]["ceiling_mask"] = ceiling_report
     routing_report["steps"]["ceiling_smoothing"] = ceiling_smoothing_report
 
-    # §2A RECOVERABILITY-WEIGHTED CORRECTION -- replaces apply_oracle_
-    # guided_correction's classification-blind clamp with a clamp bound
-    # SET BY recoverability classification (red/yellow/green), channel-
-    # split specifically on yellow (L leans toward green's full reach,
-    # a/b stays close to red's restraint -- interior luminance recovery
-    # doesn't misrepresent the property regardless of classifier
-    # confidence the way hue drift on an uncertain pixel does under AB
-    # 723). See oracleCorrection.apply_recoverability_weighted_correction's
-    # own docstring for the full mechanism and the six tunable reach-
-    # fraction constants (all env-overridable, Sam has explicitly
-    # reserved the right to dial these up/down once a real batch is
-    # reviewed).
-    #
-    # RECOV_WEIGHTED_SHADOW_MODE is NOT RECOVERABILITY_SHADOW_MODE (the
-    # Vision-gate flag used above) -- see the import block's comment for
-    # why these are deliberately separate, easily-confused-by-name flags.
-    #
-    # Shadow mode (default TRUE): the existing clamp
-    # (apply_oracle_guided_correction) stays live, unchanged pipeline
-    # behavior -- the new mechanism is computed alongside purely for
-    # comparison logging (mean |LAB diff| against what's actually
-    # shipping, plus reach fractions and recoverability breakdown used).
-    # Only once this is explicitly turned off does
-    # apply_recoverability_weighted_correction actually drive
-    # corrected_img.
-    if RECOV_WEIGHTED_SHADOW_MODE:
-        corrected_img, clip_report = apply_oracle_guided_correction(
-            orig_img, oracle_aligned, recov_map, illum_delta, color_delta_a, color_delta_b
-        )
-        shadow_corrected, recov_weighted_report = apply_recoverability_weighted_correction(
-            orig_img, oracle_aligned, recov_class, illum_delta, color_delta_a, color_delta_b
-        )
-        shadow_lab = cv2.cvtColor(shadow_corrected, cv2.COLOR_BGR2LAB).astype(np.float32)
-        live_lab = cv2.cvtColor(corrected_img, cv2.COLOR_BGR2LAB).astype(np.float32)
-        recov_weighted_report["mean_abs_diff_from_live_clamp"] = {
-            "L": float(np.abs(shadow_lab[:, :, 0] - live_lab[:, :, 0]).mean()),
-            "a": float(np.abs(shadow_lab[:, :, 1] - live_lab[:, :, 1]).mean()),
-            "b": float(np.abs(shadow_lab[:, :, 2] - live_lab[:, :, 2]).mean()),
-        }
-        print(f"[ORACLE-ROUTER] [RECOV-WEIGHTED SHADOW MODE] "
-              f"reach L red/yellow/green={recov_weighted_report['reach_fractions']['red_L']}/"
-              f"{recov_weighted_report['reach_fractions']['yellow_L']}/"
-              f"{recov_weighted_report['reach_fractions']['green_L']}  "
-              f"ab red/yellow/green={recov_weighted_report['reach_fractions']['red_ab']}/"
-              f"{recov_weighted_report['reach_fractions']['yellow_ab']}/"
-              f"{recov_weighted_report['reach_fractions']['green_ab']} -- "
-              f"mean|diff| vs live clamp: "
-              f"L={recov_weighted_report['mean_abs_diff_from_live_clamp']['L']:.2f} "
-              f"a={recov_weighted_report['mean_abs_diff_from_live_clamp']['a']:.2f} "
-              f"b={recov_weighted_report['mean_abs_diff_from_live_clamp']['b']:.2f} "
-              f"(NOT applied -- shadow mode, corrected_img from old clamp unchanged)",
-              file=sys.stderr)
-    else:
-        corrected_img, recov_weighted_report = apply_recoverability_weighted_correction(
-            orig_img, oracle_aligned, recov_class, illum_delta, color_delta_a, color_delta_b
-        )
-        clip_report = {
-            "L_clipped_fraction": recov_weighted_report["L_clipped_fraction"],
-            "a_clipped_fraction": recov_weighted_report["a_clipped_fraction"],
-            "b_clipped_fraction": recov_weighted_report["b_clipped_fraction"],
-        }
-        print(f"[ORACLE-ROUTER] [RECOV-WEIGHTED LIVE] recoverability-weighted reach "
-              f"driving pixels (shadow mode off, old classification-blind clamp bypassed)",
-              file=sys.stderr)
+    corrected_img, clip_report = apply_oracle_guided_correction(
+        orig_img, oracle_aligned, recov_map, illum_delta, color_delta_a, color_delta_b
+    )
     routing_report["steps"]["clip"] = clip_report
-    routing_report["steps"]["recov_weighted"] = recov_weighted_report
 
     # WALL/TRIM + CEILING ARCHITECTURAL MASK -- feeds the hue-fidelity
     # gate below. Ceiling identification already ran above for the
