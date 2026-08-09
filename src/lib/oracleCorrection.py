@@ -21,6 +21,7 @@ Two image classes handled differently (see handoff Step 2):
     different-room path is a separate function (see NOTE at bottom).
 """
 
+import os
 import cv2
 import numpy as np
 
@@ -58,6 +59,58 @@ COLOR_BLUR_SIGMA = 15
 # This is the same fix class as `feathered float masks replacing hard-boolean
 # box exclusion` elsewhere in the pipeline -- same failure mode, same fix.
 GATE_FEATHER_SIGMA = 15
+
+
+# ---- §2A: recoverability-weighted reach fractions ----
+# Replaces clamp_to_span's classification-blind symmetric clamp (see
+# apply_recoverability_weighted_correction's docstring for the full
+# redesign rationale). Each fraction answers: "of the distance between
+# Original and Oracle, how far is a pixel in this class allowed to move,
+# on this channel group?"
+#
+# GREEN: full reach on both channel groups -- this is exactly where
+# Oracle is confidently recovering real captured detail, not guessing.
+#
+# RED: tight on both -- the actual unsupported-guess risk case, same
+# restraint regardless of channel.
+#
+# YELLOW is deliberately NOT a flat blend (Sam, this session, 2026-08-08):
+# compute_recoverability_map's yellow class is a leftover bucket --
+# "neither clearly red nor clearly green" -- not a real third measured
+# confidence level, so treating "we don't know" as "average trust" isn't
+# right. The risk here is asymmetric by channel, not uniform: luminance
+# recovery on an interior photo reveals real sensor data and doesn't
+# misrepresent the property regardless of classification confidence --
+# unlike the exterior pipeline's sky/landscaping risk, this isn't
+# material taken "off the board," and dark/underexposed interior photos
+# don't get meaningfully worse the way exterior conditions can. Flux has
+# also been reliable on hue everywhere tested EXCEPT walls, which already
+# have their own hard anchor (see apply_wall_color_anchor) independent of
+# this classifier entirely. So: yellow's L reach leans toward green's
+# full push; yellow's a/b reach stays close to red's restraint, since hue
+# drift on a pixel the classifier isn't confident about is the one that
+# actually costs something under AB 723.
+#
+# All six are env-overridable. Sam has explicitly reserved the right to
+# dial these up or down once a real batch is reviewed -- these are
+# starting points based on reasoned risk asymmetry, not measured
+# constants. Do not treat the defaults below as validated.
+RED_REACH_L = float(os.environ.get("ORACLE_RED_REACH_L", "0.15"))
+RED_REACH_AB = float(os.environ.get("ORACLE_RED_REACH_AB", "0.15"))
+YELLOW_REACH_L = float(os.environ.get("ORACLE_YELLOW_REACH_L", "0.70"))
+YELLOW_REACH_AB = float(os.environ.get("ORACLE_YELLOW_REACH_AB", "0.30"))
+GREEN_REACH_L = float(os.environ.get("ORACLE_GREEN_REACH_L", "1.0"))
+GREEN_REACH_AB = float(os.environ.get("ORACLE_GREEN_REACH_AB", "1.0"))
+
+# Kill-switch, same shadow-mode-first discipline as every other gate in
+# this module (vision_gate_regions, hue_gate_shadow, illum_floor_shadow).
+# Default TRUE: computes the recoverability-weighted correction alongside
+# the existing classification-blind clamp, logs the comparison, but does
+# NOT swap corrected_img over until this is explicitly turned off after a
+# real batch review.
+RECOVERABILITY_WEIGHTED_SHADOW_MODE = os.environ.get(
+    "ORACLE_RECOVERABILITY_WEIGHTED_SHADOW_MODE", "true"
+).lower() not in ("false", "0", "")
 
 
 def align_oracle_to_original(orig_img, oracle_img, ransac_reproj_threshold=5.0):
@@ -310,6 +363,145 @@ def apply_oracle_guided_correction(orig_img, oracle_aligned, recoverability_map,
     return corrected_img, clip_report
 
 
+def apply_recoverability_weighted_correction(orig_img, oracle_aligned, recoverability_classification,
+                                               illumination_delta, color_delta_a, color_delta_b,
+                                               feather_sigma=None):
+    """
+    §2A redesign: replaces apply_oracle_guided_correction's classification-
+    blind clamp_to_span with a clamp whose bound is SET BY recoverability
+    classification, not fixed to the full Original<->Oracle span for every
+    pixel regardless of trust. This is a new mechanism, not a tuning tweak
+    on the old clamp -- see the redesign plan's core finding: the old clamp
+    was built as a safety rail ("never look like a third invented image")
+    but applied that same rail identically whether Oracle was confidently
+    recovering real captured detail (green) or guessing in a region with
+    no real data (red). It suppressed both equally.
+
+    THE OLD MECHANISM (apply_oracle_guided_correction, kept as-is,
+    unchanged, alongside this function): recoverability_map (a float blend
+    weight, 0.0/0.5/1.0, feathered) pre-scaled the delta BEFORE a fixed
+    clamp to [min(orig,oracle), max(orig,oracle)] was applied on top,
+    uniformly, regardless of class. Two separate mechanisms doing
+    overlapping, not-quite-coordinated jobs.
+
+    THE NEW MECHANISM: classification directly sets a per-pixel, per-
+    channel-group (L vs a/b) REACH FRACTION -- how far of the Original-to-
+    Oracle distance this pixel is allowed to move -- and that reach
+    fraction IS the clamp bound:
+        reach_target = orig + reach_fraction * (oracle_raw - orig)
+        new_value = clip(orig + raw_delta, [min(orig, reach_target), max(orig, reach_target)])
+    One mechanism, not two. Green's reach is full (1.0) -- the ceiling the
+    old clamp already gave every pixel, now correctly reserved for the
+    class that's actually earned it. Red's reach is tight (0.15 default)
+    on both channel groups regardless -- the actual unsupported-guess risk
+    case. Yellow is channel-split, not a flat blend -- see the
+    RED_REACH_*/YELLOW_REACH_*/GREEN_REACH_* constants above this function
+    for the full reasoning (luminance recovery is low-risk on interior
+    photos regardless of classifier confidence; hue drift on an uncertain
+    pixel is the one that costs something under AB 723).
+
+    WHAT THIS DOES NOT YET FIX: illumination_delta/color_delta_a/b are
+    still the pipeline's default Gaussian-blurred deltas (ILLUM_BLUR_SIGMA/
+    COLOR_BLUR_SIGMA=15) -- this function does NOT implement the redesign
+    plan's §2C (recoverability-adaptive delta resolution, less/no blur in
+    green regions so real local detail Oracle actually rendered isn't
+    smoothed away before it ever reaches this clamp). Green pixels here
+    get the full REACH ceiling, but the delta signal feeding that reach
+    may still be a smoothed average rather than the sharp local detail
+    Oracle rendered. If a green region still looks flatter than expected
+    after this ships, that's very likely §2C's gap, not this function's --
+    the redesign plan flagged these two as tightly coupled and meant to be
+    built together; tonight only §2A landed.
+
+    FEATHERING: recoverability_classification is the hard 0/1/2 map from
+    compute_recoverability_map, not the already-feathered recoverability_map
+    float. This function builds its own per-channel-group reach-fraction
+    maps FROM the discrete classification, THEN feathers those maps --
+    feathering the classification itself first would blur across class
+    boundaries into fractional values with no defined meaning. Using the
+    classification raw (unfeathered) would reproduce the exact hard-edge
+    object-silhouette artifact already confirmed and fixed once on
+    IMG_8310 (see GATE_FEATHER_SIGMA's comment above) -- same failure
+    mode, same fix, applied at the new location.
+
+    recoverability_classification: uint8 array (0/1/2 = red/yellow/green),
+        the CLASSICAL classifier's discrete output from
+        compute_oracle_guided_deltas -- NOT recoverability_map (the old
+        float blend), which apply_oracle_guided_correction still consumes
+        unchanged.
+    illumination_delta, color_delta_a, color_delta_b: same Gaussian-
+        blurred deltas apply_oracle_guided_correction consumes.
+    feather_sigma: defaults to GATE_FEATHER_SIGMA, same as every other
+        gate in this module.
+
+    Returns:
+        corrected_img: BGR uint8 image.
+        report: dict with the six reach fractions used, the classical
+            recoverability breakdown, and per-channel clipped-fraction --
+            now a meaningful signal (pixels where the raw delta wanted to
+            go further than THIS pixel's class was trusted to reach), not
+            the old uniform "hit the full-span clamp" signal.
+    """
+    if feather_sigma is None:
+        feather_sigma = GATE_FEATHER_SIGMA
+
+    orig_lab = cv2.cvtColor(orig_img, cv2.COLOR_BGR2LAB).astype(np.float32)
+    oracle_lab = cv2.cvtColor(oracle_aligned, cv2.COLOR_BGR2LAB).astype(np.float32)
+    L_orig, a_orig, b_orig = cv2.split(orig_lab)
+    L_oracle, a_oracle, b_oracle = cv2.split(oracle_lab)
+
+    # Build per-pixel reach-fraction maps from the discrete classification
+    # -- one for L, one shared for a/b (both are "hue"; no evidence yet
+    # they need to drift differently from each other within yellow).
+    reach_l = np.full(recoverability_classification.shape, RED_REACH_L, dtype=np.float32)
+    reach_l[recoverability_classification == 1] = YELLOW_REACH_L
+    reach_l[recoverability_classification == 2] = GREEN_REACH_L
+
+    reach_ab = np.full(recoverability_classification.shape, RED_REACH_AB, dtype=np.float32)
+    reach_ab[recoverability_classification == 1] = YELLOW_REACH_AB
+    reach_ab[recoverability_classification == 2] = GREEN_REACH_AB
+
+    # Feather AFTER building the fraction maps -- see FEATHERING note above.
+    reach_l = cv2.GaussianBlur(reach_l, ksize=(0, 0), sigmaX=feather_sigma)
+    reach_ab = cv2.GaussianBlur(reach_ab, ksize=(0, 0), sigmaX=feather_sigma)
+
+    def _weighted_clamp(delta, orig_ch, oracle_ch, reach):
+        new_raw = orig_ch + delta
+        target = orig_ch + reach * (oracle_ch - orig_ch)
+        lo = np.minimum(orig_ch, target)
+        hi = np.maximum(orig_ch, target)
+        clamped = np.clip(new_raw, lo, hi)
+        clamped = np.clip(clamped, 0, 255)
+        return clamped, float(np.mean(new_raw != clamped))
+
+    L_new, L_clipped_frac = _weighted_clamp(illumination_delta, L_orig, L_oracle, reach_l)
+    a_new, a_clipped_frac = _weighted_clamp(color_delta_a, a_orig, a_oracle, reach_ab)
+    b_new, b_clipped_frac = _weighted_clamp(color_delta_b, b_orig, b_oracle, reach_ab)
+
+    total_px = recoverability_classification.size
+    report = {
+        "mechanism": "recoverability_weighted_reach",
+        "reach_fractions": {
+            "red_L": RED_REACH_L, "red_ab": RED_REACH_AB,
+            "yellow_L": YELLOW_REACH_L, "yellow_ab": YELLOW_REACH_AB,
+            "green_L": GREEN_REACH_L, "green_ab": GREEN_REACH_AB,
+        },
+        "recoverability_pct": {
+            "red": 100.0 * (recoverability_classification == 0).sum() / total_px,
+            "yellow": 100.0 * (recoverability_classification == 1).sum() / total_px,
+            "green": 100.0 * (recoverability_classification == 2).sum() / total_px,
+        },
+        "L_clipped_fraction": L_clipped_frac,
+        "a_clipped_fraction": a_clipped_frac,
+        "b_clipped_fraction": b_clipped_frac,
+    }
+
+    corrected_lab = cv2.merge([L_new, a_new, b_new]).astype(np.uint8)
+    corrected_img = cv2.cvtColor(corrected_lab, cv2.COLOR_LAB2BGR)
+
+    return corrected_img, report
+
+
 def score_region(img, box, label=""):
     """
     Stat-based scoring for a specific region (e.g. dining chairs, side-table
@@ -472,6 +664,41 @@ def run_oracle_driven_pipeline(orig_img, oracle_img, log_prefix="[ORACLE-DRIVEN]
             "green": 100.0 * (recov_class == 2).sum() / total_px,
         },
     }
+
+    # --- §2A recoverability-weighted correction: SHADOW MODE by default,
+    # same posture as every other gate below. Computes what
+    # apply_recoverability_weighted_correction WOULD produce alongside the
+    # existing classification-blind clamp already applied above, logs the
+    # comparison (mean |LAB diff| against the old clamp's output, plus the
+    # reach fractions actually used), and only swaps corrected_img over
+    # once ORACLE_RECOVERABILITY_WEIGHTED_SHADOW_MODE is turned off.
+    recov_weighted_shadow = None
+    if RECOVERABILITY_WEIGHTED_SHADOW_MODE:
+        shadow_corrected, recov_weighted_shadow = apply_recoverability_weighted_correction(
+            orig_img, oracle_aligned, recov_class, illum_delta, color_delta_a, color_delta_b
+        )
+        shadow_lab = cv2.cvtColor(shadow_corrected, cv2.COLOR_BGR2LAB).astype(np.float32)
+        old_lab = cv2.cvtColor(corrected_img, cv2.COLOR_BGR2LAB).astype(np.float32)
+        recov_weighted_shadow["mean_abs_diff_from_old_clamp"] = {
+            "L": float(np.abs(shadow_lab[:, :, 0] - old_lab[:, :, 0]).mean()),
+            "a": float(np.abs(shadow_lab[:, :, 1] - old_lab[:, :, 1]).mean()),
+            "b": float(np.abs(shadow_lab[:, :, 2] - old_lab[:, :, 2]).mean()),
+        }
+        print(f"{log_prefix} [RECOV-WEIGHTED SHADOW MODE] reach L red={RED_REACH_L}/"
+              f"yellow={YELLOW_REACH_L}/green={GREEN_REACH_L}  ab red={RED_REACH_AB}/"
+              f"yellow={YELLOW_REACH_AB}/green={GREEN_REACH_AB} -- mean|diff| vs old clamp: "
+              f"L={recov_weighted_shadow['mean_abs_diff_from_old_clamp']['L']:.2f} "
+              f"a={recov_weighted_shadow['mean_abs_diff_from_old_clamp']['a']:.2f} "
+              f"b={recov_weighted_shadow['mean_abs_diff_from_old_clamp']['b']:.2f} "
+              f"(NOT applied -- shadow mode, corrected_img unchanged)")
+    else:
+        corrected_img, recov_weighted_shadow = apply_recoverability_weighted_correction(
+            orig_img, oracle_aligned, recov_class, illum_delta, color_delta_a, color_delta_b
+        )
+        print(f"{log_prefix} [RECOV-WEIGHTED LIVE] recoverability-weighted reach driving pixels "
+              f"(shadow mode off, old classification-blind clamp bypassed)")
+
+    report["recov_weighted_shadow"] = recov_weighted_shadow
 
     # --- Hue-fidelity gate: SHADOW MODE ONLY, same posture as the Vision
     # recoverability gate above. Computes the architectural mask and runs
