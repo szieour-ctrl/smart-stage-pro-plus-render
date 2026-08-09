@@ -70,6 +70,22 @@ room) to carry a consistent, whole-frame warm color-temperature bias:
 "Color Temperature -- Independent of Brightness" section stating this
 directly, and adds warm color drift as a named third failure mode in
 Critical Rule, alongside under- and over-correction.
+v4 -> v5a: v4 gave ceiling and walls the same "hold captured color
+exactly" rule under Color Temperature -- correct for walls, wrong for
+ceiling, since a ceiling's captured color under warm practical light is
+often already cast-contaminated and "hold the captured color" prevented
+Oracle from ever correcting that cast toward the ceiling's true neutral
+paint. v5a rewrites the ceiling treatment as adaptive (neutralize cast
+if the true material is white/off-white, preserve hue if the true
+material is colored) and gives ceiling its own dedicated white/trim
+separation section, while walls keep the v4 hold-true-color rule
+unchanged. Validated in the fal.ai playground against IMG_8310 (strong
+gray-blue walls -- ceiling separated cleanly, wall hue held) and
+IMG_8291 (walls and ceiling naturally close in tone -- brightness lift
+landed but ceiling/wall separation stayed weak, confirming this is a
+scene-contrast ceiling on what the prompt alone can do, not a prompt
+defect; further pop on low-contrast scenes is expected to come from the
+recoverability-driven correction pipeline, not further prompt tuning).
 
 LABELING: every image this module produces is, by definition, the
 Oracle Scene Render -- a digitally altered image. That's not a caveat
@@ -152,77 +168,116 @@ OUTPUT_FORMAT = os.environ.get("ORACLE_GENERATION_OUTPUT_FORMAT", "png")
 # IF EITHER PROMPT DOCX IS REVISED AGAIN, THIS MUST BE UPDATED TO MATCH --
 # there is no automated sync between the docx and this constant.
 
-INTERIOR_ORACLE_PROMPT = """Smart Correct Oracle v4
+INTERIOR_ORACLE_PROMPT = """Smart Correct Oracle v5a
 
-PRIMARY ROLE
-Treat the uploaded image as a real photograph of an existing room, captured under real, unedited lighting conditions -- often underexposed, mixed-light, or high dynamic range.
-Produce the same photograph corrected to MLS BRIGHT -- the bright, clean, evenly-lit, high-key style standard for professional real estate listing photography. This is a specific, recognizable industry look, not a vague "improvement": walls and ceilings read bright and clean, shadows are opened up so no area of the room reads dark or hidden, whites are crisp, and the room overall reads as inviting, spacious, and fully lit -- the way a top-tier real estate photography service (the kind MLS listings are known for) delivers, not a restrained or partial correction.
-This is a photographic correction task, not a redesign, staging, or relighting task -- but correction means MLS Bright, fully realized, not a conservative or subtle version of it.
+Primary Role
+Generate an idealized MLS Bright lighting map of the same room, preserving all geometry, materials, and decor exactly.
+Lighting may be synthetic, natural, or time-shifted, but must remain physically plausible and fixture-consistent.
+This Oracle defines how bright each pixel should be if fully resolved, not what new pixels to invent.
 
-Identity Preservation
-Preserve exactly:
-* Architecture
-* Camera position
-* Perspective
-* Composition
-* Lens characteristics
-* Furniture
-* Decor
-* Materials
-* Finishes
-* Paint colors
-* Wood colors
-* Fabric colors
-* Exterior view
-* Landscaping
-* Fixtures
-* Window coverings
-* Artwork
-Do not move, add, remove, replace, redesign, or restyle anything.
+Global Exposure Directive
+Apply full-frame luminance normalization to reach MLS Bright exposure.
 
-Dynamic Range -- MLS Bright, Fully Realized
-Recover shadow detail, highlight detail, and midtone separation throughout the entire frame to reach true MLS Bright -- not a partial or conservative lift. A real estate photographer shooting this room professionally would use HDR bracketing, fill flash, or strobe specifically to eliminate deep shadow and blown highlight in a single frame, producing the bright, open, evenly-lit look every MLS listing photo is expected to have. Match that result directly: a fully, evenly, BRIGHTLY resolved room -- not a moderately-improved version of the underexposed capture, and not a cautious middle ground between the raw file and MLS Bright.
-Do not:
-* change the time of day
-* introduce new sunlight
-* add a light source that was not present
-* invent shadows or reflections that the captured data does not support
-Do:
-* fully resolve underexposed areas into their real, visible material and color, using the sensor data that is genuinely present, however faint
-* push exposure and shadow recovery as far as true MLS Bright requires -- treat "the data is barely visible in the raw file" as a reason to recover it aggressively and brightly, not a reason to leave it dim or partially corrected
+Lift midtones and shadows until no area reads dim or hidden.
 
-Furniture and Materials in Shadow -- Recover, Do Not Protect
-This is the single most common failure in this task, so it is stated directly: a dark-toned object sitting in an underexposed room is, in the overwhelming majority of cases, underexposed furniture that needs the same MLS Bright correction as the rest of the room -- not a genuinely black material that must be protected from correction. Reserve any hesitation to lift a dark object ONLY for the rare case of a room that is otherwise already well-exposed, where a single object is genuinely, intentionally black under good light. In every other case -- which is most real estate photos before correction -- recover full wood grain, carving detail, upholstery texture, and true material color in dark furniture with the same brightness and confidence applied to the rest of the room. A carved wood chair back should show its actual carving, clearly and brightly lit, not a silhouette with a few highlight edges. Do not let apparent darkness in the source file be mistaken for the object's real, intended appearance.
+Ceiling brightness anchors the frame -- equal to or slightly above wall luminance.
 
-Ceiling
-Treat the ceiling as one continuous painted surface. Fully resolve to bright, even, MLS-Bright white, while preserving the warm practical-light glow surrounding any fixture and believable luminance gradients from natural daylight direction.
+Target histogram center at approximately 70% luminance.
+
+Maintain believable daylight direction and fixture glow.
+
+Artificial light may simulate daylight bounce, ceiling fill, or wall wash to achieve even luminance.
+
+Do not add or invent fixtures, bulbs, or lamps.
+
+Ceiling -- Adaptive Neutrality
+Treat the ceiling as a diffuse reflector whose true material color must be fully and evenly resolved.
+
+If white/off-white: neutralize warm or mixed-light casts to clean white.
+
+If colored (beige, gray, wood, coffered): preserve hue, remove lighting cast, brighten evenly.
+
+Never bleach or repaint; only neutralize lighting artifacts.
+
+Ceiling should read luminous and open, not shadowed or dull.
+
+Maintain fixture glow and natural falloff.
+
+Ceiling brightness normalization must harmonize with trim and molding luminance separation. Apply local white-balance correction and highlight refinement to achieve clean, luminous whites without loss of texture.
+
+Ceiling & Trim White Separation
+Where ceilings, crown molding, baseboards, doors, window trim, or other painted light-neutral surfaces are source-visible as white or near-white, render them as clean photographic whites consistent with their actual material color.
+Neutralize ambient yellow, beige, or mixed-light contamination without changing the underlying paint color.
+
+Increase luminance separation between light ceilings/trim and adjacent walls only where supported by the source image. Preserve surface texture, shadow gradients, recessed-light falloff, and natural room illumination.
+Do not bleach, clip, flatten, or convert beige/cream materials into white.
+
+Professional ceiling rendering: light-colored ceilings should read clean, luminous, and visually separated from surrounding walls, as they would in professionally balanced real-estate photography.
+Do not accomplish this through global exposure increase. Use localized white-balance correction, highlight/midtone refinement, and controlled luminance separation.
 
 Walls
-Fully resolve wall color and exposure into one true, bright, even, continuous tone across the whole surface, matching MLS Bright standards -- a real wall does not change color or brightness partway across a room, and the corrected image should not either. Neutralize mixed color casts from combined daylight and interior lighting. Preserve subtle texture. The wall's true paint color must read identically at every position across the room -- near a warm light fixture, near a cool daylight window, anywhere in between. A gentle natural falloff in BRIGHTNESS across a wall (nearer a light source vs. farther from it) is real and should be preserved; a shift in the wall's actual COLOR or color temperature from one side of the room to the other is not real and must not appear.
+Preserve true paint color at full brightness.
+
+Neutralize mixed lighting casts.
+
+Maintain texture and even tone across the surface.
+
+Do not warm or shift color temperature as exposure increases.
+
+Brightness and color temperature are independent; a wall's true color must remain accurate even at full MLS Bright exposure.
 
 Windows
-Recover only naturally visible detail. Do not invent scenery beyond the window. Do not create impossible exterior exposure. Maintain believable glass.
+Recover visible exterior detail only.
 
-Carpet and Flooring
-Fully recover natural texture and true tone at MLS Bright levels, including in areas currently in shadow. Increase local contrast as needed to reveal real texture. Maintain depth. Avoid an artificial HDR appearance.
+Maintain believable glass reflections and exposure balance.
 
-Wood Furniture
-Fully recover true wood tone and grain at full brightness, including on pieces currently underexposed toward black. Reveal real carving, joinery, and surface detail wherever the sensor captured it, however faint in the raw file. Do not create synthetic gloss or texture that was not actually captured.
+Do not invent scenery or create impossible exterior exposure.
 
-Contrast
-Produce the appearance of expert professional MLS photo processing -- a fully, evenly, BRIGHTLY resolved image, not a subtle adjustment. Avoid the specific failure modes of overdone HDR: halos, glow, excessive clarity, excessive dehaze, exaggerated sharpening. Avoiding those artifacts is about technique and quality, not a reason to limit how bright or fully corrected the room becomes.
+Furniture & Flooring
+Recover full texture, grain, and tone at MLS Bright luminance.
 
-Color Temperature -- Independent of Brightness
-Brightness and color temperature are two separate things, and correcting one must never shift the other. Pushing a room to full MLS Bright means lifting exposure and opening shadows -- it does NOT mean warming the color cast. A stronger brightness correction and a warmer color temperature are not the same kind of "more corrected," and must not be coupled together. Neutral surfaces specifically -- walls, ceiling, trim -- must hold their true, accurate, captured color at full MLS Bright brightness exactly as they would at any other brightness level. If a wall is a neutral gray in the captured photo, it must read as that same neutral gray once corrected, not a warmer tan or cream, no matter how much the exposure is lifted to reach it. Test this specifically: the more aggressively a region's brightness is corrected, the more carefully its original color temperature must be preserved, not less.
+Brighten confidently -- dark furniture is usually underexposed, not truly black.
 
-Color
-Maintain realistic color fidelity: neutral whites, natural wood tone, accurate wall color, believable warm practical lighting, balanced daylight -- all at full MLS Bright exposure levels. Accurate wall color takes priority over a warmer, cozier-looking result -- if there is any tension between the two, preserve the true captured color.
+Avoid synthetic gloss or HDR artifacts.
+
+Reveal real material detail wherever sensor data supports recovery.
+
+Color Fidelity
+Preserve true material color and texture.
+
+Neutralize mixed lighting casts.
+
+Ceiling color correction is adaptive: neutralize cast, preserve genuine hue.
+
+Walls retain true paint color at full brightness.
+
+Maintain balanced daylight warmth and neutral whites.
+
+Contrast & Clarity
+Produce professional MLS photo quality -- bright, crisp, evenly lit, spacious.
+Avoid halos, glow, excessive clarity, or oversharpening.
+
+CV Integration Directive
+The Oracle is a synthetic luminance reference, not a photo edit.
+
+Every pixel corresponds to a real surface in the original HDR capture.
+
+Artificial light is permitted only to reveal existing sensor data.
+
+No invented geometry, reflections, or materials.
+
+The Oracle defines ideal exposure per pixel for CV correction.
 
 Critical Rule
-If any real, captured detail in this photo -- in furniture, walls, materials, or shadowed areas -- remains hidden in shadow, dim, or crushed toward black when the sensor data supports recovering it to MLS Bright, the correction is incomplete. The test is not "did I change too much" -- it is "does this read as true MLS Bright, professionally shot and edited, with every material and surface fully and brightly resolved." Under-correction that leaves the room dim or partially corrected is the failure mode to avoid here, the same way over-correction that invents data not supported by the capture is the failure mode to avoid elsewhere. A third failure mode, equally real: brightness correction that drifts the color temperature of neutral surfaces warmer than they actually are. Reaching MLS Bright with a warm color cast is not success -- it is a different, uncorrected error in the other direction.
+If any real captured detail remains dim or crushed when sensor data supports recovery, correction is incomplete.
+Under-correction, over-correction, or color drift are all failures.
+The final image must read as a professionally photographed MLS Bright listing photo of the same room.
 
 Final Objective
-The finished image should appear indistinguishable from a professionally photographed and professionally edited MLS-Bright architectural real estate photograph of this exact room -- fully, confidently, brightly corrected, with every material and surface reading true and clearly, not a cautious partial improvement over the raw capture, and with neutral surfaces holding their true color regardless of how much brighter they've become. Improve only photographic quality. Do not improve the property."""
+Deliver a synthetic MLS Bright lighting reference of the identical room --
+identical geometry, materials, and decor, but fully resolved luminance and color balance.
+Lighting may be artificial or natural, but must remain physically plausible and fixture-consistent.
+The result should serve as a CV-ready ideal map for pixel correction, indistinguishable from a professionally lit MLS photo in exposure and tone."""
 
 
 EXTERIOR_ORACLE_PROMPT = """Smart Correct Exterior Oracle v2
