@@ -81,6 +81,7 @@ from oracleCorrection import (  # noqa: E402
     apply_hue_fidelity_gate,
     apply_wall_color_anchor,
     apply_illumination_floor,
+    apply_global_hue_angle_gate,
     compute_recoverability_map,
     smooth_deltas_in_mask,
     MIN_ALIGNMENT_INLIERS,
@@ -122,6 +123,23 @@ SMARTCORRECT_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "smar
 # without a code change, same discipline as every other gate here.
 ILLUM_FLOOR_SHADOW_MODE = os.environ.get(
     "ORACLE_ILLUM_FLOOR_SHADOW_MODE", "false"
+).lower() not in ("false", "0", "")
+
+# GLOBAL HUE ANGLE GATE -- oracleCorrection.apply_global_hue_angle_gate was
+# written, and its docstring cites a real measured hue-family drift on
+# IMG_8310 as the reason it exists, but it was never imported or called
+# anywhere in this codebase (confirmed by grep across oracleCorrection.py
+# and this file -- Aug 2026). Unlike hue_fidelity_gate/illumination_floor
+# above, this gate has NO Vision dependency at all -- no ceiling_mask, no
+# wall_trim_mask, whole-frame, classical LAB math only -- so it is not
+# subject to ceiling_mask's 0%-real-batch-pass-rate problem those two
+# gates are currently starved by. Wiring in now, live by default, as the
+# final step of correction: it runs after every other step (Vision-gated
+# or not) so it can catch whatever hue drift survives everything above it,
+# same as its own docstring's intended role as a whole-frame backstop.
+# Kill switch for consistency with every other gate in this router.
+GLOBAL_HUE_GATE_SHADOW_MODE = os.environ.get(
+    "ORACLE_GLOBAL_HUE_GATE_SHADOW_MODE", "false"
 ).lower() not in ("false", "0", "")
 
 
@@ -441,6 +459,30 @@ def run_oracle_interior(source_path: str, output_path: str, orig_img) -> dict:
               f"raised={illum_floor_report.get('floor_raised_fraction', 0.0)*100:.1f}% of masked pixels",
               file=sys.stderr)
     routing_report["steps"]["illumination_floor"] = illum_floor_report
+
+    # GLOBAL HUE ANGLE GATE -- runs last, whole-frame, no Vision dependency.
+    # See GLOBAL_HUE_GATE_SHADOW_MODE comment above for why this is wired
+    # in now and why it's independent of everything above it in this
+    # function. Deliberately placed after illumination_floor so it can
+    # catch drift introduced anywhere upstream -- Oracle's own generation,
+    # or any Vision-gated step above -- not just Oracle's raw output.
+    if GLOBAL_HUE_GATE_SHADOW_MODE:
+        _hue_angle_shadow_result, hue_angle_report = apply_global_hue_angle_gate(
+            orig_img, corrected_img
+        )
+        print(f"[ORACLE-ROUTER] [GLOBAL-HUE-GATE SHADOW MODE] "
+              f"violated_fraction={hue_angle_report.get('violated_fraction', 0.0)*100:.1f}% "
+              f"mean_drift={hue_angle_report.get('mean_hue_drift_all_pixels', 0.0):.1f} deg "
+              f"(NOT applied -- shadow mode, corrected_img unchanged)", file=sys.stderr)
+    else:
+        corrected_img, hue_angle_report = apply_global_hue_angle_gate(
+            orig_img, corrected_img
+        )
+        print(f"[ORACLE-ROUTER] [GLOBAL-HUE-GATE LIVE] "
+              f"violated_fraction={hue_angle_report.get('violated_fraction', 0.0)*100:.1f}% "
+              f"mean_drift={hue_angle_report.get('mean_hue_drift_all_pixels', 0.0):.1f} deg "
+              f"(applied -- shadow mode off)", file=sys.stderr)
+    routing_report["steps"]["global_hue_angle_gate"] = hue_angle_report
 
     ok = cv2.imwrite(output_path, corrected_img)
     if not ok:
