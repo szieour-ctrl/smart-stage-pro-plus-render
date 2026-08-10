@@ -326,6 +326,19 @@ def identify_ceiling(img) -> tuple:
                 f"ceiling, exceeds plausibility cap of {MAX_CEILING_COVERAGE_FRACTION*100:.0f}% -- "
                 f"degrading to empty per this module's own no-smoothing-on-suspect-data contract"
             )
+            # DIAGNOSTIC ONLY (Aug 2026) -- the grid that TRIPPED the cap was
+            # previously discarded entirely on this path, leaving only the
+            # coverage number in the log. That meant every over-coverage
+            # failure was a single float with no way to see WHERE the model
+            # thought ceiling was -- a solid top-to-bottom block, a scattered
+            # spray of cells, or a specific region (e.g. windows, a bright
+            # wall) misread as ceiling would all produce the same number and
+            # be indistinguishable in the log. This field exists purely so a
+            # human can render it with draw_ceiling_overlay() below and look.
+            # Does NOT change the live contract: result["grid"] returned to
+            # the caller below is still [] on this path, exactly as before --
+            # no downstream correction code sees or uses this field.
+            report["diagnosticGrid"] = grid
             return {"grid": [], "error": report["error"]}, report
 
         return {"grid": grid, "error": None}, report
@@ -362,3 +375,41 @@ def rasterize_ceiling_mask(grid: List[str], img_shape) -> np.ndarray:
                 small[r, c] = 1.0
 
     return cv2.resize(small, (w, h), interpolation=cv2.INTER_NEAREST)
+
+
+def draw_ceiling_overlay(img, grid: List[str], color=(0, 0, 255), alpha=0.45):
+    """
+    DIAGNOSTIC ONLY -- not called anywhere in the live pipeline, not
+    imported by oracleCorrection.py or oracleRouter.py. Exists so a human
+    can SEE where a ceiling grid landed on the actual photo, instead of
+    trusting a single coverage-percentage number.
+
+    Why this matters (see Aug 2026 investigation): a coverage number
+    passing the plausibility cap only proves the TOTAL marked area was
+    reasonable -- it proves nothing about WHERE those cells are. A grid
+    that marked the correct ceiling area and a grid that marked an
+    equal-sized wrong area (say, a window or an upper wall band) would
+    both report the same coverage fraction and both look identical in
+    the log. Only rendering the mask back onto the photo can catch that.
+
+    img: the actual photo the grid was computed from (BGR, any size --
+        this function upsamples the grid to img's resolution, same
+        nearest-neighbor logic as rasterize_ceiling_mask).
+    grid: list of GRID_ROWS strings, GRID_COLS chars each ('C'/'.').
+        Pass report["diagnosticGrid"] from identify_ceiling for a
+        cap-tripped grid, or result["grid"] for a passing one.
+    color: BGR tuple for the overlay tint. Default red -- high-contrast
+        against most ceiling colors (white/cream/gray).
+    alpha: overlay opacity, 0..1. 0.45 is visible without fully hiding
+        the underlying photo detail underneath the tint.
+
+    Returns a new BGR uint8 image, same shape as img, with all 'C' cells
+    tinted `color` at `alpha` opacity. Does not modify img in place.
+    """
+    mask = rasterize_ceiling_mask(grid, img.shape)  # 1.0 in 'C' cells, 0.0 elsewhere
+    tint = np.zeros_like(img)
+    tint[:] = color
+    mask_3ch = mask[:, :, None]
+    blended = (img.astype(np.float32) * (1 - alpha * mask_3ch)
+               + tint.astype(np.float32) * (alpha * mask_3ch))
+    return np.clip(blended, 0, 255).astype(np.uint8)
