@@ -207,7 +207,30 @@ def _encode_for_vision(img) -> Optional[tuple]:
 
 def _call_vision_api(image_b64: str, media_type: str) -> dict:
     """Raw urllib.request call, no SDK -- same pattern as every other Vision
-    module in this codebase."""
+    module in this codebase.
+
+    PROMPT ORDER FIX (Aug 2026, root-cause investigation into 0/19
+    real-batch pass rate): this content list previously put the image
+    block FIRST, then the text block. That directly contradicted
+    level2_wall_trim_mask.py's own docstring ("PROMPT STRUCTURE" /
+    "second IMG_8310 investigation"), which cites THIS module as the
+    evidence for putting text first, then image, in a single user turn
+    -- a real side-by-side test on IMG_8310 where ceiling's grid (at
+    the time, apparently text-first) came back correct in row count,
+    while wall_trim's grid (at the time, system-field + short user
+    turn) was badly inconsistent. Sometime after that comparison was
+    written, this module's actual code order diverged from the
+    structure its own history credits with better grid reliability --
+    the same "docstring says one thing, code does another" drift
+    already found once in this module for SHADOW_MODE's default. No
+    file in this pipeline had corrected it back to text-first. Grid
+    overlay (Aug 2026) was tested as the fix for the 0/19 real-batch
+    failure and did NOT move the pass rate at all -- this prompt-order
+    mismatch is the next concrete, evidence-backed candidate, tested
+    now for the first time on this module since the grid-overlay
+    change. Flip only: no other change to the request, the prompt
+    text, or any downstream logic.
+    """
     last_col = chr(ord('A') + GRID_COLS - 1)
     prompt_text = SYSTEM_PROMPT.format(cols=GRID_COLS, rows=GRID_ROWS, last_col=last_col)
     body = json.dumps({
@@ -217,8 +240,8 @@ def _call_vision_api(image_b64: str, media_type: str) -> dict:
         "messages": [{
             "role": "user",
             "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": image_b64}},
                 {"type": "text", "text": prompt_text},
+                {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": image_b64}},
             ],
         }],
     }).encode("utf-8")
