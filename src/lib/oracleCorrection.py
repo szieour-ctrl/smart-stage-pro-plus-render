@@ -59,6 +59,35 @@ COLOR_BLUR_SIGMA = 15
 # box exclusion` elsewhere in the pipeline -- same failure mode, same fix.
 GATE_FEATHER_SIGMA = 15
 
+# ---- Local shadow recovery thresholds ----
+# This pass runs AFTER apply_oracle_guided_correction, on its OUTPUT, not the
+# Original. That ordering is load-bearing, not incidental -- see
+# apply_local_shadow_recovery's docstring for why it's what makes the
+# do-no-harm-to-walls-and-ceiling guarantee structural rather than a rule the
+# function has to remember to follow.
+#
+# NOT YET VALIDATED against a real batch. Built directly from this session's
+# IMG_8310 evidence (Preset lifted the dark dining-chair region far more than
+# Oracle did: +28.7 L vs Oracle's +11.9), same "ship shadow-first, confirm on
+# real photos" discipline as every other gate in this file.
+SHADOW_LIFT_L_MAX = 90        # only pixels still this dark AFTER Oracle correction
+                               # are even eligible -- walls/ceiling Oracle already
+                               # lifted sit well above this and are excluded by
+                               # construction, not by a separate architecture check.
+SHADOW_LIFT_STD_MIN = 8       # local std must exceed this to count as real recoverable
+                               # detail (matches the Preset's dining-chair result, which
+                               # had visible grain/texture once lifted) -- a flat, truly
+                               # crushed patch with near-zero local variance has nothing
+                               # in it to recover and is left alone, same "no data" logic
+                               # as compute_recoverability_map's RED_STD_MAX guard.
+SHADOW_LIFT_MAX_DELTA_L = 25.0  # do-no-harm cap: never lift any single pixel more than
+                               # this many L points in this pass, regardless of what
+                               # CLAHE alone would produce -- keeps this a supplementary
+                               # nudge, not a second uncapped brightening pass stacked on
+                               # top of Oracle's already-clamped correction.
+SHADOW_LIFT_CLAHE_CLIP = 3.0
+SHADOW_LIFT_CLAHE_TILE = 8
+
 
 def align_oracle_to_original(orig_img, oracle_img, ransac_reproj_threshold=5.0):
     """
@@ -308,6 +337,122 @@ def apply_oracle_guided_correction(orig_img, oracle_aligned, recoverability_map,
     corrected_img = cv2.cvtColor(corrected_lab, cv2.COLOR_LAB2BGR)
 
     return corrected_img, clip_report
+
+
+def apply_local_shadow_recovery(corrected_img, feather_sigma=GATE_FEATHER_SIGMA):
+    """
+    Classical (non-generative, no API call) local shadow lift, run as a
+    SUPPLEMENTARY pass on top of apply_oracle_guided_correction's output --
+    not a replacement for it, and not touching Original at all.
+
+    WHY THIS EXISTS: on IMG_8310, Oracle (Flux Kontext) only lifted the dark
+    dining-chair region +11.9 L, while the separate GPT Image 2 "MLS Bright"
+    Preset pass lifted the same region +28.7 L -- real recoverable detail
+    that Flux Kontext left on the table. Flux Kontext can't be swapped for
+    GPT Image 2 here: that would put Oracle generation back on GPT Image 2's
+    shared per-minute rate limit, which is the exact bottleneck this module
+    was built on Flux Kontext to avoid (see oracleGeneration.py's ENDPOINT
+    note). This function recovers some of that gap with zero API cost and no
+    rate-limit exposure -- pure OpenCV, runs in-process.
+
+    WHY THE DO-NO-HARM-TO-WALLS/CEILING GUARANTEE IS STRUCTURAL, NOT A RULE:
+    this function reads L from corrected_img -- Oracle's output, not the
+    Original. Walls and ceiling have ALREADY been lifted by Oracle by the
+    time this runs, so they already sit above SHADOW_LIFT_L_MAX and are
+    mathematically excluded from the eligibility mask. There's no
+    architecture/surface check needed to protect them -- a wall or ceiling
+    would have to still be dark after Oracle's own brightening for this pass
+    to touch it at all, and if that's true, it's not being over-corrected,
+    it's being SUPPLEMENTED for the same reason a real shadow region would
+    be.
+
+    ELIGIBILITY MASK: two conditions, both computed on corrected_img's L
+    channel:
+      1. L < SHADOW_LIFT_L_MAX -- still dark after Oracle's own lift.
+      2. local std > SHADOW_LIFT_STD_MIN -- has real local variance (texture,
+         grain, edges), same "no data" logic as
+         compute_recoverability_map's RED_STD_MAX guard. A flat, genuinely
+         crushed patch has nothing left to recover and is skipped, not
+         force-lifted into fabricated detail.
+
+    METHOD: CLAHE (same technique already used elsewhere in this module for
+    ORB feature stabilization, applied here to actually change pixel values
+    for once) is run on the full L channel to get a locally-contrast-
+    enhanced version. Per pixel, the lifted value is
+    max(L_corrected, L_clahe) -- CLAHE is only ever allowed to raise a
+    pixel's brightness in this function, never lower it, which is the
+    do-no-harm rule for luminance specifically (CLAHE's local-contrast
+    behavior can otherwise darken some pixels within a bright neighborhood
+    to increase local contrast -- that behavior is discarded here, not used).
+    The resulting delta is then hard-capped at SHADOW_LIFT_MAX_DELTA_L
+    before being applied through the feathered eligibility mask.
+
+    a/b (color) channels are left completely untouched -- this is a pure
+    luminance nudge, no hue/saturation shift, so it can't reintroduce any of
+    the color-cast problems the hue-fidelity gate and wall-chroma-anchor
+    functions elsewhere in this module already solved.
+
+    feather_sigma: same meaning as every other gate in this module -- softens
+    the eligibility mask edge so a shadow/non-shadow boundary doesn't show as
+    a visible seam. Defaults to GATE_FEATHER_SIGMA for consistency with the
+    rest of the pipeline; pass a different value if this specific mask's
+    scale warrants it once tested against a real batch.
+
+    Returns:
+        result: BGR uint8 image, same shape as corrected_img.
+        report: dict with masked_area_fraction and mean_delta_l_applied, for
+            logging -- same "always check the actual render" discipline as
+            every clip_report in this module.
+
+    ROLLOUT: same shadow-mode-first posture as every other gate here --
+    compute and log this session, do NOT wire it to auto-apply inside
+    run_oracle_driven_pipeline until it's been reviewed against a real batch.
+    Callers wanting it live must call this explicitly on
+    run_oracle_driven_pipeline's returned corrected_img, same pattern as
+    apply_saturation_cap and apply_hue_fidelity_gate.
+    """
+    corr_lab = cv2.cvtColor(corrected_img, cv2.COLOR_BGR2LAB).astype(np.float32)
+    L_corr, a_corr, b_corr = cv2.split(corr_lab)
+
+    k = WINDOW_SIZE
+    mean_local = cv2.boxFilter(L_corr, ddepth=-1, ksize=(k, k), normalize=True)
+    mean_sq_local = cv2.boxFilter(L_corr * L_corr, ddepth=-1, ksize=(k, k), normalize=True)
+    std_local = np.sqrt(np.clip(mean_sq_local - mean_local ** 2, 0, None))
+
+    eligible = (L_corr < SHADOW_LIFT_L_MAX) & (std_local > SHADOW_LIFT_STD_MIN)
+    eligible_mask = eligible.astype(np.float32)
+
+    if eligible_mask.max() < 1e-6:
+        return corrected_img, {
+            "applied": False, "reason": "no_eligible_shadow_pixels",
+            "masked_area_fraction": 0.0, "mean_delta_l_applied": 0.0,
+        }
+
+    feathered_mask = cv2.GaussianBlur(eligible_mask, ksize=(0, 0), sigmaX=feather_sigma)
+    feathered_mask = np.clip(feathered_mask, 0.0, 1.0)
+
+    clahe = cv2.createCLAHE(clipLimit=SHADOW_LIFT_CLAHE_CLIP,
+                             tileGridSize=(SHADOW_LIFT_CLAHE_TILE, SHADOW_LIFT_CLAHE_TILE))
+    L_clahe = clahe.apply(L_corr.astype(np.uint8)).astype(np.float32)
+
+    # CLAHE may raise OR lower a pixel to boost local contrast -- only the
+    # raise is wanted here (do-no-harm on luminance). max() discards any
+    # CLAHE-driven darkening entirely.
+    L_lifted_raw = np.maximum(L_corr, L_clahe)
+    delta = np.clip(L_lifted_raw - L_corr, 0.0, SHADOW_LIFT_MAX_DELTA_L)
+
+    L_new = np.clip(L_corr + delta * feathered_mask, 0, 255)
+
+    new_lab = cv2.merge([L_new, a_corr, b_corr]).astype(np.uint8)
+    result = cv2.cvtColor(new_lab, cv2.COLOR_LAB2BGR)
+
+    applied_delta = delta * feathered_mask
+    return result, {
+        "applied": True,
+        "masked_area_fraction": float(feathered_mask.mean()),
+        "mean_delta_l_applied": float(applied_delta[feathered_mask > 0.01].mean())
+                                 if (feathered_mask > 0.01).any() else 0.0,
+    }
 
 
 def score_region(img, box, label=""):
