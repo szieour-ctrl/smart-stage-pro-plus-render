@@ -48,9 +48,9 @@ Lawn, and Trees-and-Shrubs by name and adds a general Critical Rule
 ("if a correction would make the property appear in better physical
 condition than the captured photo supports, do not perform it").
 
-INTERIOR now uses v4 (Smart_Correct_Oracle_Interior_v3.docx naming lags one
-version behind the actual prompt text below -- rename the docx to v4 next
-time it's regenerated). History:
+INTERIOR now uses v5b (Smart_Correct_Oracle_Interior_v3.docx naming lags
+three versions behind the actual prompt text below -- rename the docx to
+v5b next time it's regenerated). History:
 v1 -> v2: v1's language was restrained-by-default with no explicit
 permission to recover aggressively -- confirmed on a real photo (Flux
 Kontext, IMG_8310): the interior result was a near-total no-op across
@@ -86,6 +86,23 @@ landed but ceiling/wall separation stayed weak, confirming this is a
 scene-contrast ceiling on what the prompt alone can do, not a prompt
 defect; further pop on low-contrast scenes is expected to come from the
 recoverability-driven correction pipeline, not further prompt tuning).
+v5a -> v5b: v5a's Global Exposure Directive included "Target histogram
+center at approximately 70% luminance" -- a fixed value, not a floor.
+Confirmed on a real already-bright photo (2089 Thornecroft Ln, new-
+construction neutral gray room, all lights on): Original frame mean
+luminance measured ~73% -- already above the 70% target -- and the
+resulting Oracle came back measurably DARKER than the Original across
+every region (walls, ceiling, carpet, hallway all down 5-13 RGB points,
+whole-frame mean down ~7%), the opposite of the intended "MLS Bright,
+never darker" behavior. Root cause: a histogram-center target is a
+bidirectional normalization instruction by nature -- it pulls frames
+above the target down just as readily as it lifts frames below it up.
+v5b removes the fixed percentage entirely and replaces it with a
+one-directional floor (lift underexposed frames, never darken an
+already well-exposed one) plus a highlight-detail-preservation ceiling
+(stop lifting a region once texture/grain would clip to flat white),
+since detail preservation -- not a target number -- is the actual
+reason any upper bound belongs in this directive at all.
 
 LABELING: every image this module produces is, by definition, the
 Oracle Scene Render -- a digitally altered image. That's not a caveat
@@ -168,7 +185,7 @@ OUTPUT_FORMAT = os.environ.get("ORACLE_GENERATION_OUTPUT_FORMAT", "png")
 # IF EITHER PROMPT DOCX IS REVISED AGAIN, THIS MUST BE UPDATED TO MATCH --
 # there is no automated sync between the docx and this constant.
 
-INTERIOR_ORACLE_PROMPT = """Smart Correct Oracle v5a
+INTERIOR_ORACLE_PROMPT = """Smart Correct Oracle v5b
 
 Primary Role
 Generate an idealized MLS Bright lighting map of the same room, preserving all geometry, materials, and decor exactly.
@@ -176,13 +193,22 @@ Lighting may be synthetic, natural, or time-shifted, but must remain physically 
 This Oracle defines how bright each pixel should be if fully resolved, not what new pixels to invent.
 
 Global Exposure Directive
-Apply full-frame luminance normalization to reach MLS Bright exposure.
+This is a strictly one-directional brightening operation, never a normalization toward a
+fixed value. Lift midtones and shadows until no area reads dim or hidden. There is no
+target brightness level to converge on -- only a floor to lift up to and a highlight
+ceiling to avoid crossing.
 
-Lift midtones and shadows until no area reads dim or hidden.
+If the captured frame is already well-exposed, do not reduce its brightness in any
+region. An already-bright frame must never come out of this step darker, in any area,
+than the frame that went in.
+
+The only ceiling on brightness is highlight-detail preservation: stop lifting a region
+once material texture, grain, or surface detail in that region would clip to flat white
+or become illegible. Recoverable detail must remain recoverable -- this is a correction
+reference for a downstream pixel-level engine, and a blown-out region has nothing left
+in it to correct against.
 
 Ceiling brightness anchors the frame -- equal to or slightly above wall luminance.
-
-Target histogram center at approximately 70% luminance.
 
 Maintain believable daylight direction and fixture glow.
 
