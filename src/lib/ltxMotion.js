@@ -60,6 +60,7 @@ const axios = require("axios");
 const ffmpeg = require("fluent-ffmpeg");
 const { fal } = require("@fal-ai/client");
 const { concatTwoClips } = require("./klingMotion");
+const { prepareImageForMotionAPI } = require("./imagePrep");
 
 const OUTPUT_W = 1920;
 const OUTPUT_H = 1080;
@@ -92,18 +93,11 @@ function ensureConfigured() {
 // is confirmed to be a Cloudinary delivery URL (renderPipeline.js already
 // depends on this for Kling). Inserting the transformation segment right
 // after "/upload/" is Cloudinary's documented URL-transform convention.
-const TWO_IMAGE_CROP_TRANSFORM = "c_crop,g_center,w_0.94,h_0.94";
-
-function buildCroppedStartUrl(remoteImageUrl) {
-  if (!remoteImageUrl.includes("/upload/")) {
-    // Not a recognizable Cloudinary delivery URL — can't safely insert a
-    // transformation segment. Caller falls back to using the same URL for
-    // both start and end rather than throwing, since a failed crop still
-    // produces a renderable (if less ideal) two-image call.
-    return remoteImageUrl;
-  }
-  return remoteImageUrl.replace("/upload/", `/upload/${TWO_IMAGE_CROP_TRANSFORM}/`);
-}
+// TWO_IMAGE_CROP_TRANSFORM / buildCroppedStartUrl REMOVED (August 2026) —
+// replaced by prepareImageForMotionAPI({ cropPercent: 0.94 }) from
+// ./imagePrep, called directly at the two-image workflow site below. Same
+// 94%-centered-crop behavior, no Cloudinary dependency. See imagePrep.js's
+// file header for the full reasoning.
 
 // ── CINEMATIC LTX FAST PROMPT PACK (16 motions, 2 batches) ────────────
 // Batch 1 (9): Sam's End_Frame_Generation_and_PRO_Plus_Changes doc.
@@ -282,7 +276,7 @@ const LTX_MOTION_TEMPLATES = {
     // single image — see buildCroppedStartUrl's comment above for the
     // full mechanism (tight cropped start + full original as end).
     requiresTwoImage: true,
-    cropTransformation: TWO_IMAGE_CROP_TRANSFORM,
+    cropTransformation: "94% center crop (see imagePrep.js's prepareImageForMotionAPI cropPercent)",
   },
   rack_focus: {
     // REPLACED (July 21, 2026 — real render: this preset hallucinated a
@@ -374,7 +368,7 @@ const LTX_MOTION_TEMPLATES = {
     // NEW (July 20, 2026, LTX_Prompt_revision doc) — one of the 3 presets
     // requiring the two-image crop workflow (see buildCroppedStartUrl).
     requiresTwoImage: true,
-    cropTransformation: TWO_IMAGE_CROP_TRANSFORM,
+    cropTransformation: "94% center crop (see imagePrep.js's prepareImageForMotionAPI cropPercent)",
   },
   open_plan_reveal: {
     prompt:
@@ -389,7 +383,7 @@ const LTX_MOTION_TEMPLATES = {
     // Back (3 total now, not 2 — the doc's "only TWO movements require
     // cropping" line is superseded by this correction).
     requiresTwoImage: true,
-    cropTransformation: TWO_IMAGE_CROP_TRANSFORM,
+    cropTransformation: "94% center crop (see imagePrep.js's prepareImageForMotionAPI cropPercent)",
   },
 };
 
@@ -617,8 +611,8 @@ async function generateLtxContinuationClip(frame, presetKey, workDir, jobId) {
   // 16:9") is a separate UI fix — see handoff notes, frontend repo pending.
   const inputPayload = {
     image_url: preset && preset.requiresTwoImage
-      ? buildCroppedStartUrl(frame.remoteImageUrl)
-      : frame.remoteImageUrl,
+      ? await prepareImageForMotionAPI(frame.remoteImageUrl, { cropPercent: 0.94, jobId })
+      : await prepareImageForMotionAPI(frame.remoteImageUrl, { jobId }),
     prompt,
     duration: duration,
     fps: 25, // matches motionRenderer.py's own fps, so LTX and Ken Burns clips are never accidentally frame-rate-mismatched at the concat/comparison level
@@ -638,7 +632,7 @@ async function generateLtxContinuationClip(frame, presetKey, workDir, jobId) {
   // to reference for whatever the move would otherwise reveal beyond the
   // tight start frame's boundaries, per the doc's two-image mechanism.
   if (preset && preset.requiresTwoImage) {
-    inputPayload.end_image_url = frame.remoteImageUrl;
+    inputPayload.end_image_url = await prepareImageForMotionAPI(frame.remoteImageUrl, { jobId });
   }
 
   let request_id;
@@ -771,6 +765,4 @@ module.exports = {
   VALID_LTX_PRESETS,
   VALID_LTX_DURATIONS,
   OPEN_PLAN_SAFE_LTX_PRESETS,
-  buildCroppedStartUrl,
-  TWO_IMAGE_CROP_TRANSFORM,
 };
