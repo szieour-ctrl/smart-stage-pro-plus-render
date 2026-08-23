@@ -721,9 +721,9 @@ async function processRenderJob(job) {
     });
     console.log(`[${job.jobId}] Assembled ${Object.keys(outputs).length} formats.`);
 
-    // ── Step 5: Upload finished videos to Cloudinary ──────────────────────
+    // ── Step 5: Upload finished videos to S3 ──────────────────────
     const urls = await uploadToCloudinary(outputs, job.projectId);
-    console.log(`[${job.jobId}] Uploaded to Cloudinary.`);
+    console.log(`[${job.jobId}] Uploaded to S3.`);
 
     // ── Step 6: Notify Netlify the job is complete ───────────────────────
     await notifyWebhook({
