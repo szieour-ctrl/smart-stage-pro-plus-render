@@ -1,36 +1,39 @@
 // musicGen.js — Background music, sourced from a curated Suno track
 // library (static, pre-hosted files), NOT a live generative API call.
 //
-// CHANGE (July 2026, audio build): REPLACES the old Mubert integration
-// entirely. Mubert was scaffolded but never actually turned on in
-// production (MUBERT_API_KEY was never set — every video shipped with a
-// silent fallback track, always). Per Sam's direction: rather than a
-// live prompt-to-music API (Mubert, or an unofficial Suno API wrapper),
-// this is a small, fixed set of tracks Sam generates himself in Suno's
-// own app, downloads, and hosts on Cloudinary — same pattern as the 8
-// Photographic Presets and the ElevenLabs voice options. No live music-
-// generation API call happens at request time at all; this file just
-// downloads a pre-made file and loops/trims it to fit.
+// CHANGE (Aug 2026, S3 migration): SUNO_TRACK_LIBRARY now points at S3
+// (bucket smart-stage-pro-media-938733852197-us-east-2-an, prefix
+// smart-stage-music/) instead of Cloudinary. Same static-file pattern
+// as before — Sam generates tracks in Suno's own app, downloads the
+// mp3s, uploads each to the smart-stage-music/ S3 prefix, and adds/
+// updates the entry below. No live music-generation API call happens
+// at request time at all; this file just downloads a pre-made file and
+// loops/trims it to fit.
 //
-// SUNO_TRACK_LIBRARY BELOW IS PLACEHOLDER DATA — every url is a dummy.
-// Sam needs to: generate tracks in Suno's own app, download the mp3s,
-// upload each to Cloudinary (any folder, e.g. "smart-stage-audio/music"),
-// and replace the placeholder urls below with the real Cloudinary URLs.
-// Track IDs (the map keys) are what the frontend's music picker sends as
-// musicStyle — safe to rename/add/remove entries here without touching
-// any other file, same as MUSIC_STYLE_MAP worked before.
+// To add a new track:
+//   1. Generate it in Suno, download the mp3.
+//   2. Upload to S3 under smart-stage-music/ (bucket above), simple
+//      URL-safe filename (letters/numbers/hyphens/underscores, no spaces).
+//   3. Confirm smart-stage-music/* is covered by the bucket's public-read
+//      policy (it should already be, from the initial migration).
+//   4. Add a new entry below — key is what the frontend's music picker
+//      sends as musicStyle; safe to rename/add/remove entries here
+//      without touching any other file, same as MUSIC_STYLE_MAP worked
+//      before.
 
 const fs = require("fs");
 const path = require("path");
 const axios = require("axios");
 const ffmpeg = require("fluent-ffmpeg");
 
+const S3_MUSIC_BASE = "https://smart-stage-pro-media-938733852197-us-east-2-an.s3.us-east-2.amazonaws.com/smart-stage-music";
+
 const SUNO_TRACK_LIBRARY = {
-  "japandi_calm":       { label: "Japandi — Calm Piano",        url: "https://res.cloudinary.com/de18zsi7o/video/upload/v1783988761/Marble_Staircase_p67gsf.mp3" },
-  "luxury_cinematic":   { label: "Luxury — Cinematic Strings",  url: "https://res.cloudinary.com/de18zsi7o/video/upload/v1783986942/Marble_Gallery_1_nkefh1.mp3" },
-  "modern_uplifting":   { label: "Modern — Warm & Uplifting",   url: "https://res.cloudinary.com/de18zsi7o/video/upload/v1783988869/Open_Door_Morning_st0bqs.mp3" },
-  "farmhouse_acoustic": { label: "Farmhouse — Light Acoustic",  url: "https://res.cloudinary.com/de18zsi7o/video/upload/v1783988583/MLS_Modern_vms49f.mp3" },
-  "default":            { label: "Default — Neutral Ambient",  url: "https://res.cloudinary.com/de18zsi7o/video/upload/v1783988583/MLS_Modern_vms49f.mp3" },
+  "japandi_calm":       { label: "Japandi — Calm Piano",        url: `${S3_MUSIC_BASE}/japandi-calm.mp3` },
+  "luxury_cinematic":   { label: "Luxury — Cinematic Strings",  url: `${S3_MUSIC_BASE}/luxury-cinematic.mp3` },
+  "modern_uplifting":   { label: "Modern — Warm & Uplifting",   url: `${S3_MUSIC_BASE}/modern-uplifting.mp3` },
+  "farmhouse_acoustic": { label: "Farmhouse — Light Acoustic",  url: `${S3_MUSIC_BASE}/farmhouse-acoustic.mp3` },
+  "default":            { label: "Default — Neutral Ambient",  url: `${S3_MUSIC_BASE}/default-ambient.mp3` },
 };
 
 function resolveTrack(musicStyle) {
@@ -122,7 +125,7 @@ async function generateMusic({ durationSeconds, musicStyle, workDir }) {
   const track = resolveTrack(musicStyle);
 
   if (!track.url || track.url.startsWith("REPLACE_WITH_REAL_")) {
-    console.warn(`Suno track "${musicStyle}" has no real Cloudinary URL configured yet — using silent fallback. Replace the placeholder in SUNO_TRACK_LIBRARY (musicGen.js) with a real hosted track.`);
+    console.warn(`Suno track "${musicStyle}" has no real hosted URL configured yet — using silent fallback. Replace the placeholder in SUNO_TRACK_LIBRARY (musicGen.js) with a real S3 URL.`);
     return generateSilentTrack(durationSeconds, workDir);
   }
 
