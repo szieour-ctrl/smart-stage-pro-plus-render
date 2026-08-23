@@ -57,6 +57,7 @@ const axios = require("axios");
 const ffmpeg = require("fluent-ffmpeg");
 const { fal } = require("@fal-ai/client");
 const { applyMotionPreset } = require("./motionPresets");
+const { prepareImageForMotionAPI } = require("./imagePrep");
 
 // Must match the output dimensions used in motionPresets.js — kept as a
 // separate local constant rather than importing it, since these two
@@ -181,10 +182,11 @@ function enforceScopeRules(frame) {
 // Cloudinary applies this transformation on the fly when Kling fetches the
 // URL — no extra processing or re-upload needed on our end.
 
-function forceCloudinary16x9(url) {
-  if (!url || !url.includes("/upload/")) return url; // not a Cloudinary delivery URL — leave untouched
-  return url.replace("/upload/", "/upload/c_fill,ar_16:9,g_auto/");
-}
+// forceCloudinary16x9 REMOVED (August 2026) — replaced by
+// prepareImageForMotionAPI({ cropTo16x9: true }) from ./imagePrep, called
+// directly at the fal.queue.submit() site below. See imagePrep.js's file
+// header for the full reasoning and the known center-crop-vs-Cloudinary's-
+// smart-gravity behavioral difference.
 
 // ── KLING MOTION PRESET TEMPLATES ─────────────────────────────────────
 // Named, tested prompt templates beyond the two generic defaults below.
@@ -579,8 +581,10 @@ async function generateKlingClip(frame, workDir) {
   // instead of vanishing without a trace.
   const { request_id } = await fal.queue.submit(KLING_ENDPOINT, {
     input: {
-      image_url: forceCloudinary16x9(frame.imageUrl),
-      end_image_url: frame.endImageUrl ? forceCloudinary16x9(frame.endImageUrl) : undefined,
+      image_url: await prepareImageForMotionAPI(frame.imageUrl, { cropTo16x9: true }),
+      end_image_url: frame.endImageUrl
+        ? await prepareImageForMotionAPI(frame.endImageUrl, { cropTo16x9: true })
+        : undefined,
       prompt,
       duration,
       generate_audio: false, // Mubert handles music separately — avoid conflicting audio tracks
