@@ -1162,8 +1162,20 @@ async function assembleVideo({ clipPaths, musicPath, narrationSegments, formats,
   // appendClosingCardWithAudio's header comment for why. Wrapped in
   // try/catch: a closing card is a nice-to-have, never the reason a
   // render fails.
-  if (closingCard && narrationSegments && narrationSegments.length > 0) {
+  // FIXED (August 2026 — real bug found via a real render: end frame +
+  // music fade silently never appeared on a narration-off render, with no
+  // log line explaining why). This used to also require
+  // `narrationSegments && narrationSegments.length > 0` — but
+  // appendClosingCardWithAudio (above) never actually reads
+  // narrationSegments at all; it works purely off mainPath's already-
+  // mixed audio (narration or not) and musicPath for its own independent
+  // stinger. The narration check was an unnecessary, incorrect gate — the
+  // closing card and its music fade should appear whenever the flag/
+  // address/frame checks upstream in renderPipeline.js already passed,
+  // regardless of whether narration happens to be on for this render.
+  if (closingCard) {
     try {
+      console.log("[assembleVideo] Appending closing card with music stinger...");
       withMusic = await appendClosingCardWithAudio(withMusic, closingCard, musicPath, workDir);
     } catch (err) {
       console.warn(`Closing card skipped (non-fatal, video proceeds without it): ${err.message}`);
