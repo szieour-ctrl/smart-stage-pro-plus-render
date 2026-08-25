@@ -501,22 +501,13 @@ async function applyContinuationMotion(klingClipPath, frame, workDir) {
     1.0
   );
 
-  // ── TEMPORARY DEBUG: upload both individual clips BEFORE concatenation,
-  // so each can be inspected in isolation. This is the fastest way to tell
-  // whether the bug lives in the parallax filter itself (motionPresets.js)
-  // or only appears after the concat/normalize step. Remove once the
-  // continuation feature is confirmed working end to end.
-  try {
-    const { uploadToCloudinary } = require("./cloudinaryUpload");
-    const debugUrls = await uploadToCloudinary(
-      { debug_kling_only: klingClipPath, debug_parallax_only: continuationResult.path },
-      "debug-continuation"
-    );
-    console.log(`  [DEBUG] Kling clip alone: ${debugUrls.debug_kling_only}`);
-    console.log(`  [DEBUG] Parallax clip alone: ${debugUrls.debug_parallax_only}`);
-  } catch (debugErr) {
-    console.error(`  [DEBUG] Debug upload failed (non-fatal): ${debugErr.message}`);
-  }
+  // REMOVED (Aug 25, 2026): two TEMPORARY DEBUG upload blocks used to sit
+  // here, gated on "Remove once the continuation feature is confirmed
+  // working end to end" — confirmed via a real end-to-end Kling/LTX
+  // render this session, so removing per their own stated condition
+  // rather than migrating them to S3. Also would have needed migrating:
+  // both called the now-retired uploadToCloudinary(outputs, projectId)
+  // from cloudinaryUpload.js.
 
   const combinedPath = await concatTwoClips(
     klingClipPath,
@@ -524,24 +515,6 @@ async function applyContinuationMotion(klingClipPath, frame, workDir) {
     workDir,
     `kling_continued_${Date.now()}.mp4`
   );
-
-  // ── TEMPORARY DEBUG: upload the combined clip too, right after concat,
-  // before it heads into the rest of the pipeline. The two uploads above
-  // confirmed each half individually — this one confirms whether the
-  // CONCAT step itself produces a correct ~8s combined file, or whether
-  // the bug is further downstream (assemble.js) truncating something
-  // that was already fine at this point. Remove alongside the other two
-  // debug uploads once the full chain is confirmed working.
-  try {
-    const { uploadToCloudinary } = require("./cloudinaryUpload");
-    const combinedDebugUrls = await uploadToCloudinary(
-      { debug_combined: combinedPath },
-      "debug-continuation"
-    );
-    console.log(`  [DEBUG] Combined clip (post-concat, pre-pipeline): ${combinedDebugUrls.debug_combined}`);
-  } catch (debugErr) {
-    console.error(`  [DEBUG] Combined debug upload failed (non-fatal): ${debugErr.message}`);
-  }
 
   return { path: combinedPath, endingZoom: continuationResult.endingZoom };
 }
