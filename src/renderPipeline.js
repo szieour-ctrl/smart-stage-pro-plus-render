@@ -20,7 +20,7 @@ const { generateLtxRevealContinuation, applyLtxMotion, isStandaloneEligible, LTX
 const { generateMusic } = require("./lib/musicGen");
 const { assembleVideo, buildRevealClip, REVEAL_PRESETS, REVEAL_OPENER_DURATION, REVEAL_WIPE_DURATION, REVEAL_CONTINUATION_DURATION, computeClipTimeline, extractMidpointFrame, probeDuration, mapWithConcurrencyLimit, FFMPEG_CONCURRENCY_LIMIT } = require("./lib/assemble");
 const { generateNarration, groupContiguousByRoom } = require("./lib/narrationGen");
-const { uploadToCloudinary } = require("./lib/cloudinaryUpload");
+const { uploadToS3 } = require("./lib/s3Upload");
 const { notifyWebhook } = require("./lib/notify");
 // NEW (this session) — End Frame: replaces the closing shot with a
 // Flux-edited version (address + CTA baked into the image itself).
@@ -722,7 +722,7 @@ async function processRenderJob(job) {
     console.log(`[${job.jobId}] Assembled ${Object.keys(outputs).length} formats.`);
 
     // ── Step 5: Upload finished videos to S3 ──────────────────────
-    const urls = await uploadToCloudinary(outputs, job.projectId);
+    const urls = await uploadToS3(outputs, job.projectId);
     console.log(`[${job.jobId}] Uploaded to S3.`);
 
     // ── Step 6: Notify Netlify the job is complete ───────────────────────
