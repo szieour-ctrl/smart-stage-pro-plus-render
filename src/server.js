@@ -17,6 +17,13 @@ const { processRenderJob } = require("./renderPipeline");
 const { processCorrectBatch, correctOneImage } = require("./lib/correctPipeline");
 const { generateLtxContinuationClip } = require("./lib/ltxMotion");
 const { runHdrTest } = require("./lib/hdrTestPipeline");
+// NEW (this session — /test-motion diagnostic route): isolated Ken Burns
+// preset testing, same spirit as /test-ltx below but for the local
+// OpenCV motion path instead of the fal.ai LTX path. See the route
+// itself, further down, for the full usage/reasoning.
+const { downloadFrames } = require("./lib/downloadFrames");
+const { applyMotionPreset, VALID_PRESETS } = require("./lib/motionPresets");
+const { uploadScratchFile } = require("./lib/s3Upload");
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
@@ -252,6 +259,7 @@ app.post("/correct-batch", requireSecret, async (req, res) => {
 // SMART_CORRECT_ALLOWED_ORIGIN so preview/staging domains can be added
 // without a code change).
 const SMART_CORRECT_ALLOWED_ORIGIN = process.env.SMART_CORRECT_ALLOWED_ORIGIN || "https://smartstagepro.com";
+
 app.use("/correct-image", (req, res, next) => {
   res.header("Access-Control-Allow-Origin", SMART_CORRECT_ALLOWED_ORIGIN);
   res.header("Access-Control-Allow-Methods", "POST, OPTIONS");
@@ -355,6 +363,94 @@ app.get("/test-ltx", requireSecret, async (req, res) => {
   }
 });
 
+// ── TEMPORARY DIAGNOSTIC — TEST MOTION PRESET (Ken Burns) ────────────────
+// Added (this session) — same spirit as /test-ltx above, but for the
+// local OpenCV Ken Burns path (motionPresets.js → motionRenderer.py)
+// instead of the fal.ai LTX path. Unlike LTX, this makes NO external API
+// call and incurs NO billing — it just runs the real, deployed
+// applyMotionPreset() directly against one image, bypassing the entire
+// /render job/webhook pipeline (no job tracking, no narration, no music,
+// no S3-finals upload, no Netlify callback).
+//
+// The one wrinkle: applyMotionPreset()'s output is a local file on this
+// Railway container, which isn't served anywhere — there's no way to
+// just hand back a path. uploadToS3() (the production video uploader)
+// isn't the right tool either, since it deliberately writes to a PRIVATE
+// prefix as part of the credit-gating system (see s3Upload.js's header
+// comment) and only returns a bare S3 key, not a clickable URL. So this
+// route uses the new uploadScratchFile() helper instead — same
+// smart-stage-scratch/ prefix already used for temporary per-render
+// crop/resize files, already public, already on a 1-2 day lifecycle
+// expiry. Nothing about the private video-finals storage path is
+// touched by this route.
+//
+// Usage (GET, so it's testable from a browser address bar or Postman,
+// no request body needed):
+//   /test-motion?imageUrl=<url>&preset=<presetKey>&duration=<seconds>
+//     &x-railway-secret header required, same as /render and /test-ltx
+//
+// Remove this route once pan_zoom/soft_hold/restrained_push (and any
+// other newly added Ken Burns presets) are confirmed matching production
+// output.
+app.get("/test-motion", requireSecret, async (req, res) => {
+  const { imageUrl, preset, duration } = req.query;
+
+  if (!imageUrl || !preset) {
+    return res.status(400).json({
+      error: "Missing required query params.",
+      required: ["imageUrl", "preset"],
+      optional: ["duration (seconds, default 6.0)"],
+      validPresets: Array.from(VALID_PRESETS),
+      example: "/test-motion?imageUrl=https://smart-stage-finals.s3.amazonaws.com/.../staged.jpg&preset=pan_zoom&duration=6",
+    });
+  }
+
+  if (!VALID_PRESETS.has(preset)) {
+    return res.status(400).json({
+      error: `Unknown preset "${preset}"`,
+      validPresets: Array.from(VALID_PRESETS),
+    });
+  }
+
+  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "test-motion-"));
+
+  try {
+    // downloadFrames.js expects each frame's image link under
+    // `imageUrl` (not `remoteImageUrl` — that's the name it RETURNS
+    // things under, for Kling's benefit, not what it reads coming in).
+    // Reused as-is here — same download logic production uses, rather
+    // than a parallel fetch implementation that could drift.
+    const [localFrame] = await downloadFrames([{ imageUrl }], workDir);
+
+    const frame = {
+      ...localFrame,
+      motionPreset: preset,
+      durationSeconds: duration ? Number(duration) : null,
+    };
+
+    const result = await applyMotionPreset(frame, workDir, 1.0);
+
+    const videoUrl = await uploadScratchFile(
+      result.path,
+      `test-motion_${preset}_${Date.now()}.mp4`,
+      "video/mp4"
+    );
+
+    res.json({
+      success: true,
+      preset,
+      duration: duration ? Number(duration) : 6.0,
+      endingZoom: result.endingZoom,
+      videoUrl,
+      note: "Uploaded to the smart-stage-scratch/ S3 prefix — auto-expires in 1-2 days.",
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    fs.rm(workDir, { recursive: true, force: true }, () => {});
+  }
+});
+
 // ── TEMPORARY DIAGNOSTIC — HDR GAIN-MAP TEST TOOL ───────────────────────
 // Added (July 29, 2026), per the July 28 architecture review's agreed
 // first step: a standalone test tool, fully decoupled from production
@@ -375,7 +471,7 @@ app.get("/test-ltx", requireSecret, async (req, res) => {
 //   { imageBase64, mimeType, targetDisplayHeadroom?, highlightReserve? }
 //   header: x-railway-secret: <RAILWAY_SECRET>
 //
-// Remove this route once the HDR decode investigation is done and either
+// Remove once the HDR decode investigation is done and either
 // folded into production or abandoned.
 //
 // CORS: permissive on purpose. Unlike /correct-image (locked to the real
