@@ -535,7 +535,7 @@ const REVEAL_PRESETS = {
       "cinematic_push", "luxury_drift", "floating_camera_drift", "architectural_glide", "corner_to_corner_drift",
       "orbit_arc", "rack_focus", "drone_boom_up", "crane_up", "crane_down", "parallax_push", "pan_zoom_reveal",
       "living_room_ambient", "fireplace_flicker", "water_motion", "outdoor_breeze",
-      "micro_zoom_out", "micro_dolly_back", "open_plan_reveal",
+      "micro_zoom_out", "micro_dolly_back",
     ],
   },
   luxury_drift: {
@@ -553,7 +553,7 @@ const REVEAL_PRESETS = {
       "luxury_drift", "floating_camera_drift", "architectural_glide", "corner_to_corner_drift",
       "orbit_arc", "drone_boom_up", "crane_up", "crane_down", "pan_zoom_reveal",
       "living_room_ambient", "fireplace_flicker", "water_motion", "outdoor_breeze",
-      "micro_zoom_out", "micro_dolly_back", "open_plan_reveal",
+      "micro_zoom_out", "micro_dolly_back",
     ],
   },
   cinematic_reveal: {
@@ -568,7 +568,7 @@ const REVEAL_PRESETS = {
       "cinematic_push", "luxury_drift", "floating_camera_drift", "architectural_glide", "corner_to_corner_drift",
       "orbit_arc", "rack_focus", "drone_boom_up", "crane_up", "crane_down", "parallax_push", "pan_zoom_reveal",
       "living_room_ambient", "fireplace_flicker", "water_motion", "outdoor_breeze",
-      "micro_zoom_out", "micro_dolly_back", "open_plan_reveal",
+      "micro_zoom_out", "micro_dolly_back",
     ],
   },
 };
