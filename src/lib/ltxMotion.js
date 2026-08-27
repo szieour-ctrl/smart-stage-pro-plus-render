@@ -77,13 +77,12 @@ function ensureConfigured() {
 }
 
 // ── TWO-IMAGE CROP WORKFLOW (July 20, 2026, LTX_Prompt_revision doc) ────
-// Only 3 presets need this: orbit_arc, micro_dolly_back, open_plan_reveal
-// (see requiresTwoImage flag on each below). Per the doc's Section 1: LTX
-// has no reference for what's outside the original frame on any move that
-// expands the frame boundary (rotation, pull-back, or — per Sam's July 20
-// correction — the open-plan reveal's zone-redistribution too). Two-image
-// mechanism: crop the SAME source photo down slightly (94% width/height,
-// centered) to use as the tight Start Frame; the untouched original photo
+// Only 2 presets need this: orbit_arc, micro_dolly_back (see
+// requiresTwoImage flag on each below). Per the doc's Section 1: LTX has
+// no reference for what's outside the original frame on any move that
+// expands the frame boundary (rotation, pull-back). Two-image mechanism:
+// crop the SAME source photo down slightly (94% width/height, centered)
+// to use as the tight Start Frame; the untouched original photo
 // (necessarily wider by comparison, since it's the same image before that
 // crop) is the End Frame. Both frames are guaranteed to share identical
 // lighting/color/style because they're literally the same photograph —
@@ -98,6 +97,18 @@ function ensureConfigured() {
 // ./imagePrep, called directly at the two-image workflow site below. Same
 // 94%-centered-crop behavior, no Cloudinary dependency. See imagePrep.js's
 // file header for the full reasoning.
+//
+// KNOWN TRADEOFF (confirmed via real playground test, this session): the
+// two-image mechanism reliably fixes camera-direction accuracy (e.g.
+// micro_zoom_out correctly zooming out instead of defaulting to a push-in
+// on single-image mode) but appears to come at the cost of ambient motion
+// — a real fireplace flame tested nearly frozen/undetectable in a
+// two-image micro_dolly_back render, versus flickering normally in
+// single-image mode. Likely cause: with two fixed photographic endpoints
+// to match, the model has less generative freedom left for anything not
+// dictated by those two images (like flame flicker) than it does in
+// single-image mode. Not yet resolved — worth keeping in mind when
+// choosing which presets get the two-image treatment on fireplace shots.
 
 // ── CINEMATIC LTX FAST PROMPT PACK (16 motions, 2 batches) ────────────
 // Batch 1 (9): Sam's End_Frame_Generation_and_PRO_Plus_Changes doc.
@@ -271,7 +282,7 @@ const LTX_MOTION_TEMPLATES = {
     safeWhen: "A central subject — kitchen island, dining table, pool — with room around it in frame.",
     gate: null,
     // NEW (July 20, 2026, LTX_Prompt_revision doc) — Orbit/Arc is one of
-    // only 3 presets that require the two-image crop workflow. Wide arc
+    // only 2 presets that require the two-image crop workflow. Wide arc
     // rotation reveals background area LTX has no reference for on a
     // single image — see buildCroppedStartUrl's comment above for the
     // full mechanism (tight cropped start + full original as end).
@@ -329,6 +340,8 @@ const LTX_MOTION_TEMPLATES = {
     confidence: "medium-high",
     safeWhen: "Any room with reasonable width to pan across.",
     gate: null,
+    // CONFIRMED (real render, this session) — single-image, no crop,
+    // renders correctly as intended. No change needed.
   },
 
   // Batch 3 REVISED (July 18, 2026) — Sam's own real disconnect catch:
@@ -336,20 +349,27 @@ const LTX_MOTION_TEMPLATES = {
   // doc's one-line description, never tested) wasn't hallway-safe enough
   // — a generic "pull back and widen" instruction has no way to guarantee
   // it won't expose hallway depth or a doorway edge in an open-plan space
-  // that has one nearby. Replaced entirely with 3 purpose-built,
-  // explicitly hallway-constrained movements from LTX_Micro_movement_
-  // prompts.docx — each one names the hallway-exposure risk directly and
-  // constrains against it, rather than relying on a generic "no new
-  // geometry" instruction to cover a specific, known failure mode.
+  // that has one nearby. Replaced entirely with purpose-built, explicitly
+  // hallway-constrained movements from LTX_Micro_movement_prompts.docx —
+  // each one names the hallway-exposure risk directly and constrains
+  // against it, rather than relying on a generic "no new geometry"
+  // instruction to cover a specific, known failure mode.
   // UNTESTED — same flag as before: on paper from the doc, not yet
   // confirmed against a real render the way the batch-1/2 presets were.
   // Batch 3 REVISED (July 20, 2026, LTX_Prompt_revision v3 doc) — replaces
   // the earlier, much longer hallway-guardrail phrasing (Batch 3 REVISED,
   // July 18) with the v3 pack's tighter wording, plus the flame clause.
-  // STILL UNTESTED (Sam's real-render testing this session covered the
-  // FLAME_CLAUSE specifically on other presets, not these 3 movements
-  // themselves) — flag carried forward from the prior revision, not
-  // cleared by this change.
+  //
+  // open_plan_reveal REMOVED (this session) — real testing found it
+  // functionally identical to micro_zoom_out once both use the two-image
+  // crop workflow (LTX has no depth data from a flat photo to distinguish
+  // "redistribute focus across zones" from "frame gets wider" — both
+  // rendered as the same uniform reveal), plus the same frozen/
+  // near-undetectable flame issue as micro_dolly_back's two-image mode.
+  // No unique value over micro_zoom_out to justify keeping both. If
+  // reintroduced later, restore this block (git history has the last
+  // version) and re-add to OPEN_PLAN_SAFE_LTX_PRESETS and the
+  // two-image-workflow comment above.
   micro_zoom_out: {
     prompt:
       "Perform a gentle micro zoom-out that breathes outward while staying strictly inside the photographed boundaries. No new ceiling, flooring, corners, cabinetry, or hallway entrances appear." + FLAME_CLAUSE,
@@ -357,31 +377,35 @@ const LTX_MOTION_TEMPLATES = {
     safeWhen: "Open-plan spaces, especially those with a hallway or corridor nearby that must not be exposed.",
     gate: null,
     openPlanOnly: true,
+    // ADDED (confirmed by real render test — single-image version pushed
+    // IN instead of zooming out; the two-image crop/original pairing is
+    // what actually enforces the correct direction, not the prompt text
+    // alone.
+    requiresTwoImage: true,
+    cropTransformation: "94% center crop (see imagePrep.js's prepareImageForMotionAPI cropPercent)",
   },
   micro_dolly_back: {
+    // REVISED (this session, real render test) — single-image version
+    // pushed IN instead of dollying back (same root cause as
+    // micro_zoom_out above); first two-image attempt correctly widened
+    // the frame but rendered visually identical to micro_zoom_out (no
+    // depth map available from a flat photo, so LTX can't distinguish a
+    // true parallax dolly from a flat zoom). This revised prompt, which
+    // explicitly describes foreground-vs-background parallax rather than
+    // just "dolly back," was re-tested in the fal.ai playground with the
+    // same two-image pair and CONFIRMED GOOD — visually distinct from
+    // micro_zoom_out now, no push-in regression.
     prompt:
-      "Perform a smooth micro dolly-back that moves backward without exposing any new areas of the room. No hallway depth, doorway edges, or extended wall planes appear." + FLAME_CLAUSE,
+      "Perform a smooth micro dolly motion that widens the frame while creating subtle parallax: elements closer to the camera (foreground furniture, countertop edges) shift position slightly more than elements farther away (back walls, distant fixtures), creating a sense of depth rather than a flat, uniform zoom. No hallway depth, doorway edges, or extended wall planes appear." + FLAME_CLAUSE,
     confidence: "medium-high",
     safeWhen: "Open-plan spaces, especially those with a hallway or corridor nearby that must not be exposed.",
     gate: null,
     openPlanOnly: true,
-    // NEW (July 20, 2026, LTX_Prompt_revision doc) — one of the 3 presets
+    // NEW (July 20, 2026, LTX_Prompt_revision doc) — one of the 2 presets
     // requiring the two-image crop workflow (see buildCroppedStartUrl).
-    requiresTwoImage: true,
-    cropTransformation: "94% center crop (see imagePrep.js's prepareImageForMotionAPI cropPercent)",
-  },
-  open_plan_reveal: {
-    prompt:
-      "Perform a subtle open-plan reveal that redistributes focus across already visible zones without widening the frame. No new corners, walls, or hallway geometry appear." + FLAME_CLAUSE,
-    confidence: "medium-high",
-    safeWhen: "Open-plan spaces with continuous kitchen-dining-living sightlines.",
-    gate: null,
-    openPlanOnly: true,
-    // NEW (July 20, 2026) — originally shipped as "no crop" in the v3 doc;
-    // Sam's explicit follow-up correction same day added Open-Plan Reveal
-    // to the cropped/two-image tier alongside Orbit/Arc and Micro Dolly
-    // Back (3 total now, not 2 — the doc's "only TWO movements require
-    // cropping" line is superseded by this correction).
+    // KNOWN ISSUE (confirmed real render, this session): flame renders
+    // nearly frozen/undetectable in two-image mode on this preset — see
+    // the two-image workflow comment above for the likely cause.
     requiresTwoImage: true,
     cropTransformation: "94% center crop (see imagePrep.js's prepareImageForMotionAPI cropPercent)",
   },
@@ -392,7 +416,7 @@ const VALID_LTX_PRESETS = new Set(Object.keys(LTX_MOTION_TEMPLATES));
 // NEW (July 18, 2026, Cinematic_LTX_-Kling_reference doc) — replaces the
 // blanket open-plan block that used to reject ALL LTX presets on
 // open-plan frames outright. This is now a curated allowlist: exactly
-// the 7 presets the reference doc marks "✅ Safe for Both Kling + LTX"
+// the presets the reference doc marks "✅ Safe for Both Kling + LTX"
 // under its OPEN-PLAN SPACES section. Everything not in this set still
 // blocks on open-plan — including presets already proven fine for
 // single/enclosed rooms (orbit_arc, rack_focus, crane_up/down,
@@ -403,6 +427,9 @@ const VALID_LTX_PRESETS = new Set(Object.keys(LTX_MOTION_TEMPLATES));
 // around; treating "cleared for single-room" as "cleared for open-plan"
 // would be exactly the kind of unearned generalization this whole
 // pack has been careful to avoid everywhere else.
+//
+// open_plan_reveal REMOVED (this session) — see removal note on the
+// deleted preset block above.
 const OPEN_PLAN_SAFE_LTX_PRESETS = new Set([
   "cinematic_push",
   "luxury_drift",
@@ -412,13 +439,12 @@ const OPEN_PLAN_SAFE_LTX_PRESETS = new Set([
   "fireplace_flicker",
   "micro_zoom_out",
   "micro_dolly_back",
-  "open_plan_reveal",
 ]);
 
 // Confidence tiers eligible for STANDALONE selection (no Room Reveal
 // pairing required) — Sam's call: "Medium to High confidence movements"
 // only. Every preset in the pack above is medium-high or high, so in
-// practice this currently allows all 9 — kept as an explicit filter
+// practice this currently allows all of them — kept as an explicit filter
 // rather than hardcoding "all of them," so a future LOW-confidence
 // addition to the pack doesn't silently become standalone-selectable
 // without a deliberate decision.
@@ -444,18 +470,18 @@ function enforceLtxScopeRules(frame, presetKey, jobId) {
 
   // REVERSED (July 18, 2026, Cinematic_LTX_-Kling_reference doc) — this
   // used to be a blanket rejection of ANY LTX preset on open-plan frames.
-  // The reference doc's real safety analysis clears a specific 7-preset
-  // subset for open-plan (OPEN_PLAN_SAFE_LTX_PRESETS above); everything
-  // else still blocks there, including presets already fine for single
-  // rooms — see that constant's comment for why "safe in a small room"
-  // doesn't imply "safe in a large multi-zone space."
+  // The reference doc's real safety analysis clears a specific subset for
+  // open-plan (OPEN_PLAN_SAFE_LTX_PRESETS above); everything else still
+  // blocks there, including presets already fine for single rooms — see
+  // that constant's comment for why "safe in a small room" doesn't imply
+  // "safe in a large multi-zone space."
   if (frame.isOpenPlan && !OPEN_PLAN_SAFE_LTX_PRESETS.has(presetKey)) {
     throw new Error(
       `LTX motion rejected: preset "${presetKey}" is not cleared for open-plan rooms (frame.isOpenPlan is true). Cleared open-plan presets: ${[...OPEN_PLAN_SAFE_LTX_PRESETS].join(", ")}. Use one of those, a Ken Burns continuation preset, or Kling if this specific motion is required on this room.`
     );
   }
 
-  // These 3 are the inverse case — restricted TO open-plan spaces, unsafe
+  // These are the inverse case — restricted TO open-plan spaces, unsafe
   // in enclosed single rooms (each one's own hallway-safety constraints
   // only make sense where there's real open-plan continuity to work
   // with). Mirrors klingMotion.js's identical OPEN_PLAN_ONLY_PRESETS
@@ -626,7 +652,7 @@ async function generateLtxContinuationClip(frame, presetKey, workDir, jobId) {
   };
 
   // Two-image workflow (July 20, 2026, LTX_Prompt_revision doc) — only
-  // orbit_arc, micro_dolly_back, and open_plan_reveal set requiresTwoImage.
+  // orbit_arc, micro_zoom_out, and micro_dolly_back set requiresTwoImage.
   // end_image_url = the ORIGINAL, uncropped staged image — wider by
   // comparison to the cropped start frame above, giving LTX real content
   // to reference for whatever the move would otherwise reveal beyond the
