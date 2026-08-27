@@ -77,8 +77,10 @@ function ensureConfigured() {
 }
 
 // ── TWO-IMAGE CROP WORKFLOW (July 20, 2026, LTX_Prompt_revision doc) ────
-// Only 2 presets need this: orbit_arc, micro_dolly_back (see
-// requiresTwoImage flag on each below). Per the doc's Section 1: LTX has
+// Presets requiring this: orbit_arc, micro_zoom_out, micro_dolly_back,
+// pan_zoom_reveal (see requiresTwoImage flag on each below — pan_zoom_reveal
+// added this session after a real single-image render hallucinated at 6s).
+// Per the doc's Section 1: LTX has
 // no reference for what's outside the original frame on any move that
 // expands the frame boundary (rotation, pull-back). Two-image mechanism:
 // crop the SAME source photo down slightly (94% width/height, centered)
@@ -136,41 +138,38 @@ function ensureConfigured() {
 // made for Kling's equivalent gates).
 
 // FLAME_CLAUSE — shared suffix appended to every non-ambient camera-motion
-// preset below (v3 pack, LTX_Prompt_revision doc, July 20, 2026, tested by
-// Sam across 6 real renders: 3 with a real fireplace, 3 with none — zero
-// hallucinations in either direction). Two things this deliberately does,
-// confirmed as intentional with Sam and NOT an accidental hallucination
-// exception to the rest of this file's "no new objects" language:
-//   1. Fixes the actual bug this was written for — camera-motion presets'
-//      own "everything stays fixed/unchanged" negative constraints were
-//      unintentionally freezing an already-lit fireplace's flame along
-//      with genuinely-static things (furniture, architecture). This clause
-//      carves out "already-present dynamic elements keep moving naturally"
-//      from "no NEW objects/geometry/reflections" — the actual protection
-//      against hallucination is untouched.
-//   2. Also allows flame INJECTION when no flame is visible in an existing
-//      fireplace opening. Confirmed with Sam this is intentional, not a
-//      hallucination-policy violation: AB 723 governs photo disclosure of
-//      STAGING alterations; this is video, showing a real, physical
-//      feature of the home (the fireplace itself) as lit, which is a
-//      different category from inventing a feature that doesn't exist.
-//      Real-render-tested specifically for the failure mode this could
-//      cause — 3 no-fireplace renders confirmed LTX did NOT invent a
-//      fireplace where none existed.
+// preset below.
+//
+// REPLACED (this session, real render evidence + Sam's compliance
+// clarification). The prior version (below, kept in git history) used
+// "exactly as photographed" + explicit visible/not-visible branching
+// logic. Real testing this session showed that wording — and the
+// "everything stays fixed" framing camera-motion presets pair it with —
+// reliably freezes the flame, even in single-image mode with no crop
+// involved. What actually works, confirmed via living_room_ambient and
+// fireplace_flicker: framing the flame as "ambient motion" rather than
+// carving out an exception to "stay fixed" language.
+//
+// This version also drops the old visible/not-visible injection
+// precondition entirely — simplified per Sam's clarification of the real
+// compliance picture: AB 723 governs PHOTO staging disclosure, not video;
+// the finished video is presented on the compliance page alongside a
+// before/after comparison; and the underlying still image is already
+// labeled "Digitally Staged." Flame injection on an existing fireplace
+// doesn't need its own separate precondition logic to be safe under that
+// setup — unlike the old FLAME_CLAUSE, which was written when video had
+// no compliance treatment of its own yet.
+//
+// KNOWN LIMITATION (confirmed real testing, this session): this ambient
+// framing has only been confirmed working in SINGLE-IMAGE mode.
+// Two-image mode (orbit_arc, micro_zoom_out, micro_dolly_back,
+// pan_zoom_reveal) has been repeatedly confirmed to freeze flame/ambient
+// motion regardless of prompt wording — likely a structural limit of
+// LTX's two-image conditioning, not something this clause can fix. Don't
+// expect flame animation on any two-image preset even with this wording.
 const FLAME_CLAUSE =
-  // REVISED (July 21, 2026, real render): Rack Focus hallucinated a
-  // fireplace into a living room that had none. Sam re-ran the identical
-  // prompt in fal.ai's own playground and got no hallucination — i.e. not
-  // deterministic, but the wording had a real ambiguity that made it
-  // possible: "If no flame is visible, include a small... flame inside the
-  // existing fireplace opening" never actually required a fireplace to be
-  // present as a precondition for injection — a model that hadn't firmly
-  // ruled out "cozy fireplace" as part of the room's mood had room to
-  // invent the whole opening, not just relight an existing one. New
-  // wording makes presence an explicit, separate precondition ("If a
-  // fireplace or fire pit IS PRESENT and no flame is visible...") instead
-  // of only gating on flame visibility.
-  " If a fireplace or fire pit flame is visible, it should appear with subtle, natural flicker exactly as photographed. If a fireplace or fire pit is present and no flame is visible, include a small, photorealistic flame inside the existing fireplace opening, shown with subtle, natural flicker, without altering any surrounding architecture.";
+  " Ambient motion naturally includes a subtle, softly flickering flame in any visible fireplace or fire pit. No new objects, reflections, lighting changes, or architectural modifications appear.";
+
 
 const LTX_MOTION_TEMPLATES = {
   cinematic_push: {
@@ -197,7 +196,7 @@ const LTX_MOTION_TEMPLATES = {
     // can't be allowed to reopen the kind of roll problem corner_to_corner_
     // drift hit separately in the same test round.
     prompt:
-      "Perform a slow, buoyant floating drift with a gentle, noticeable sway that moves the viewer through the space without introducing any camera roll or tilt. Maintain perfectly level horizons, stable verticals, and natural parallax only from existing geometry. No new textures, reflections, or objects appear.\nIf a fireplace or fire pit flame is visible, it should appear with subtle, natural flicker exactly as photographed. If a fireplace or fire pit is present and no flame is visible, include a small, photorealistic flame inside the existing fireplace opening, shown with subtle, natural flicker, without altering any surrounding architecture.",
+      "Perform a slow, buoyant floating drift with a gentle, noticeable sway that moves the viewer through the space without introducing any camera roll or tilt. Maintain perfectly level horizons, stable verticals, and natural parallax only from existing geometry. No new textures, reflections, or objects appear.\nAmbient motion naturally includes a subtle, softly flickering flame in any visible fireplace or fire pit. No new objects, reflections, lighting changes, or architectural modifications appear.",
     confidence: "medium-high",
     safeWhen: "Rooms with soft lighting and visible depth.",
     gate: { type: "advisory", note: "Avoid highly reflective rooms (mirrors, glossy tile) — not automatically detected, use judgment when picking the source photo." },
@@ -220,17 +219,23 @@ const LTX_MOTION_TEMPLATES = {
     // tilt and demands level horizons/stable verticals instead of
     // describing a corner-to-corner destination at all.
     prompt:
-      "Perform an ultra-slow lateral drift that gently shifts the viewer's perspective across the room without introducing any diagonal roll or camera tilt. Maintain perfectly level horizons, stable verticals, and natural parallax only from existing geometry. No new space, openings, or architectural features appear.\nIf a fireplace or fire pit flame is visible, it should appear with subtle, natural flicker exactly as photographed. If a fireplace or fire pit is present and no flame is visible, include a small, photorealistic flame inside the existing fireplace opening, shown with subtle, natural flicker, without altering any surrounding architecture.",
+      "Perform an ultra-slow lateral drift that gently shifts the viewer's perspective across the room without introducing any diagonal roll or camera tilt. Maintain perfectly level horizons, stable verticals, and natural parallax only from existing geometry. No new space, openings, or architectural features appear.\nAmbient motion naturally includes a subtle, softly flickering flame in any visible fireplace or fire pit. No new objects, reflections, lighting changes, or architectural modifications appear.",
     confidence: "high",
     safeWhen: "Rooms with visible corners and depth.",
     gate: { type: "advisory", note: "Avoid rooms with obstructed corners." },
   },
   living_room_ambient: {
+    // REVISED (this session, Sam's call) — dropped curtain sway and plant
+    // movement entirely; scope narrowed to fireplace flicker and ceiling
+    // fan rotation only, matching the "ambient" framing confirmed working
+    // on fireplace_flicker/the pan_zoom_reveal fix below (see that
+    // preset's comment for the fuller "ambient" vs. "hold everything
+    // fixed" discussion).
     prompt:
-      "The camera holds a stable frame while subtle ambient motion animates only elements already visible — gentle curtain sway, soft plant movement, or natural fireplace flicker. No new motion sources, objects, lighting changes, or reflections appear; architecture and furniture remain unchanged.",
+      "The camera holds a stable frame while subtle ambient motion animates only elements already visible — natural fireplace flicker or ceiling fan rotation. No new motion sources, objects, lighting changes, or reflections appear; architecture and furniture remain unchanged.",
     confidence: "high",
-    safeWhen: "Rooms with visible ambient elements (curtains, plants, or a fireplace).",
-    gate: { type: "advisory", note: "Motion may read as too subtle in rooms with no ambient elements at all." },
+    safeWhen: "Rooms with a visible fireplace or ceiling fan.",
+    gate: { type: "advisory", note: "Motion may read as too subtle in rooms with no fireplace or ceiling fan at all." },
   },
   fireplace_flicker: {
     prompt:
@@ -335,13 +340,28 @@ const LTX_MOTION_TEMPLATES = {
     gate: null,
   },
   pan_zoom_reveal: {
+    // REVISED (this session, real render test) — original FLAME_CLAUSE
+    // version was initially confirmed fine, but a later real test at a
+    // full 6s single-image duration showed LTX hallucinating. Sam's
+    // fix: replace FLAME_CLAUSE with explicit "ambient motion" framing
+    // (mirroring what fixed fireplace_flicker/living_room_ambient) rather
+    // than the standard "everything stays fixed" + flame-carveout
+    // language — and move this preset onto the two-image crop workflow,
+    // same fix already applied to micro_zoom_out/micro_dolly_back for
+    // camera-direction accuracy. Sam's exact wording, verbatim.
+    //
+    // NOTE: two-image mode has repeatedly frozen ambient motion on other
+    // presets (see FLAME_CLAUSE's header comment) — this prompt's fireplace/
+    // fan language may not actually render as flicker/rotation here.
+    // Kept intentionally anyway (Sam's call): costs nothing to leave in,
+    // and improves the clip on the rare case it does come through.
     prompt:
-      "Perform an ultra-slow lateral pan paired with a micro zoom-out. Maintain all architectural lines exactly as photographed. No widened field of view, no new geometry, and no inferred depth." + FLAME_CLAUSE,
+      "Perform an ultra-slow lateral pan paired with a micro zoom-out. Maintain all architectural lines exactly as photographed. No widened field of view, no new geometry, and no inferred depth. subtle ambient motion animates only elements already visible —natural fireplace flicker or ceiling fan rotation. No new motion sources, objects, lighting changes, or reflections appear; architecture and furniture remain unchanged.",
     confidence: "medium-high",
     safeWhen: "Any room with reasonable width to pan across.",
     gate: null,
-    // CONFIRMED (real render, this session) — single-image, no crop,
-    // renders correctly as intended. No change needed.
+    requiresTwoImage: true,
+    cropTransformation: "94% center crop (see imagePrep.js's prepareImageForMotionAPI cropPercent)",
   },
 
   // Batch 3 REVISED (July 18, 2026) — Sam's own real disconnect catch:
@@ -360,16 +380,17 @@ const LTX_MOTION_TEMPLATES = {
   // the earlier, much longer hallway-guardrail phrasing (Batch 3 REVISED,
   // July 18) with the v3 pack's tighter wording, plus the flame clause.
   //
-  // open_plan_reveal REMOVED (this session) — real testing found it
-  // functionally identical to micro_zoom_out once both use the two-image
-  // crop workflow (LTX has no depth data from a flat photo to distinguish
-  // "redistribute focus across zones" from "frame gets wider" — both
-  // rendered as the same uniform reveal), plus the same frozen/
-  // near-undetectable flame issue as micro_dolly_back's two-image mode.
-  // No unique value over micro_zoom_out to justify keeping both. If
-  // reintroduced later, restore this block (git history has the last
-  // version) and re-add to OPEN_PLAN_SAFE_LTX_PRESETS and the
-  // two-image-workflow comment above.
+  // open_plan_reveal DELETED (this session, final call, Sam's explicit
+  // confirmation) — visually near-identical to micro_zoom_out once both
+  // use the two-image crop workflow, plus the same frozen/undetectable
+  // flame issue as micro_dolly_back's two-image mode. This standalone
+  // preset (and its use as one End Motion CHOICE inside Room Reveal) is
+  // removed — the Room Reveal feature itself (Classic/Luxury/Cinematic
+  // Reveal, the opener/wipe/continuation architecture, the other
+  // ~20 remaining End Motion options) is completely untouched and stays
+  // exactly as-is. If reintroduced later, restore this block (git
+  // history) and re-add to OPEN_PLAN_SAFE_LTX_PRESETS + both two-image
+  // header comments above.
   micro_zoom_out: {
     prompt:
       "Perform a gentle micro zoom-out that breathes outward while staying strictly inside the photographed boundaries. No new ceiling, flooring, corners, cabinetry, or hallway entrances appear." + FLAME_CLAUSE,
@@ -401,7 +422,7 @@ const LTX_MOTION_TEMPLATES = {
     safeWhen: "Open-plan spaces, especially those with a hallway or corridor nearby that must not be exposed.",
     gate: null,
     openPlanOnly: true,
-    // NEW (July 20, 2026, LTX_Prompt_revision doc) — one of the 2 presets
+    // NEW (July 20, 2026, LTX_Prompt_revision doc) — one of the presets
     // requiring the two-image crop workflow (see buildCroppedStartUrl).
     // KNOWN ISSUE (confirmed real render, this session): flame renders
     // nearly frozen/undetectable in two-image mode on this preset — see
@@ -427,9 +448,6 @@ const VALID_LTX_PRESETS = new Set(Object.keys(LTX_MOTION_TEMPLATES));
 // around; treating "cleared for single-room" as "cleared for open-plan"
 // would be exactly the kind of unearned generalization this whole
 // pack has been careful to avoid everywhere else.
-//
-// open_plan_reveal REMOVED (this session) — see removal note on the
-// deleted preset block above.
 const OPEN_PLAN_SAFE_LTX_PRESETS = new Set([
   "cinematic_push",
   "luxury_drift",
@@ -652,7 +670,8 @@ async function generateLtxContinuationClip(frame, presetKey, workDir, jobId) {
   };
 
   // Two-image workflow (July 20, 2026, LTX_Prompt_revision doc) — only
-  // orbit_arc, micro_zoom_out, and micro_dolly_back set requiresTwoImage.
+  // orbit_arc, micro_zoom_out, micro_dolly_back, and pan_zoom_reveal set
+  // requiresTwoImage.
   // end_image_url = the ORIGINAL, uncropped staged image — wider by
   // comparison to the cropped start frame above, giving LTX real content
   // to reference for whatever the move would otherwise reveal beyond the
