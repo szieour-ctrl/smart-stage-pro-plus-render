@@ -70,4 +70,19 @@ async function uploadAudioToS3(localPath, projectId, label) {
   return uploadFileToS3(localPath, key, "audio/mpeg");
 }
 
-module.exports = { uploadToS3, uploadAudioToS3 };
+// NEW (this session — /test-motion diagnostic route): simple public
+// upload for one-off test/scratch files. NOT for real finished videos —
+// those must stay private behind the gated key/presign flow above (see
+// this file's header comment for why). This instead targets the
+// already-public smart-stage-scratch/ prefix (same one used for
+// temporary per-render crop/resize files, with its own 1-2 day S3
+// lifecycle expiry already confirmed set up), and hands back a real,
+// directly-clickable URL — no credit-check gate needed for a throwaway
+// test clip nobody is being billed for.
+async function uploadScratchFile(localPath, filename, contentType) {
+  const key = `smart-stage-scratch/${filename}`;
+  await uploadFileToS3(localPath, key, contentType);
+  return `https://${S3_BUCKET}.s3.${process.env.S3_REGION}.amazonaws.com/${key}`;
+}
+
+module.exports = { uploadToS3, uploadAudioToS3, uploadScratchFile };
