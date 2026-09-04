@@ -10,6 +10,11 @@
 // at request time at all; this file just downloads a pre-made file and
 // loops/trims it to fit.
 //
+// CHANGE (Sep 2026): added 10 more tracks (15 total). New tracks use
+// their own generated titles as labels/keys rather than the original
+// style/mood naming pattern (japandi_calm, luxury_cinematic, etc.) —
+// both patterns coexist fine since the picker just needs a valid key.
+//
 // To add a new track:
 //   1. Generate it in Suno, download the mp3.
 //   2. Upload to S3 under smart-stage-music/ (bucket above), simple
@@ -29,11 +34,24 @@ const ffmpeg = require("fluent-ffmpeg");
 const S3_MUSIC_BASE = "https://smart-stage-pro-media-938733852197-us-east-2-an.s3.us-east-2.amazonaws.com/smart-stage-music";
 
 const SUNO_TRACK_LIBRARY = {
+  // Original 5
   "japandi_calm":       { label: "Japandi — Calm Piano",        url: `${S3_MUSIC_BASE}/japandi-calm.mp3` },
   "luxury_cinematic":   { label: "Luxury — Cinematic Strings",  url: `${S3_MUSIC_BASE}/luxury-cinematic.mp3` },
   "modern_uplifting":   { label: "Modern — Warm & Uplifting",   url: `${S3_MUSIC_BASE}/modern-uplifting.mp3` },
   "farmhouse_acoustic": { label: "Farmhouse — Light Acoustic",  url: `${S3_MUSIC_BASE}/farmhouse-acoustic.mp3` },
   "default":            { label: "Default — Neutral Ambient",  url: `${S3_MUSIC_BASE}/default-ambient.mp3` },
+
+  // Added Sep 2026 (10 new tracks)
+  "paper_lantern_court": { label: "Paper Lantern Court", url: `${S3_MUSIC_BASE}/paper-lantern-court.mp3` },
+  "breezy":              { label: "Breezy",              url: `${S3_MUSIC_BASE}/breezy.mp3` },
+  "aperture_rising":     { label: "Aperture Rising",     url: `${S3_MUSIC_BASE}/aperture-rising.mp3` },
+  "open_house_glow":     { label: "Open House Glow",     url: `${S3_MUSIC_BASE}/open-house-glow.mp3` },
+  "open_door_plans":     { label: "Open Door Plans",     url: `${S3_MUSIC_BASE}/open-door-plans.mp3` },
+  "fresh_keyframes":     { label: "Fresh Keyframes",     url: `${S3_MUSIC_BASE}/fresh-keyframes.mp3` },
+  "twilight_terrace":    { label: "Twilight Terrace",    url: `${S3_MUSIC_BASE}/twilight-terrace.mp3` },
+  "sunshine_tour":       { label: "Sunshine Tour",       url: `${S3_MUSIC_BASE}/sunshine-tour.mp3` },
+  "sunshine":            { label: "Sunshine",            url: `${S3_MUSIC_BASE}/sunshine.mp3` },
+  "sunlit_keychain":     { label: "Sunlit Keychain",     url: `${S3_MUSIC_BASE}/sunlit-keychain.mp3` },
 };
 
 function resolveTrack(musicStyle) {
