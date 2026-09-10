@@ -93,6 +93,18 @@ function downloadBuffer(url) {
 // single-image LTX case (the one that actually failed in the real log
 // this was built from) needs exactly that: never cropped under
 // Cloudinary either, just guarded against fal.ai's 7MB ceiling.
+//
+// UPDATED (Sep 10, 2026 — klingMotion.js's two-image crop workflow for
+// orbit_arc/pan_zoom_reveal, ported from ltxMotion.js). cropTo16x9 and
+// cropPercent now COMPOSE when both are passed together — cropPercent
+// crops the ALREADY-16:9-cropped frame, not the original photo — instead
+// of being mutually exclusive (previously an if/else-if: passing both
+// would have silently applied only cropTo16x9 and dropped cropPercent
+// with no error, no log, nothing — exactly the class of silent bug this
+// file's own header calls out about the old Cloudinary transforms it
+// replaced). No existing caller passes both at once today, so this is
+// purely additive — cropTo16x9-only and cropPercent-only behavior are
+// both byte-for-byte unchanged.
 async function prepareImageForMotionAPI(sourceUrl, { cropTo16x9 = false, cropPercent = null, jobId = "unknown" } = {}) {
   const bucket = process.env.S3_BUCKET_NAME;
   const region = process.env.S3_REGION;
@@ -100,30 +112,50 @@ async function prepareImageForMotionAPI(sourceUrl, { cropTo16x9 = false, cropPer
 
   const original = await downloadBuffer(sourceUrl);
   let pipeline = sharp(original);
+  const meta = await sharp(original).metadata();
+
+  // Tracks the CURRENT working dimensions through the pipeline, not the
+  // original photo's — cropPercent, when it runs after cropTo16x9, needs
+  // to crop relative to the frame cropTo16x9 just produced, or the two
+  // extract() calls below would be computed off the wrong base and either
+  // crop too little/much or attempt a region larger than what's actually
+  // left after the first crop.
+  let currentWidth = meta.width;
+  let currentHeight = meta.height;
 
   if (cropTo16x9) {
-    const meta = await sharp(original).metadata();
     const targetRatio = 16 / 9;
-    const currentRatio = meta.width / meta.height;
+    const currentRatio = currentWidth / currentHeight;
     if (currentRatio > targetRatio) {
       // wider than 16:9 — crop left/right
-      const newWidth = Math.round(meta.height * targetRatio);
-      const left = Math.round((meta.width - newWidth) / 2);
-      pipeline = pipeline.extract({ left, top: 0, width: newWidth, height: meta.height });
+      const newWidth = Math.round(currentHeight * targetRatio);
+      const left = Math.round((currentWidth - newWidth) / 2);
+      pipeline = pipeline.extract({ left, top: 0, width: newWidth, height: currentHeight });
+      currentWidth = newWidth;
     } else if (currentRatio < targetRatio) {
       // taller than 16:9 — crop top/bottom
-      const newHeight = Math.round(meta.width / targetRatio);
-      const top = Math.round((meta.height - newHeight) / 2);
-      pipeline = pipeline.extract({ left: 0, top, width: meta.width, height: newHeight });
+      const newHeight = Math.round(currentWidth / targetRatio);
+      const top = Math.round((currentHeight - newHeight) / 2);
+      pipeline = pipeline.extract({ left: 0, top, width: currentWidth, height: newHeight });
+      currentHeight = newHeight;
     }
     // else already 16:9 — no crop needed
-  } else if (cropPercent) {
-    const meta = await sharp(original).metadata();
-    const newWidth = Math.round(meta.width * cropPercent);
-    const newHeight = Math.round(meta.height * cropPercent);
-    const left = Math.round((meta.width - newWidth) / 2);
-    const top = Math.round((meta.height - newHeight) / 2);
+  }
+
+  if (cropPercent) {
+    // Runs AFTER cropTo16x9 above when both are requested — currentWidth/
+    // currentHeight already reflect that crop, so this correctly narrows
+    // the 16:9 frame itself (chained sharp .extract() calls crop relative
+    // to the pipeline's current state, not the original image), rather
+    // than computing an independent 94% crop of the raw photo that then
+    // gets discarded by a second, unrelated 16:9 crop.
+    const newWidth = Math.round(currentWidth * cropPercent);
+    const newHeight = Math.round(currentHeight * cropPercent);
+    const left = Math.round((currentWidth - newWidth) / 2);
+    const top = Math.round((currentHeight - newHeight) / 2);
     pipeline = pipeline.extract({ left, top, width: newWidth, height: newHeight });
+    currentWidth = newWidth;
+    currentHeight = newHeight;
   }
 
   let outputBuffer = null;
@@ -144,7 +176,12 @@ async function prepareImageForMotionAPI(sourceUrl, { cropTo16x9 = false, cropPer
   }));
 
   const newUrl = `https://${bucket}.s3.${region}.amazonaws.com/${key}`;
-  console.log(`[imagePrep] [${jobId}] Prepared ${cropTo16x9 ? "cropped+" : ""}sized copy: ${newUrl} (${Math.round(outputBuffer.length / 1024)}KB)`);
+  // Log label now reflects cropPercent too, not just cropTo16x9 — with
+  // the two composing (see above), a cropPercent-only or combined call
+  // was previously logged as plain "sized copy" with no indication any
+  // cropping happened at all.
+  const cropLabel = (cropTo16x9 || cropPercent) ? "cropped+" : "";
+  console.log(`[imagePrep] [${jobId}] Prepared ${cropLabel}sized copy: ${newUrl} (${Math.round(outputBuffer.length / 1024)}KB)`);
   return newUrl;
 }
 
