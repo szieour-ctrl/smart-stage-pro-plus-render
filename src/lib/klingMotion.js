@@ -104,40 +104,56 @@ function ensureConfigured() {
 //     invent furniture/layout wholesale rather than animate or extend an
 //     already-disclosed scene. Use a real vacant+staged pair, or Ken Burns.
 
-// SUPERSEDED then EMPTIED (July 18, 2026, same day, two steps):
-// orbit_arc/rack_focus/drone_boom_up/crane_up/crane_down/parallax_push/
-// pan_zoom_reveal were removed from this allowlist first (each got a
-// tested LTX-safe rewrite — see ltxMotion.js's batch 2). Then, later the
-// same day, Sam's explicit scope call went further: "LTX should be used
-// Exclusively on all Medium to High confidence AI Motions. Kling is now
-// only to be used on the limited movements that we discussed" (the 7
-// genuine two-image transformations: Hero Transformation, Exterior
-// Landscape Transformation, and the 5 day/twilight timelapse variants).
-// The remaining preset names (fireplace_flicker, cinematic_push,
-// luxury_drift, floating_camera_drift, architectural_glide, room_reveal,
-// living_room_ambient, corner_to_corner_drift) came out too — every
-// single-image camera-motion preset now has an LTX equivalent (19 total
-// across all 3 batches in ltxMotion.js's LTX_MOTION_TEMPLATES). All 15
-// KLING_MOTION_TEMPLATES entries above are left in place as historical
-// reference, not deleted — simply unreachable via this now-empty
-// allowlist. This Set stays declared rather than removed outright so
-// enforceScopeRules' isAllowedSingleImageInteriorPreset check below
-// still works correctly as "always false" — Kling's remaining 7 presets
-// all qualify via hasKnownPair (Hero Transformation, Exterior Landscape
-// Transformation) or isExterior (the day/twilight family) instead,
-// neither of which this Set gates, so emptying it doesn't affect
-// anything Kling still needs to do. Also corrects the July 17, 2026
-// decision doc, which had listed Orbit Arc as staying Kling-reserved —
-// long since superseded.
-const SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS = new Set([]);
+// RESTORED (Sep 9, 2026 — see Notion decision doc "DECISION — Full Kling
+// Migration for AI Motion + Pool Cut to 2/Video"). These were emptied on
+// July 18, 2026 when every single-image camera-motion preset moved to
+// LTX Fast. LTX's per-preset reliability could not be brought to a
+// production-safe level this session — real-render testing found and
+// fixed several distinct, genuine bugs (a fireplace-injection side
+// effect in FLAME_CLAUSE, orbit-triggering "toward the center" language,
+// a literal "micro" magnitude word, missing duration-pacing causing
+// static/hallucinated tails), and two presets held up under everything
+// thrown at them (cinematic_push, micro_dolly_back) — but a clean,
+// unambiguous prompt with no scene-content language ("Perform an
+// ultra-slow lateral drift...") still reproduced a wrong-motion failure
+// with no findable cause, and widening the two-image crop percentage to
+// give the model more "motion runway" traded a static tail for a new
+// hallucination instead of fixing anything. Read as evidence of a real
+// instruction-following ceiling on this endpoint, not another findable
+// prompt bug — see the Notion decision doc for the full real-render
+// evidence trail. This Set now matches video-job.js's copy of the same
+// list, which (per that file's own comments) was never actually emptied
+// in the first place — the two files have been silently out of sync
+// since July 18; this restores the parity that should have existed the
+// whole time.
+const SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS = new Set([
+  "orbit_arc",
+  "rack_focus",
+  "fireplace_flicker",
+  "cinematic_push",
+  "luxury_drift",
+  "floating_camera_drift",
+  "parallax_push",
+  "architectural_glide",
+  "crane_up",
+  "crane_down",
+  "room_reveal",
+  "living_room_ambient",
+  "corner_to_corner_drift",
+  "pan_zoom_reveal",
+]);
 
-// EMPTIED (July 18, 2026) — same reasoning as above. Kling's own
-// room_reveal preset (a camera-motion-only pull-back, not a
-// transformation) is no longer offered at all — LTX's 3-preset
-// hallway-safe replacement (micro_zoom_out, micro_dolly_back,
-// open_plan_reveal — see ltxMotion.js) covers this use case now. Left
-// declared and empty rather than removed, matching the pattern above.
-const OPEN_PLAN_ONLY_PRESETS = new Set([]);
+// RESTORED (Sep 9, 2026) — same reasoning as above. room_reveal's known
+// doorway-hallucination failure mode on small rooms (see its
+// KLING_MOTION_TEMPLATES comment below) is exactly what this gate exists
+// to prevent. Also now doing double duty as the Kling-side landing spot
+// for LTX's retired micro_zoom_out/micro_dolly_back presets — neither had
+// a Kling equivalent (Kling never needed a two-image crop workaround for
+// hallway safety the way LTX did), so the frontend maps both to
+// room_reveal, which already carries the strongest anti-hallucination
+// language of any preset in this file. See build-video-demo.html's
+// LTX_TO_KLING_PRESET mapping.
+const OPEN_PLAN_ONLY_PRESETS = new Set(["room_reveal"]);
 
 function enforceScopeRules(frame) {
   const hasKnownPair = !!frame.endImageUrl;
@@ -160,8 +176,14 @@ function enforceScopeRules(frame) {
     return;
   }
 
+  // FIX (Sep 9, 2026) — this message previously hardcoded a 10-preset
+  // list that had already gone stale (living_room_ambient,
+  // corner_to_corner_drift, pan_zoom_reveal, and room_reveal were added
+  // to the allowlist later but never added here). Generated directly
+  // from the Set itself now, so it can't drift out of sync with the real
+  // allowlist again the way this exact message just did.
   throw new Error(
-    `Kling AI motion rejected: no end image provided for room type "${frame.roomType}", and preset "${frame.klingMotionPreset || "(none — generic default)"}" is not in the single-image interior allowlist (orbit_arc, rack_focus, fireplace_flicker, cinematic_push, luxury_drift, floating_camera_drift, parallax_push, architectural_glide, crane_up, crane_down). The generic interior default requires Kling to invent furniture/layout wholesale rather than interpolate between two known images or animate an already-disclosed scene — this is disabled by design. Use a vacant+staged pair, select one of the allowed single-image presets, or use Ken Burns for single-image interior shots outside that list. See AB 723 scope restriction in klingMotion.js.`
+    `Kling AI motion rejected: no end image provided for room type "${frame.roomType}", and preset "${frame.klingMotionPreset || "(none — generic default)"}" is not in the single-image interior allowlist (${[...SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS].join(", ")}). The generic interior default requires Kling to invent furniture/layout wholesale rather than interpolate between two known images or animate an already-disclosed scene — this is disabled by design. Use a vacant+staged pair, select one of the allowed single-image presets, or use Ken Burns for single-image interior shots outside that list. See AB 723 scope restriction in klingMotion.js.`
   );
 }
 
@@ -296,15 +318,21 @@ const KLING_MOTION_TEMPLATES = {
   // in a tight room than in an open-concept one where a wider view is
   // often already implied by adjacent visible space. WARNING — best
   // suited to open-concept / great-room spaces where widening the frame
-  // doesn't require inventing new architecture. Strongly discourage (or,
-  // once an isOpenPlan-type field exists on the frame schema, hard-gate)
-  // use on small/enclosed rooms until further tested.
+  // doesn't require inventing new architecture. Now hard-gated via
+  // OPEN_PLAN_ONLY_PRESETS above (frame.isOpenPlan didn't exist as a field
+  // yet when this was first written; it does now).
   //
   // Prompt strengthened same day with explicit anti-hallucination
   // constraints — the O3 endpoint has no negative_prompt parameter (only
   // legacy Kling v1/v1.6/v2/v2.1/v3-pro/v3-standard support it), so this
   // is the only lever available; the constraint has to live in the main
   // prompt text itself.
+  //
+  // RE-PURPOSED (Sep 9, 2026): this is now also the Kling-side landing
+  // spot for LTX's retired micro_zoom_out and micro_dolly_back presets —
+  // see build-video-demo.html's LTX_TO_KLING_PRESET mapping. Its existing
+  // anti-hallucination language was already the strongest in this file,
+  // which is exactly what that use case needs.
   room_reveal:
     "Slow cinematic reveal movement, camera gently pulling back and widening to bring more of the ALREADY-VISIBLE room into frame, staying fully within the room's existing walls and boundaries as shown in the source photo, photorealistic, no distortion, stable architecture, all furniture and fixtures remain fixed and unchanged. This preset is intended ONLY for large, open-concept spaces where a wide pull-back reveals more of a great room, kitchen, or living area that genuinely extends beyond the current frame — it is NOT intended for small, enclosed, single-purpose rooms (bedroom, bathroom, small dining room, small office) where there is no additional real space to reveal. Strictly forbidden, under all circumstances: do not create, invent, generate, open, or reveal any doorway, archway, opening, hallway, window, wall gap, or adjoining room that is not already fully and unambiguously visible in the source photo. Do not remove, extend, thin, or alter any wall in any way. Do not add floor area, ceiling area, or any architectural element beyond the room's existing, already-photographed boundaries. If the room is small, fully enclosed, or has no visible opening to another space, the camera must stop pulling back at the point where the existing walls fill the frame — it is far better to produce a smaller, more conservative pull-back than to invent any new space, opening, or architectural feature. When in doubt about whether additional revealed area is genuinely present in the source photo, do not reveal it.",
 
@@ -527,12 +555,17 @@ async function generateKlingClip(frame, workDir) {
 
   const prompt = buildPrompt(frame);
 
-  // Kling's API only accepts whole-second duration values (3-15), not
-  // decimals. Our room-type defaults (e.g. 5.5s for "living") are tuned
-  // for FFmpeg/Ken Burns and need to be rounded for Kling specifically —
-  // this caused a 422 "Unprocessable Entity" the first time we tested.
+  // FIX (Sep 9, 2026 — Sam's real-world correction): this comment and
+  // clamp previously claimed Kling's API accepts 3-15s. Real minimum is
+  // 5s, not 3 — clamping to 3 or 4 here would have sent a value Kling
+  // either rejects or silently re-clamps itself, the same category of
+  // silent-mismatch bug the July 2026 fractional-duration 422 was. Our
+  // room-type defaults are a flat 6.0s (motionPresets.js
+  // DEFAULT_DURATIONS), safely above this floor, so this mostly won't
+  // bite in practice — but the clamp itself needs to be correct
+  // regardless of what currently happens to avoid it.
   const rawDuration = frame.durationSeconds || 5;
-  const roundedDuration = Math.min(15, Math.max(3, Math.round(rawDuration)));
+  const roundedDuration = Math.min(15, Math.max(5, Math.round(rawDuration)));
   const duration = String(roundedDuration);
 
   console.log(`  [Kling] Submitting job — room: ${frame.roomType}, duration: ${duration}s (requested ${rawDuration}s)`);
