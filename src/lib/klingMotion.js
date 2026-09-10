@@ -137,23 +137,92 @@ const SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS = new Set([
   "architectural_glide",
   "crane_up",
   "crane_down",
-  "room_reveal",
+  "pull_back_wide",
   "living_room_ambient",
   "corner_to_corner_drift",
   "pan_zoom_reveal",
 ]);
 
-// RESTORED (Sep 9, 2026) — same reasoning as above. room_reveal's known
-// doorway-hallucination failure mode on small rooms (see its
+// RENAMED (Sep 10, 2026) — this preset was called "room_reveal", the same
+// name as the entirely separate opener+wipe+continuation feature
+// (assemble.js's REVEAL_PRESETS / useRevealEffect / "Room Reveal" UI
+// button — see that architecture's own naming, unchanged by this rename).
+// Two unrelated things sharing one name was a real, ongoing source of
+// confusion (this preset isn't even reachable from that other feature —
+// it's explicitly excluded from every REVEAL_PRESETS.allowedEndMotions
+// list). Renamed to pull_back_wide, which describes the actual camera
+// move and can't collide with anything else in this codebase.
+//
+// RESTORED (Sep 9, 2026) — same reasoning as above. pull_back_wide's
+// known doorway-hallucination failure mode on small rooms (see its
 // KLING_MOTION_TEMPLATES comment below) is exactly what this gate exists
-// to prevent. Also now doing double duty as the Kling-side landing spot
-// for LTX's retired micro_zoom_out/micro_dolly_back presets — neither had
-// a Kling equivalent (Kling never needed a two-image crop workaround for
-// hallway safety the way LTX did), so the frontend maps both to
-// room_reveal, which already carries the strongest anti-hallucination
-// language of any preset in this file. See build-video-demo.html's
-// LTX_TO_KLING_PRESET mapping.
-const OPEN_PLAN_ONLY_PRESETS = new Set(["room_reveal"]);
+// to prevent. Also doing double duty as the Kling-side landing spot for
+// LTX's retired micro_zoom_out/micro_dolly_back presets — neither had a
+// Kling equivalent to carry the two-image crop fix below (see
+// REQUIRES_TWO_IMAGE_CROP's comment — Kling DOES now use the same
+// workaround LTX did, just not for these two specifically), so the
+// frontend maps both to pull_back_wide instead, which already carries the
+// strongest anti-hallucination language of any preset in this file. See
+// build-video-demo.html's LTX_TO_KLING_PRESET mapping.
+const OPEN_PLAN_ONLY_PRESETS = new Set(["pull_back_wide"]);
+
+
+// ── TWO-IMAGE CROP WORKFLOW (Sep 10, 2026 — ported from ltxMotion.js's
+// identical mechanism, per Sam's real LTX_Prompt_revision doc and
+// confirmed fal.ai playground testing) ─────────────────────────────────
+// A camera move that widens the effective field of view (an arc rotation,
+// a lateral pan combined with a zoom-out, a pull-back-and-widen) has
+// nothing to reference for what's outside the original single photo's
+// frame — the model either invents new geometry or defaults to the wrong
+// direction entirely (LTX's real confirmed failure mode on orbit_arc/
+// pan_zoom_reveal before this fix: a push-in instead of the requested
+// widen/arc; Kling's real confirmed failure mode on pull_back_wide,
+// separately, before ITS fix: an invented doorway in a small room — same
+// underlying "nothing to reference outside the frame" problem, different
+// vendor, different specific failure). Mechanism: crop the SAME source
+// photo down to 94% width/height, centered, and use that as the tight
+// Start Frame (image_url); the untouched original photo — wider by
+// comparison — becomes the End Frame (end_image_url). Both frames are
+// guaranteed identical in lighting/color/style because they're literally
+// the same photograph, satisfying Kling's own known-pair interpolation
+// path with no separate generation step. Only applies when there's no
+// REAL known pair already on the frame (a genuine vacant/staged
+// endImageUrl) — that case already has two real, disclosed endpoints and
+// doesn't need a synthetic one.
+//
+// ltxMotion.js's own requiresTwoImage list has FOUR presets: orbit_arc,
+// pan_zoom_reveal, micro_zoom_out, micro_dolly_back. Two of those three
+// Kling carries (orbit_arc, pan_zoom_reveal) are represented here
+// directly — micro_zoom_out/micro_dolly_back are LTX-only presets with no
+// Kling equivalent to attach this flag to (see OPEN_PLAN_ONLY_PRESETS'
+// comment above for where those two actually land on the Kling side).
+//
+// pull_back_wide ADDED (Sep 10, 2026, Sam's explicit call) — was never on
+// ltxMotion.js's list at all (LTX excluded this preset from its own
+// library entirely, so it never went through LTX's two-image discovery
+// process either way), but carries its OWN real, Kling-native
+// hallucination incident (the invented-doorway failure documented on its
+// KLING_MOTION_TEMPLATES entry above) that predates and is independent of
+// the LTX-driven presets on this list. Previously shipped on prompt text
+// + OPEN_PLAN_ONLY_PRESETS gating alone; this adds the same structural
+// safeguard the other two widen/arc presets already have, on top of —
+// not instead of — that existing prompt+gating.
+//
+// VERIFIED (Sep 10, 2026, against the real imagePrep.js): this composes
+// prepareImageForMotionAPI's cropTo16x9 option (needed on every Kling
+// call — Kling infers aspect ratio from the input image, unlike LTX,
+// which takes an explicit aspect_ratio API param instead) with its
+// cropPercent option, mirroring how ltxMotion.js calls
+// prepareImageForMotionAPI({ cropPercent: 0.94, jobId }) standalone (LTX
+// never needed cropTo16x9 at all). imagePrep.js originally had these as
+// mutually exclusive (if/else-if) — passing both together would have
+// silently applied only the 16:9 crop and dropped the 94% crop with no
+// error. Fixed directly in imagePrep.js (Sep 10, 2026) so the two compose
+// correctly: cropPercent now narrows the ALREADY-16:9-cropped frame, not
+// an independent crop of the original photo. See that file's matching
+// comment for the full fix.
+const REQUIRES_TWO_IMAGE_CROP = new Set(["orbit_arc", "pan_zoom_reveal", "pull_back_wide"]);
+const TWO_IMAGE_CROP_PERCENT = 0.94;
 
 function enforceScopeRules(frame) {
   const hasKnownPair = !!frame.endImageUrl;
@@ -178,7 +247,7 @@ function enforceScopeRules(frame) {
 
   // FIX (Sep 9, 2026) — this message previously hardcoded a 10-preset
   // list that had already gone stale (living_room_ambient,
-  // corner_to_corner_drift, pan_zoom_reveal, and room_reveal were added
+  // corner_to_corner_drift, pan_zoom_reveal, and pull_back_wide were added
   // to the allowlist later but never added here). Generated directly
   // from the Set itself now, so it can't drift out of sync with the real
   // allowlist again the way this exact message just did.
@@ -302,23 +371,28 @@ const KLING_MOTION_TEMPLATES = {
   crane_down:
     "Smooth cinematic crane camera movement, descending vertically while tilting slightly downward to bring the lower portion of the room already visible in the photo into clearer view — flooring, tilework, or a rug — photorealistic, no distortion, stable architecture, all visible fixtures, furniture, and architecture remain fixed and unchanged throughout the movement, do not reveal room area beyond what is visible in the source photo",
 
-  // ── room_reveal — Cleared (July 9, 2026) via Sam's fal.ai Playground
+  // ── pull_back_wide — Cleared (July 9, 2026) via Sam's fal.ai Playground
   // testing and now included in SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS
-  // below. This preset's own name implies widening what's visible beyond
-  // the original photo's framing, not just moving the camera through/
-  // around content already shown — a materially different claim than
-  // orbit_arc's "stays centered on one feature" — which is why it needed
-  // explicit verification before enabling for single-image interior use.
+  // below. RENAMED (Sep 10, 2026) from "room_reveal" — that name collided
+  // with the entirely separate opener+wipe+continuation feature
+  // (assemble.js's REVEAL_PRESETS / "Room Reveal" UI button), which this
+  // preset isn't even reachable from (excluded from every
+  // REVEAL_PRESETS.allowedEndMotions list). This preset's own motion
+  // implies widening what's visible beyond the original photo's framing,
+  // not just moving the camera through/around content already shown — a
+  // materially different claim than orbit_arc's "stays centered on one
+  // feature" — which is why it needed explicit verification before
+  // enabling for single-image interior use.
   //
   // KNOWN FAILURE MODE (flagged by Sam, July 9, 2026): on a small, enclosed
   // room, Kling interpreted "pulling back" as needing more physical space
   // to pull back INTO, and invented a doorway/opening in a wall that
   // doesn't exist in the source photo — a real hallucination, not a
-  // one-off. Root cause: the reveal move is spatially harder to satisfy
-  // in a tight room than in an open-concept one where a wider view is
-  // often already implied by adjacent visible space. WARNING — best
-  // suited to open-concept / great-room spaces where widening the frame
-  // doesn't require inventing new architecture. Now hard-gated via
+  // one-off. Root cause: the move is spatially harder to satisfy in a
+  // tight room than in an open-concept one where a wider view is often
+  // already implied by adjacent visible space. WARNING — best suited to
+  // open-concept / great-room spaces where widening the frame doesn't
+  // require inventing new architecture. Now hard-gated via
   // OPEN_PLAN_ONLY_PRESETS above (frame.isOpenPlan didn't exist as a field
   // yet when this was first written; it does now).
   //
@@ -333,7 +407,16 @@ const KLING_MOTION_TEMPLATES = {
   // see build-video-demo.html's LTX_TO_KLING_PRESET mapping. Its existing
   // anti-hallucination language was already the strongest in this file,
   // which is exactly what that use case needs.
-  room_reveal:
+  //
+  // TWO-IMAGE CROP ADDED (Sep 10, 2026, Sam's explicit call, on top of —
+  // not instead of — the prompt text and open-plan gate above): added to
+  // REQUIRES_TWO_IMAGE_CROP near the top of this file, same structural
+  // safeguard as orbit_arc/pan_zoom_reveal. This preset's own hallucination
+  // history (the invented-doorway failure described above) is real and
+  // Kling-native — the prompt+gating combination was enough to get it
+  // shipped originally, but hadn't been given the same two-image
+  // protection the other widen/arc presets have.
+  pull_back_wide:
     "Slow cinematic reveal movement, camera gently pulling back and widening to bring more of the ALREADY-VISIBLE room into frame, staying fully within the room's existing walls and boundaries as shown in the source photo, photorealistic, no distortion, stable architecture, all furniture and fixtures remain fixed and unchanged. This preset is intended ONLY for large, open-concept spaces where a wide pull-back reveals more of a great room, kitchen, or living area that genuinely extends beyond the current frame — it is NOT intended for small, enclosed, single-purpose rooms (bedroom, bathroom, small dining room, small office) where there is no additional real space to reveal. Strictly forbidden, under all circumstances: do not create, invent, generate, open, or reveal any doorway, archway, opening, hallway, window, wall gap, or adjoining room that is not already fully and unambiguously visible in the source photo. Do not remove, extend, thin, or alter any wall in any way. Do not add floor area, ceiling area, or any architectural element beyond the room's existing, already-photographed boundaries. If the room is small, fully enclosed, or has no visible opening to another space, the camera must stop pulling back at the point where the existing walls fill the frame — it is far better to produce a smaller, more conservative pull-back than to invent any new space, opening, or architectural feature. When in doubt about whether additional revealed area is genuinely present in the source photo, do not reveal it.",
 
   // ── living_room_ambient and corner_to_corner_drift — Cleared (July 9,
@@ -568,6 +651,19 @@ async function generateKlingClip(frame, workDir) {
   const roundedDuration = Math.min(15, Math.max(5, Math.round(rawDuration)));
   const duration = String(roundedDuration);
 
+  // NEW (Sep 10, 2026) — two-image crop workflow, ported from
+  // ltxMotion.js. Only fires when there's no REAL known pair already
+  // (frame.endImageUrl unset) and the chosen preset is one of the two
+  // that need it — see REQUIRES_TWO_IMAGE_CROP's comment above for the
+  // full mechanism (now verified against the real imagePrep.js).
+  const needsTwoImageCrop = !frame.endImageUrl
+    && frame.klingMotionPreset
+    && REQUIRES_TWO_IMAGE_CROP.has(frame.klingMotionPreset);
+
+  if (needsTwoImageCrop) {
+    console.log(`  [Kling] "${frame.klingMotionPreset}" requires the two-image crop workflow (no real pair present) — cropping start frame to ${TWO_IMAGE_CROP_PERCENT * 100}%, using the uncropped original as the end frame.`);
+  }
+
   console.log(`  [Kling] Submitting job — room: ${frame.roomType}, duration: ${duration}s (requested ${rawDuration}s)`);
 
   const KLING_ENDPOINT = "fal-ai/kling-video/o3/standard/image-to-video";
@@ -587,10 +683,22 @@ async function generateKlingClip(frame, workDir) {
   // instead of vanishing without a trace.
   const { request_id } = await fal.queue.submit(KLING_ENDPOINT, {
     input: {
-      image_url: await prepareImageForMotionAPI(frame.imageUrl, { cropTo16x9: true }),
+      // needsTwoImageCrop: start frame is the SAME source image, cropped
+      // tighter (94%, centered) on top of the existing 16:9 crop every
+      // Kling call already needs. Otherwise unchanged.
+      image_url: needsTwoImageCrop
+        ? await prepareImageForMotionAPI(frame.imageUrl, { cropTo16x9: true, cropPercent: TWO_IMAGE_CROP_PERCENT })
+        : await prepareImageForMotionAPI(frame.imageUrl, { cropTo16x9: true }),
+      // end_image_url: a real known pair (frame.endImageUrl) always wins.
+      // Otherwise, needsTwoImageCrop supplies the SAME source image again,
+      // uncropped (just the standard 16:9 crop) — the wider "End Frame"
+      // the cropped start frame widens/arcs into. undefined (no
+      // end_image_url at all) only when neither applies.
       end_image_url: frame.endImageUrl
         ? await prepareImageForMotionAPI(frame.endImageUrl, { cropTo16x9: true })
-        : undefined,
+        : (needsTwoImageCrop
+          ? await prepareImageForMotionAPI(frame.imageUrl, { cropTo16x9: true })
+          : undefined),
       prompt,
       duration,
       generate_audio: false, // Mubert handles music separately — avoid conflicting audio tracks
@@ -689,9 +797,66 @@ async function applyKlingMotion(frame, workDir, fallbackFn) {
   return { path: clipPath, source: "kling", endingZoom };
 }
 
+// ── ROOM REVEAL CONTINUATION (Sep 10, 2026) ────────────────────────────
+// Mirrors ltxMotion.js's generateLtxRevealContinuation() — same call
+// signature, same job (renderPipeline.js's reveal branch calls whichever
+// one matches frame.revealEngine), same shape of return value. Exists
+// because Room Reveal's continuation phase is a different case from every
+// other Kling call in this file: it's a SINGLE staged image (the opener/
+// wipe already carried the vacant→staged reveal via Ken Burns, not Kling),
+// with the End Motion preset supplying pure camera movement on top of an
+// already-fully-staged, already-disclosed scene — the exact
+// SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS case enforceScopeRules() already
+// permits, just entered from the Reveal code path instead of the
+// standalone AI Motion dropdown.
+//
+// Kling has no fixed-enum duration ceiling the way LTX does (LTX snaps to
+// 6/8/10/.../20s; Kling accepts any integer 5-15s — see generateKlingClip's
+// clamp above) — but generateKlingClip only ever returns a bare file path,
+// not the duration it actually rendered at, so this re-derives the same
+// clamp independently rather than changing generateKlingClip's return
+// shape (which applyKlingMotion and every other existing caller depends on
+// staying a plain path). renderPipeline.js needs the ACTUAL rendered
+// duration (not the requested one) for the same reason ltxDuration exists
+// on the LTX side: buildRevealClip's trim math and verifyClipDuration's
+// padding check both have to reflect what really got rendered, not what
+// was asked for.
+//
+// No fallback-to-Ken-Burns try/catch here, deliberately — renderPipeline.js's
+// reveal branch already wraps this call in its own try/catch (matching the
+// LTX branch's existing pattern) and falls back to a Ken Burns push_in
+// continuation on any failure, so duplicating that logic here would just be
+// two layers doing the same job.
+async function generateKlingRevealContinuation(frame, endMotion, workDir, jobId) {
+  ensureConfigured();
+
+  const rawDuration = frame.continuationDurationSeconds || 5;
+  const klingDuration = Math.min(15, Math.max(5, Math.round(rawDuration)));
+
+  console.log(
+    `  [${jobId}] [Kling] Reveal continuation — preset: "${endMotion}", requested ${rawDuration}s, rendering at ${klingDuration}s`
+  );
+
+  const clipPath = await generateKlingClip(
+    {
+      imageUrl: frame.remoteImageUrl,
+      roomType: frame.roomType,
+      klingMotionPreset: endMotion,
+      isOpenPlan: frame.isOpenPlan,
+      durationSeconds: klingDuration,
+    },
+    workDir
+  );
+
+  console.log(`  [${jobId}] [Kling] Reveal continuation clip ready: ${clipPath}`);
+
+  return { path: clipPath, klingDuration };
+}
+
 module.exports = {
   applyKlingMotion,
   generateKlingClip,
+  generateKlingRevealContinuation,
   enforceScopeRules,
   buildPrompt,
   extractLastFrame,
@@ -699,4 +864,5 @@ module.exports = {
   KLING_MOTION_TEMPLATES,
   VALID_KLING_PRESETS,
   SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS,
+  REQUIRES_TWO_IMAGE_CROP,
 };
