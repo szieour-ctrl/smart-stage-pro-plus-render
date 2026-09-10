@@ -490,30 +490,43 @@ const REVEAL_CONTINUATION_DURATION = 6.0;
 // End Motion exclusions per preset, but did not lock an exact ffmpeg
 // transition name per preset — these three are my proposed defaults,
 // not yet confirmed. Easy to change, all in one place.
-// NOTE (July 18, 2026) — allowedEndMotions now mixes two different
-// renderers: Ken Burns presets (motionRenderer.py, unchanged names) and
-// LTX Fast presets (ltxMotion.js's LTX_MOTION_TEMPLATES). The two
-// namespaces don't collide (confirmed: no shared preset names between
-// the two lists), so renderPipeline.js can dispatch to the right
-// renderer with a single lookup: LTX_MOTION_TEMPLATES[endMotion]
-// existing means LTX, otherwise Ken Burns. LTX additions follow each
-// preset's EXISTING characterological restriction, not just "add
-// everything": luxury_drift already excludes push_in/pull_back/tilt_up/
-// tilt_down (a deliberate lateral-only identity) — its LTX additions
-// exclude cinematic_push for the identical reason (it's a push-in
-// motion). water_motion/outdoor_breeze are exterior-only (enforced at
-// runtime by ltxMotion.js's enforceLtxScopeRules, not filtered out of
-// this static list) — the frontend dropdown still needs its own
-// room-type-aware filtering as follow-up UI work, not done in this pass.
-// room_reveal is intentionally NOT included anywhere — Sam's call, "NO
-// Open Plan LTX right now."
+// NOTE (July 18, 2026; updated Sep 10, 2026 — full Kling revert):
+// allowedEndMotions mixes two different renderers: Ken Burns presets
+// (motionRenderer.py, unchanged names) and Kling presets
+// (klingMotion.js's KLING_MOTION_TEMPLATES — previously LTX Fast presets
+// from ltxMotion.js's LTX_MOTION_TEMPLATES, swapped out entirely as part
+// of the Sep 10 revert). The two namespaces don't collide (confirmed: no
+// shared preset names between the two lists), so renderPipeline.js can
+// dispatch to the right renderer with a single lookup:
+// KLING_MOTION_TEMPLATES[endMotion] existing means Kling, otherwise Ken
+// Burns. Kling additions follow each preset's EXISTING characterological
+// restriction, not just "add everything": luxury_drift already excludes
+// push_in/pull_back/tilt_up/tilt_down (a deliberate lateral-only
+// identity) — its Kling additions exclude cinematic_push for the
+// identical reason (it's a push-in motion). water_motion/outdoor_breeze
+// are exterior-only (enforced at runtime by klingMotion.js's
+// enforceScopeRules, not filtered out of this static list) — the frontend
+// dropdown still needs its own room-type-aware filtering as follow-up UI
+// work, not done in this pass. pull_back_wide (named "room_reveal" until
+// the Sep 10, 2026 rename — see klingMotion.js) is intentionally NOT
+// included anywhere — Sam's call, "NO Open Plan AI Motion right now"
+// (unchanged by the Kling revert — this was a scope decision about the
+// preset itself, not about which engine renders it).
+//
+// REMOVED (Sep 10, 2026): micro_zoom_out and micro_dolly_back, from all
+// three lists below. Both were LTX-only presets with no Kling equivalent
+// — build-video-demo.html's standalone dropdown maps both to Kling's
+// pull_back_wide as a same-visual substitute, but pull_back_wide is
+// excluded from Reveal's End Motion namespace entirely (see above) — so
+// for Reveal specifically, these two are dropped rather than substituted.
 const REVEAL_PRESETS = {
   // FINAL MODEL (July 19, 2026, Sam's explicit correction after two
   // wrong attempts — no more drift): there is no 4th preset. There are
   // exactly 3 reveal identities, same fixed Ken Burns opener + wipe each,
   // used under EITHER engine. What changes between engines is ONLY the
   // End Motion (continuation) — Ken Burns names when the clip's engine is
-  // Ken Burns, LTX names when it's AI Motion. Billing is decided by the
+  // Ken Burns, Kling names when it's AI Motion (renamed from LTX names as
+  // part of the Sep 10, 2026 full Kling revert). Billing is decided by the
   // engine alone (frame.motion), never by which specific preset or End
   // Motion was picked — see video-job.js's usesAiMotion() and
   // renderPipeline.js's reveal branch for where that's actually enforced.
@@ -521,11 +534,11 @@ const REVEAL_PRESETS = {
   // allowedEndMotions below therefore lists BOTH namespaces together —
   // this is the full set of continuations this preset identity supports
   // across either engine, not something shown all at once. The frontend
-  // filters to just the Ken-Burns-named entries or just the LTX-named
+  // filters to just the Ken-Burns-named entries or just the Kling-named
   // entries depending on which engine tab is active (build-video-demo.html);
   // renderPipeline.js dispatches on the actual chosen endMotion's
-  // namespace (LTX_MOTION_TEMPLATES[endMotion] existing means LTX), which
-  // naturally agrees with whatever the filtered UI could have sent.
+  // namespace (KLING_MOTION_TEMPLATES[endMotion] existing means Kling),
+  // which naturally agrees with whatever the filtered UI could have sent.
   classic_reveal: {
     label: "Classic Reveal",
     openerMotion: "soft_hold",
@@ -535,7 +548,6 @@ const REVEAL_PRESETS = {
       "cinematic_push", "luxury_drift", "floating_camera_drift", "architectural_glide", "corner_to_corner_drift",
       "orbit_arc", "rack_focus", "drone_boom_up", "crane_up", "crane_down", "parallax_push", "pan_zoom_reveal",
       "living_room_ambient", "fireplace_flicker", "water_motion", "outdoor_breeze",
-      "micro_zoom_out", "micro_dolly_back",
     ],
   },
   luxury_drift: {
@@ -548,12 +560,11 @@ const REVEAL_PRESETS = {
     allowedEndMotions: [
       "drift", "pan_left", "pan_right", "float", "luxury_parallax",
       // Push-in-feeling motions (Ken Burns push_in/pull_back/tilt_up/
-      // tilt_down, LTX cinematic_push/rack_focus) deliberately excluded
+      // tilt_down, Kling cinematic_push/rack_focus) deliberately excluded
       // on both namespaces — this preset's identity is purely lateral.
       "luxury_drift", "floating_camera_drift", "architectural_glide", "corner_to_corner_drift",
       "orbit_arc", "drone_boom_up", "crane_up", "crane_down", "pan_zoom_reveal",
       "living_room_ambient", "fireplace_flicker", "water_motion", "outdoor_breeze",
-      "micro_zoom_out", "micro_dolly_back",
     ],
   },
   cinematic_reveal: {
@@ -568,7 +579,6 @@ const REVEAL_PRESETS = {
       "cinematic_push", "luxury_drift", "floating_camera_drift", "architectural_glide", "corner_to_corner_drift",
       "orbit_arc", "rack_focus", "drone_boom_up", "crane_up", "crane_down", "parallax_push", "pan_zoom_reveal",
       "living_room_ambient", "fireplace_flicker", "water_motion", "outdoor_breeze",
-      "micro_zoom_out", "micro_dolly_back",
     ],
   },
 };
