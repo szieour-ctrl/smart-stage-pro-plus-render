@@ -15,8 +15,20 @@ const axios = require("axios");
 
 const { downloadFrames } = require("./lib/downloadFrames");
 const { applyMotionPreset, resolveDuration } = require("./lib/motionPresets");
-const { applyKlingMotion } = require("./lib/klingMotion");
-const { generateLtxRevealContinuation, applyLtxMotion, isStandaloneEligible, LTX_MOTION_TEMPLATES } = require("./lib/ltxMotion");
+// FULL KLING REVERT (Sep 10, 2026) — ltxMotion.js require() removed
+// entirely. Room Reveal's continuation phase (the last remaining LTX
+// caller in this file) now dispatches to klingMotion.js's
+// generateKlingRevealContinuation(), and the standalone frame.ltxMotionPreset
+// branch below is gone — build-video-demo.html no longer sends that field
+// for any frame, standalone or Reveal. ltxMotion.js itself is untouched on
+// disk (still a valid module) but has zero remaining callers in this
+// pipeline as of this change — see Notion decision doc "DECISION — Full
+// Kling Migration for AI Motion + Pool Cut to 2/Video" for why: LTX's
+// per-preset reliability never reached production-safe, including on Room
+// Reveal's AUTO-PICK path, which was rendering a hallucinated fireplace on
+// a real listing (open_plan_main hero shot, cinematic_push preset) as of
+// the Sep 10 handoff.
+const { applyKlingMotion, generateKlingRevealContinuation, KLING_MOTION_TEMPLATES } = require("./lib/klingMotion");
 const { generateMusic } = require("./lib/musicGen");
 const { assembleVideo, buildRevealClip, REVEAL_PRESETS, REVEAL_OPENER_DURATION, REVEAL_WIPE_DURATION, REVEAL_CONTINUATION_DURATION, computeClipTimeline, extractMidpointFrame, probeDuration, mapWithConcurrencyLimit, FFMPEG_CONCURRENCY_LIMIT } = require("./lib/assemble");
 const { generateNarration, groupContiguousByRoom } = require("./lib/narrationGen");
@@ -83,9 +95,16 @@ async function processRenderJob(job) {
   // useful for diagnosing exactly which frames had already rendered via
   // Kling (real cost already incurred) before the failure occurred.
   let klingFrameOutcomes = [];
-  // Mirrors klingFrameOutcomes above — same reasoning: distinguishes
-  // real LTX renders from ken_burns_fallback outcomes, for the same
-  // refund/diagnostic purposes.
+  // FULL KLING REVERT (Sep 10, 2026) — kept declared and returned (always
+  // empty array now) rather than removed outright, since video-notify.js's
+  // refund logic still destructures this field from the job result. Its
+  // only source, the standalone frame.ltxMotionPreset branch, is gone —
+  // see that branch's removal comment further down. NOTE: this was never
+  // the tracking mechanism for Room Reveal's continuation outcomes either
+  // way (LTX before, Kling now) — Reveal billing/refund is enforced
+  // separately, via frame.revealEngine in video-job.js's usesAiMotionReveal()
+  // — so this array's emptiness doesn't affect Reveal refund logic at all.
+  // Safe to delete outright once video-notify.js is confirmed not to read it.
   let ltxFrameOutcomes = [];
 
   try {
@@ -424,44 +443,52 @@ async function processRenderJob(job) {
         // enforces "only ONE namespace is reachable for this frame,"
         // matching frame.revealEngine — this is also the real billing
         // enforcement point, not just a UI nicety, since a Ken-Burns-
-        // engine frame that somehow ended up with an LTX endMotion would
+        // engine frame that somehow ended up with a Kling endMotion would
         // render real paid AI motion on a clip the user was told was free.
         //
         // frame.revealEngine (not frame.motion directly) — a purpose-built
-        // field sent specifically for reveal frames, "ken_burns" or "ltx".
+        // field sent specifically for reveal frames, "ken_burns" or "kling"
+        // (renamed from "ltx" as part of the Sep 10, 2026 full Kling revert
+        // — see video-job.js and build-video-demo.html for the matching
+        // field-value rename).
         // Using frame.motion directly here would have been a real bug:
         // that raw string is never persisted through video-job.js's
         // frameRows/Railway-dispatch layer at all (confirmed by grep —
         // only motionPreset-family fields survive that round trip), so
         // it would always read undefined on the real backend object.
-        const isLtxNamespace = (key) => !!LTX_MOTION_TEMPLATES[key];
+        // FULL KLING REVERT (Sep 10, 2026) — namespace check now reads
+        // KLING_MOTION_TEMPLATES instead of LTX_MOTION_TEMPLATES, and the
+        // engine value is "kling" instead of "ltx" throughout. See
+        // video-job.js and build-video-demo.html for the matching
+        // "ltx" → "kling" rename on the reveal_engine field itself.
+        const isKlingNamespace = (key) => !!KLING_MOTION_TEMPLATES[key];
         // DIAGNOSTIC (July 19, 2026 — confirmed real bug from Sam's first
         // real render: frame.revealEngine arrived as null/undefined,
         // silently forcing this reveal to Ken Burns with ZERO trace
-        // anywhere in the logs — no error, no [LTX] line, nothing. The
+        // anywhere in the logs — no error, no [Kling] line, nothing. The
         // fal.ai dashboard showed no activity and the video still
         // rendered successfully, which is exactly what made it invisible.
         // Loud now, matching the [PADDING MISMATCH] pattern elsewhere in
         // this file — a missing/invalid revealEngine on a reveal frame is
         // always worth knowing about immediately, not discovering by
         // noticing an empty fal.ai dashboard after the fact.
-        if (frame.revealEngine !== "ltx" && frame.revealEngine !== "ken_burns") {
+        if (frame.revealEngine !== "kling" && frame.revealEngine !== "ken_burns") {
           console.error(
-            `  [${job.jobId}] [REVEAL ENGINE MISSING] frame ${i}: revealEngine is "${frame.revealEngine}" (expected "ltx" or "ken_burns"). ` +
-            `Defaulting to Ken Burns (the safe/free side) — this frame will NOT call LTX even if the user selected AI Motion. ` +
+            `  [${job.jobId}] [REVEAL ENGINE MISSING] frame ${i}: revealEngine is "${frame.revealEngine}" (expected "kling" or "ken_burns"). ` +
+            `Defaulting to Ken Burns (the safe/free side) — this frame will NOT call Kling even if the user selected AI Motion. ` +
             `Check that video-job.js's reveal_engine column exists and the frameRows insert/read-back is wired correctly.`
           );
         }
-        if (frame.revealEngine === "ltx") {
-          if (!isLtxNamespace(endMotion)) {
-            const firstLtx = preset.allowedEndMotions.find(isLtxNamespace);
-            endMotion = firstLtx || endMotion; // no LTX option exists for this preset+room combo — rare, but don't crash
+        if (frame.revealEngine === "kling") {
+          if (!isKlingNamespace(endMotion)) {
+            const firstKling = preset.allowedEndMotions.find(isKlingNamespace);
+            endMotion = firstKling || endMotion; // no Kling option exists for this preset+room combo — rare, but don't crash
           }
         } else {
           // Ken Burns engine (or anything else — default to the safe,
           // free side of the gate) — AI Motion is locked out entirely.
-          if (isLtxNamespace(endMotion)) {
-            endMotion = preset.allowedEndMotions.find((key) => !isLtxNamespace(key)) || "push_in";
+          if (isKlingNamespace(endMotion)) {
+            endMotion = preset.allowedEndMotions.find((key) => !isKlingNamespace(key)) || "push_in";
           }
         }
 
@@ -488,55 +515,56 @@ async function processRenderJob(job) {
           1.0
         );
 
-        // NEW (July 18, 2026) — LTX Fast continuation option. endMotion
-        // now comes from one of TWO namespaces (Ken Burns preset names in
-        // motionRenderer.py, or LTX preset names in LTX_MOTION_TEMPLATES —
-        // confirmed no name collisions between the two lists). Dispatch on
-        // which one it belongs to.
+        // UPDATED (Sep 10, 2026 — full Kling revert). endMotion still comes
+        // from one of TWO namespaces (Ken Burns preset names in
+        // motionRenderer.py, or Kling preset names in KLING_MOTION_TEMPLATES
+        // — confirmed no name collisions between the two lists, same as the
+        // old Ken-Burns-vs-LTX split this replaces). Dispatch on which one
+        // it belongs to.
         //
         // continuationDuration above is the DESIRED/padded value (a
-        // flexible float). Ken Burns respects it exactly. LTX Fast cannot
-        // — its duration is a fixed enum (6/8/10.../20s) — so LTX snaps
-        // UP to the nearest valid value internally and returns what it
-        // ACTUALLY rendered at. That real value, not the original
-        // request, is what has to flow into buildRevealClip's trim below
-        // — using the pre-snap number would silently discard whatever
-        // extra seconds LTX actually generated (and were actually paid
-        // for), and would also make verifyClipDuration fire a false
-        // [PADDING MISMATCH] on every single LTX reveal clip.
+        // flexible float). Ken Burns respects it exactly. Kling cannot —
+        // generateKlingClip clamps to an integer 5-15s — so
+        // generateKlingRevealContinuation snaps to the nearest valid value
+        // internally and returns what it ACTUALLY rendered at
+        // (klingDuration). That real value, not the original request, is
+        // what has to flow into buildRevealClip's trim below — using the
+        // pre-snap number would silently discard whatever extra seconds
+        // Kling actually generated (and were actually paid for), and would
+        // also make verifyClipDuration fire a false [PADDING MISMATCH] on
+        // every single Kling reveal clip.
         let continuationResult;
         let actualContinuationDuration = continuationDuration;
-        const isLtxEndMotion = !!LTX_MOTION_TEMPLATES[endMotion];
-        // TEMPORARY DIAGNOSTIC (July 19, 2026) — every static check of this
-        // code path has come back clean (revealEngine confirmed correct,
-        // both clamps confirmed logically sound, LTX_MOTION_TEMPLATES
-        // confirmed to contain the expected key, renderPipeline.js and
-        // ltxMotion.js confirmed matching deployed code) — yet zero [LTX]
-        // log activity on a real render where all of that should have
-        // resulted in at least an attempted call. Printing the actual
-        // runtime values directly rather than continuing to reason about
-        // what they "should" be. Remove once this mystery is resolved.
-        console.log(`  [DIAGNOSTIC] frame ${i}: presetKey="${presetKey}" revealEngine="${frame.revealEngine}" endMotion(final)="${endMotion}" isLtxEndMotion=${isLtxEndMotion} LTX_MOTION_TEMPLATES_has_key=${Object.prototype.hasOwnProperty.call(LTX_MOTION_TEMPLATES, endMotion)} total_LTX_keys=${Object.keys(LTX_MOTION_TEMPLATES).length}`);
+        const isKlingEndMotion = !!KLING_MOTION_TEMPLATES[endMotion];
+        // FULL KLING REVERT (Sep 10, 2026) — this branch previously called
+        // generateLtxRevealContinuation(); now calls klingMotion.js's
+        // generateKlingRevealContinuation() instead, following the same
+        // "actual rendered duration must flow into buildRevealClip's trim,
+        // not the requested one" reasoning documented above for LTX's
+        // fixed-enum snap — Kling's own clamp (5-15s integer, see
+        // generateKlingClip) can round the requested value too, so the same
+        // real-vs-requested distinction still applies.
+        console.log(`  [DIAGNOSTIC] frame ${i}: presetKey="${presetKey}" revealEngine="${frame.revealEngine}" endMotion(final)="${endMotion}" isKlingEndMotion=${isKlingEndMotion} KLING_MOTION_TEMPLATES_has_key=${Object.prototype.hasOwnProperty.call(KLING_MOTION_TEMPLATES, endMotion)} total_KLING_keys=${Object.keys(KLING_MOTION_TEMPLATES).length}`);
 
-        if (isLtxEndMotion) {
+        if (isKlingEndMotion) {
           try {
-            const ltxResult = await generateLtxRevealContinuation(
+            const klingResult = await generateKlingRevealContinuation(
               { ...frame, continuationDurationSeconds: continuationDuration },
               endMotion,
               workDir,
               job.jobId
             );
-            continuationResult = ltxResult;
-            actualContinuationDuration = ltxResult.ltxDuration;
+            continuationResult = klingResult;
+            actualContinuationDuration = klingResult.klingDuration;
           } catch (err) {
-            // No LTX-preset-to-Ken-Burns-preset mapping exists (the two
+            // No Kling-preset-to-Ken-Burns-preset mapping exists (the two
             // libraries' names don't correspond 1:1), so this can't fall
-            // back to "the same motion via Ken Burns" the way Kling's own
-            // fallback does. Falls back to push_in — a safe, always-
-            // available default — same "premium enhancement, never a hard
-            // dependency" principle as every other AI motion fallback in
-            // this file.
-            console.error(`  [${job.jobId}] [Reveal] LTX continuation "${endMotion}" failed, falling back to Ken Burns push_in: ${err.message}`);
+            // back to "the same motion via Ken Burns" the way the
+            // standalone Kling branch's own built-in fallback does. Falls
+            // back to push_in — a safe, always-available default — same
+            // "premium enhancement, never a hard dependency" principle as
+            // every other AI motion fallback in this file.
+            console.error(`  [${job.jobId}] [Reveal] Kling continuation "${endMotion}" failed, falling back to Ken Burns push_in: ${err.message}`);
             continuationResult = await applyMotionPreset(
               { ...frame, motionPreset: "push_in", durationSeconds: continuationDuration },
               workDir,
@@ -564,41 +592,17 @@ async function processRenderJob(job) {
 
         if (job.wantsNarration) {
           const expectedRevealDuration = REVEAL_OPENER_DURATION + actualContinuationDuration - REVEAL_WIPE_DURATION;
-          await verifyClipDuration(job.jobId, `frame ${i} (reveal, ${presetKey}${isLtxEndMotion ? ", LTX" : ""})`, clipPath, expectedRevealDuration);
-        }
-      } else if (frame.ltxMotionPreset && LTX_MOTION_TEMPLATES[frame.ltxMotionPreset]) {
-        // NEW (July 18, 2026) — standalone LTX AI Motion, no Room Reveal
-        // pairing required. Same category as klingMotion.js's
-        // SINGLE_IMAGE_INTERIOR_ALLOWED_PRESETS: pure camera/ambient
-        // motion on an already-real, already-staged single image. Only
-        // Medium-High/High confidence presets from the Cinematic LTX
-        // Prompt Pack are exposed here at all (Sam's explicit scope call)
-        // — ltxMotion.js's isStandaloneEligible() is the enforcement
-        // point the frontend dropdown is expected to match, but this is
-        // still checked server-side too, same "don't trust the client
-        // alone" principle as the Reveal Presets' endMotion clamp.
-        if (!isStandaloneEligible(frame.ltxMotionPreset)) {
-          console.error(`  [${job.jobId}] [LTX] Rejected standalone use of "${frame.ltxMotionPreset}" — below the Medium-High confidence floor for standalone selection. Falling back to Ken Burns auto.`);
-          const result = await applyMotionPreset({ ...frame, motionPreset: "auto" }, workDir, carryZoom);
-          clipPath = result.path;
-          carryZoom = result.endingZoom;
-        } else {
-          const result = await applyLtxMotion(
-            frame,
-            frame.ltxMotionPreset,
-            workDir,
-            () => applyMotionPreset({ ...frame, motionPreset: "auto" }, workDir, carryZoom),
-            job.jobId
-          );
-          clipPath = result.path;
-          carryZoom = result.endingZoom;
-
-          ltxFrameOutcomes.push({
-            sequenceOrder: frame.sequenceOrder !== undefined ? frame.sequenceOrder : i,
-            outcome: result.source,
-          });
+          await verifyClipDuration(job.jobId, `frame ${i} (reveal, ${presetKey}${isKlingEndMotion ? ", Kling" : ""})`, clipPath, expectedRevealDuration);
         }
       } else {
+        // FULL KLING REVERT (Sep 10, 2026) — the standalone
+        // frame.ltxMotionPreset branch that used to live here is removed.
+        // Standalone AI Motion has dispatched through the frame.useAiMotion
+        // branch above (ordinary Kling call) since the Sep 9 redirect;
+        // build-video-demo.html no longer sends ltxMotionPreset for any
+        // frame at all, so this branch had zero remaining callers even
+        // before removal — confirmed by grep across all frontend/backend
+        // frame-construction sites.
         const result = await applyMotionPreset(frame, workDir, carryZoom);
         clipPath = result.path;
         carryZoom = result.endingZoom;
