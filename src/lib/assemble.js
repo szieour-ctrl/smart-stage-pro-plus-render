@@ -583,13 +583,18 @@ const REVEAL_PRESETS = {
   },
 };
 
-// beforeClipPath / afterClipPath are pre-rendered motionRenderer.py clips
-// — beforeClipPath at REVEAL_OPENER_DURATION using the preset's
-// openerMotion, afterClipPath at continuationDurationOverride (or
-// REVEAL_CONTINUATION_DURATION if omitted) using the user's chosen End
-// Motion. This function ONLY does the wipe compositing; it does not call
-// motionRenderer.py itself, so the caller (renderPipeline.js) controls
-// exactly what source images and durations went into each phase.
+// beforeClipPath is always a pre-rendered motionRenderer.py Ken Burns
+// clip, at REVEAL_OPENER_DURATION using the preset's openerMotion.
+// afterClipPath, at continuationDurationOverride (or
+// REVEAL_CONTINUATION_DURATION if omitted), is EITHER another
+// motionRenderer.py clip (Ken Burns continuation) OR a raw fal.ai Kling
+// download (AI Motion continuation, via klingMotion.js's
+// generateKlingRevealContinuation) — this function no longer assumes
+// which, since both are normalized to identical format internally before
+// the wipe (see the fix inside, Sep 11, 2026). This function ONLY does
+// the wipe compositing; it does not call motionRenderer.py or Kling
+// itself, so the caller (renderPipeline.js) controls exactly what source
+// images/clips and durations went into each phase.
 //
 // continuationDurationOverride (July 18, 2026) — lets renderPipeline.js's
 // intro/outro narration padding (+5s on the last clip) actually reach a
@@ -601,7 +606,7 @@ const REVEAL_PRESETS = {
 // durations, both still fixed, since it's measured from the start of the
 // FIRST input regardless of how long the second input's trimmed clip is.
 function buildRevealClip(beforeClipPath, afterClipPath, presetKey, workDir, outputName, continuationDurationOverride) {
-  return new Promise((resolve, reject) => {
+  return new Promise(async (resolve, reject) => {
     const preset = REVEAL_PRESETS[presetKey];
     if (!preset) {
       reject(new Error(`buildRevealClip: unknown reveal preset "${presetKey}"`));
@@ -609,6 +614,42 @@ function buildRevealClip(beforeClipPath, afterClipPath, presetKey, workDir, outp
     }
     const outputPath = path.join(workDir, outputName);
     const continuationDuration = continuationDurationOverride || REVEAL_CONTINUATION_DURATION;
+
+    // FIX (Sep 11, 2026 — real render failure, confirmed from a live job's
+    // log: "Error reinitializing filters! / Failed to inject frame into
+    // filter network: Invalid argument"). This is the EXACT same crash
+    // signature normalizeClip's own header comment already diagnosed and
+    // fixed for concatenateClips()/xfadeChain() on July 14, 2026 — xfade
+    // requires every pair of inputs it chains to share resolution, frame
+    // rate, and pixel format, and this function's xfade call below never
+    // enforced that. It went unnoticed here specifically because until
+    // today's full Kling revert, this function's afterClipPath was always
+    // either a motionRenderer.py Ken Burns clip (same format as
+    // beforeClipPath by construction) or an LTX-generated clip that
+    // apparently happened to come back at a compatible format. Kling's
+    // raw fal.ai output does not — same root cause as the July 14 crash,
+    // just reappearing in a code path that was never given the fix that
+    // already exists elsewhere in this same file.
+    //
+    // Reuses normalizeClip() directly rather than re-deriving a second
+    // copy of the same scale/pad/fps/pixel-format logic — same "don't
+    // duplicate what already exists" principle this codebase repeats
+    // throughout. Named indices (not plain numbers) since workDir is
+    // shared across every frame AND with concatenateClips()'s own
+    // normalizeClip(clip, workDir, i) calls on the SAME job — a numeric
+    // index here could silently collide with and overwrite an unrelated
+    // clip's normalized output from elsewhere in the same render.
+    const baseName = path.basename(outputName, path.extname(outputName));
+    let normalizedBefore, normalizedAfter;
+    try {
+      [normalizedBefore, normalizedAfter] = await Promise.all([
+        normalizeClip(beforeClipPath, workDir, `${baseName}_reveal_opener`),
+        normalizeClip(afterClipPath, workDir, `${baseName}_reveal_continuation`),
+      ]);
+    } catch (err) {
+      reject(new Error(`Reveal Preset "${presetKey}" clip normalization failed before the wipe could even run: ${err.message}`));
+      return;
+    }
 
     // xfade's `offset` is measured from the start of the FIRST input and
     // marks where the crossfade begins — so offset = openerDuration - wipeDuration
@@ -619,8 +660,8 @@ function buildRevealClip(beforeClipPath, afterClipPath, presetKey, workDir, outp
     const offset = REVEAL_OPENER_DURATION - REVEAL_WIPE_DURATION;
 
     ffmpeg()
-      .input(beforeClipPath)
-      .input(afterClipPath)
+      .input(normalizedBefore)
+      .input(normalizedAfter)
       .complexFilter([
         `[0:v]trim=duration=${REVEAL_OPENER_DURATION},setpts=PTS-STARTPTS[opener]`,
         `[1:v]trim=duration=${continuationDuration},setpts=PTS-STARTPTS[continuation]`,
