@@ -70,6 +70,17 @@ const VALID_PRESETS = new Set([
   "drift", "pan_zoom",
   "float", "luxury_parallax", "static",
   "soft_hold", "restrained_push",
+  // Compound Ken Burns presets (added [DATE]) — promoted from R&D, real
+  // motionRenderer.py curves as of the same date. Without these here,
+  // resolvePreset() logs "Unknown preset" and silently falls back to
+  // AUTO_PRESETS[roomType] — same failure shape the soft_hold/
+  // restrained_push comment above already documents.
+  "soft_push_float_push", "soft_push_float_diagonal",
+  "soft_push_float_push_diagonal", "soft_push_float_gentle_diagonal",
+  "soft_push_float_strong_push",
+  "push_tilt_up", "push_tilt_down",
+  "push_pan_left", "push_pan_right",
+  "pan_left_push", "pan_right_push",
 ]);
 
 // FIX (Sam's catch, real render — confirmed via the room-label
