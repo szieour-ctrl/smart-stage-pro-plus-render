@@ -77,9 +77,10 @@ function ensureConfigured() {
 }
 
 // ── TWO-IMAGE CROP WORKFLOW (July 20, 2026, LTX_Prompt_revision doc) ────
-// Presets requiring this: orbit_arc, micro_zoom_out, micro_dolly_back,
-// pan_zoom_reveal (see requiresTwoImage flag on each below — pan_zoom_reveal
-// added this session after a real single-image render hallucinated at 6s).
+// Presets requiring this: orbit_arc, pan_zoom_reveal (micro_zoom_out and
+// micro_dolly_back also used this workflow before being deleted [DATE] —
+// see LTX_MOTION_TEMPLATES below; git history has the full definitions if
+// ever needed again). See requiresTwoImage flag on each below.
 // Per the doc's Section 1: LTX has
 // no reference for what's outside the original frame on any move that
 // expands the frame boundary (rotation, pull-back). Two-image mechanism:
@@ -101,11 +102,11 @@ function ensureConfigured() {
 // file header for the full reasoning.
 //
 // KNOWN TRADEOFF (confirmed via real playground test, this session): the
-// two-image mechanism reliably fixes camera-direction accuracy (e.g.
-// micro_zoom_out correctly zooming out instead of defaulting to a push-in
-// on single-image mode) but appears to come at the cost of ambient motion
-// — a real fireplace flame tested nearly frozen/undetectable in a
-// two-image micro_dolly_back render, versus flickering normally in
+// two-image mechanism reliably fixes camera-direction accuracy (e.g. a
+// widen/arc move correctly moving outward instead of defaulting to a
+// push-in on single-image mode) but appears to come at the cost of
+// ambient motion — a real fireplace flame tested nearly frozen/
+// undetectable in a two-image render, versus flickering normally in
 // single-image mode. Likely cause: with two fixed photographic endpoints
 // to match, the model has less generative freedom left for anything not
 // dictated by those two images (like flame flicker) than it does in
@@ -162,11 +163,11 @@ function ensureConfigured() {
 //
 // KNOWN LIMITATION (confirmed real testing, this session): this ambient
 // framing has only been confirmed working in SINGLE-IMAGE mode.
-// Two-image mode (orbit_arc, micro_zoom_out, micro_dolly_back,
-// pan_zoom_reveal) has been repeatedly confirmed to freeze flame/ambient
-// motion regardless of prompt wording — likely a structural limit of
-// LTX's two-image conditioning, not something this clause can fix. Don't
-// expect flame animation on any two-image preset even with this wording.
+// Two-image mode (orbit_arc, pan_zoom_reveal) has been repeatedly
+// confirmed to freeze flame/ambient motion regardless of prompt wording —
+// likely a structural limit of LTX's two-image conditioning, not
+// something this clause can fix. Don't expect flame animation on any
+// two-image preset even with this wording.
 const FLAME_CLAUSE =
   " Ambient motion naturally includes a subtle, softly flickering flame in any visible fireplace or fire pit. No new objects, reflections, lighting changes, or architectural modifications appear.";
 
@@ -381,55 +382,24 @@ const LTX_MOTION_TEMPLATES = {
   // July 18) with the v3 pack's tighter wording, plus the flame clause.
   //
   // open_plan_reveal DELETED (this session, final call, Sam's explicit
-  // confirmation) — visually near-identical to micro_zoom_out once both
-  // use the two-image crop workflow, plus the same frozen/undetectable
-  // flame issue as micro_dolly_back's two-image mode. This standalone
-  // preset (and its use as one End Motion CHOICE inside Room Reveal) is
-  // removed — the Room Reveal feature itself (Classic/Luxury/Cinematic
-  // Reveal, the opener/wipe/continuation architecture, the other
-  // ~20 remaining End Motion options) is completely untouched and stays
-  // exactly as-is. If reintroduced later, restore this block (git
-  // history) and re-add to OPEN_PLAN_SAFE_LTX_PRESETS + both two-image
-  // header comments above.
-  micro_zoom_out: {
-    prompt:
-      "Perform a gentle micro zoom-out that breathes outward while staying strictly inside the photographed boundaries. No new ceiling, flooring, corners, cabinetry, or hallway entrances appear." + FLAME_CLAUSE,
-    confidence: "medium-high",
-    safeWhen: "Open-plan spaces, especially those with a hallway or corridor nearby that must not be exposed.",
-    gate: null,
-    openPlanOnly: true,
-    // ADDED (confirmed by real render test — single-image version pushed
-    // IN instead of zooming out; the two-image crop/original pairing is
-    // what actually enforces the correct direction, not the prompt text
-    // alone.
-    requiresTwoImage: true,
-    cropTransformation: "94% center crop (see imagePrep.js's prepareImageForMotionAPI cropPercent)",
-  },
-  micro_dolly_back: {
-    // REVISED (this session, real render test) — single-image version
-    // pushed IN instead of dollying back (same root cause as
-    // micro_zoom_out above); first two-image attempt correctly widened
-    // the frame but rendered visually identical to micro_zoom_out (no
-    // depth map available from a flat photo, so LTX can't distinguish a
-    // true parallax dolly from a flat zoom). This revised prompt, which
-    // explicitly describes foreground-vs-background parallax rather than
-    // just "dolly back," was re-tested in the fal.ai playground with the
-    // same two-image pair and CONFIRMED GOOD — visually distinct from
-    // micro_zoom_out now, no push-in regression.
-    prompt:
-      "Perform a smooth micro dolly motion that widens the frame while creating subtle parallax: elements closer to the camera (foreground furniture, countertop edges) shift position slightly more than elements farther away (back walls, distant fixtures), creating a sense of depth rather than a flat, uniform zoom. No hallway depth, doorway edges, or extended wall planes appear." + FLAME_CLAUSE,
-    confidence: "medium-high",
-    safeWhen: "Open-plan spaces, especially those with a hallway or corridor nearby that must not be exposed.",
-    gate: null,
-    openPlanOnly: true,
-    // NEW (July 20, 2026, LTX_Prompt_revision doc) — one of the presets
-    // requiring the two-image crop workflow (see buildCroppedStartUrl).
-    // KNOWN ISSUE (confirmed real render, this session): flame renders
-    // nearly frozen/undetectable in two-image mode on this preset — see
-    // the two-image workflow comment above for the likely cause.
-    requiresTwoImage: true,
-    cropTransformation: "94% center crop (see imagePrep.js's prepareImageForMotionAPI cropPercent)",
-  },
+  // confirmation) — visually near-identical to the (also now-deleted)
+  // micro_zoom_out once both used the two-image crop workflow, plus the
+  // same frozen/undetectable flame issue. This standalone preset (and its
+  // use as one End Motion CHOICE inside Room Reveal) is removed — the
+  // Room Reveal feature itself (Classic/Luxury/Cinematic Reveal, the
+  // opener/wipe/continuation architecture, the other ~20 remaining End
+  // Motion options) is completely untouched and stays exactly as-is. If
+  // reintroduced later, restore this block (git history) and re-add to
+  // OPEN_PLAN_SAFE_LTX_PRESETS + both two-image header comments above.
+  //
+  // micro_zoom_out / micro_dolly_back DELETED (Sam's explicit call,
+  // [DATE]) — both were LTX-only presets with no Kling equivalent (see
+  // klingMotion.js's OPEN_PLAN_ONLY_PRESETS comment); Sam's decision was
+  // to delete rather than build Kling equivalents, given both were
+  // open-plan-only moves and Room Reveal's separate, standing "no
+  // open-plan AI Motion" policy would have excluded them from that
+  // context regardless. Full definitions (prompts, two-image crop config)
+  // are in git history if ever needed again.
 };
 
 const VALID_LTX_PRESETS = new Set(Object.keys(LTX_MOTION_TEMPLATES));
@@ -455,8 +425,6 @@ const OPEN_PLAN_SAFE_LTX_PRESETS = new Set([
   "corner_to_corner_drift",
   "living_room_ambient",
   "fireplace_flicker",
-  "micro_zoom_out",
-  "micro_dolly_back",
 ]);
 
 // Confidence tiers eligible for STANDALONE selection (no Room Reveal
@@ -670,8 +638,8 @@ async function generateLtxContinuationClip(frame, presetKey, workDir, jobId) {
   };
 
   // Two-image workflow (July 20, 2026, LTX_Prompt_revision doc) — only
-  // orbit_arc, micro_zoom_out, micro_dolly_back, and pan_zoom_reveal set
-  // requiresTwoImage.
+  // orbit_arc and pan_zoom_reveal set requiresTwoImage (micro_zoom_out and
+  // micro_dolly_back also used this before being deleted).
   // end_image_url = the ORIGINAL, uncropped staged image — wider by
   // comparison to the cropped start frame above, giving LTX real content
   // to reference for whatever the move would otherwise reveal beyond the
