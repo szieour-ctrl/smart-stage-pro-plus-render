@@ -81,6 +81,8 @@ const VALID_PRESETS = new Set([
   "push_tilt_up", "push_tilt_down",
   "push_pan_left", "push_pan_right",
   "pan_left_push", "pan_right_push",
+  // Added [DATE], Sam's design — Float, then a full pull-back settle.
+  "float_pull_back",
 ]);
 
 // FIX (Sam's catch, real render — confirmed via the room-label
