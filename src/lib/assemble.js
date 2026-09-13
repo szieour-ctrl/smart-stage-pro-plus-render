@@ -519,6 +519,22 @@ const REVEAL_CONTINUATION_DURATION = 6.0;
 // pull_back_wide as a same-visual substitute, but pull_back_wide is
 // excluded from Reveal's End Motion namespace entirely (see above) — so
 // for Reveal specifically, these two are dropped rather than substituted.
+// Compound Ken Burns presets (added [DATE]) — available to every Reveal
+// identity, including Luxury Drift (Sam's explicit call: these 11 NEW
+// names override Luxury Drift's push/pull/tilt exclusion above — that
+// exclusion is otherwise UNCHANGED, push_in/pull_back/tilt_up/tilt_down
+// still stay out of Luxury Drift's list below). Mirrors autoSelect.js's
+// and build-video-demo.html's COMPOUND_END_MOTIONS constant exactly —
+// keep all three in sync.
+const COMPOUND_END_MOTIONS = [
+  "soft_push_float_push", "soft_push_float_diagonal",
+  "soft_push_float_push_diagonal", "soft_push_float_gentle_diagonal",
+  "soft_push_float_strong_push",
+  "push_tilt_up", "push_tilt_down",
+  "push_pan_left", "push_pan_right",
+  "pan_left_push", "pan_right_push",
+];
+
 const REVEAL_PRESETS = {
   // FINAL MODEL (July 19, 2026, Sam's explicit correction after two
   // wrong attempts — no more drift): there is no 4th preset. There are
@@ -545,6 +561,7 @@ const REVEAL_PRESETS = {
     wipeTransition: "wipeleft",
     allowedEndMotions: [
       "push_in", "pan_left", "pan_right", "tilt_up", "tilt_down", "drift", "float", "luxury_parallax",
+      ...COMPOUND_END_MOTIONS,
       "cinematic_push", "luxury_drift", "floating_camera_drift", "architectural_glide", "corner_to_corner_drift",
       "orbit_arc", "rack_focus", "drone_boom_up", "crane_up", "crane_down", "parallax_push", "pan_zoom_reveal",
       "living_room_ambient", "fireplace_flicker", "water_motion", "outdoor_breeze",
@@ -559,9 +576,12 @@ const REVEAL_PRESETS = {
     wipeTransition: "circleopen",
     allowedEndMotions: [
       "drift", "pan_left", "pan_right", "float", "luxury_parallax",
+      ...COMPOUND_END_MOTIONS,
       // Push-in-feeling motions (Ken Burns push_in/pull_back/tilt_up/
       // tilt_down, Kling cinematic_push/rack_focus) deliberately excluded
       // on both namespaces — this preset's identity is purely lateral.
+      // The 11 compounds above are the one deliberate exception (Sam's
+      // call) despite several of them containing a push phase.
       "luxury_drift", "floating_camera_drift", "architectural_glide", "corner_to_corner_drift",
       "orbit_arc", "drone_boom_up", "crane_up", "crane_down", "pan_zoom_reveal",
       "living_room_ambient", "fireplace_flicker", "water_motion", "outdoor_breeze",
@@ -576,6 +596,7 @@ const REVEAL_PRESETS = {
     wipeTransition: "smoothleft",
     allowedEndMotions: [
       "push_in", "pan_left", "pan_right", "tilt_up", "tilt_down", "drift", "float", "luxury_parallax",
+      ...COMPOUND_END_MOTIONS,
       "cinematic_push", "luxury_drift", "floating_camera_drift", "architectural_glide", "corner_to_corner_drift",
       "orbit_arc", "rack_focus", "drone_boom_up", "crane_up", "crane_down", "parallax_push", "pan_zoom_reveal",
       "living_room_ambient", "fireplace_flicker", "water_motion", "outdoor_breeze",
