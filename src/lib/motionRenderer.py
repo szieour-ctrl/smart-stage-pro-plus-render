@@ -37,6 +37,24 @@ Preset reference:
                       forward; pull_back is excluded from every Reveal
                       Preset's End Motion list for exactly this reason.
 
+Compound presets (added [DATE] — promoted from R&D FFmpeg-concat prototype
+to real motionRenderer.py curves; production names replace the R&D keys):
+  soft_push_float_push             — Soft Push → Float → Push
+  soft_push_float_diagonal         — Soft Push → Float → Diagonal
+  soft_push_float_push_diagonal    — Soft Push → Float → Push Diagonal
+  soft_push_float_gentle_diagonal  — Soft Push → Float → Gentle Diagonal
+  soft_push_float_strong_push      — Soft Push → Float → Strong Push
+  push_tilt_up / push_tilt_down    — Push, then tilt up/down
+  push_pan_left / push_pan_right   — Push, then pan left/right
+  pan_left_push / pan_right_push   — Pan left/right, then push
+
+Each compound preset is one continuous curve made of 2-3 smoothstep-eased
+phases. Phase boundaries are FRACTIONS of total duration, not literal
+seconds, so the cinematic rhythm survives narration padding stretching a
+Room Reveal continuation past its original 6s design length. Each phase
+begins from the exact ending state of the one before it — no seams. See
+COMPOUND_PRESETS below for the phase tables.
+
 Usage (called by motionPresets.js via child_process.spawn):
   python3 motionRenderer.py \
     --source   /tmp/job-xyz/frame_living.jpg \
@@ -67,7 +85,16 @@ def parse_args():
                    choices=["push_in","pull_back","pan_left","pan_right",
                              "tilt_up","tilt_down","drift","pan_zoom",
                              "float","luxury_parallax","static",
-                             "soft_hold","restrained_push"])
+                             "soft_hold","restrained_push",
+                             # Compound Room Reveal END motions
+                             "soft_push_float_push",
+                             "soft_push_float_diagonal",
+                             "soft_push_float_push_diagonal",
+                             "soft_push_float_gentle_diagonal",
+                             "soft_push_float_strong_push",
+                             "push_tilt_up", "push_tilt_down",
+                             "push_pan_left", "push_pan_right",
+                             "pan_left_push", "pan_right_push"])
     p.add_argument("--duration",   type=float, required=True)
     p.add_argument("--output",     required=True,  help="Output .mp4 path")
     p.add_argument("--start-zoom", type=float, default=1.0, dest="start_zoom")
@@ -128,6 +155,119 @@ def ease_in(t):
 def ease_out(t):
     """Starts fast, decelerates. Used for tilt_down (gravity feel)."""
     return 1.0 - (1.0 - t) * (1.0 - t)
+
+
+# ── COMPOUND PRESET PHASE TABLES ──────────────────────────────────────────────
+#
+# Each entry: (start_zoom, start_pan_x, start_pan_y, [phases]).
+# Each phase: (duration_fraction, delta_zoom, delta_pan_x, delta_pan_y),
+# smoothstep-eased, applied on top of wherever the previous phase ended.
+#
+# NOTE: unlike every atomic preset above, these ignore the caller's
+# --start-zoom and always start from their own fixed composition below —
+# that's what the production handoff spec calls for (these are designed as
+# a fresh 2-3 beat performance, not a continuation of an arbitrary incoming
+# zoom level the way luxury_parallax is). Flag if that's not the intent.
+#
+# pan_x/pan_y here are in the same fraction-of-source units as pan_x_frac/
+# pan_y_frac elsewhere in this file (0.0 = center).
+COMPOUND_PRESETS = {
+    # Ramp family — Soft Push → Float → <final beat>. First two phases
+    # (Low Push, Float) are shared; only the closing third diverges.
+    "soft_push_float_push": (
+        1.02, 0.0, 0.0, [
+            (0.4167, 0.070, 0.0,   0.0),     # Low Push
+            (0.2500, 0.015, 0.012, -0.008),  # Float
+            (0.3333, 0.180, 0.0,   0.0),     # Fast Push
+        ],
+    ),
+    "soft_push_float_diagonal": (
+        1.02, 0.0, 0.0, [
+            (0.4167, 0.070, 0.0,   0.0),
+            (0.2500, 0.015, 0.012, -0.008),
+            (0.3333, 0.100, 0.180, -0.120),  # Fast Diagonal
+        ],
+    ),
+    "soft_push_float_push_diagonal": (
+        1.02, 0.0, 0.0, [
+            (0.4167, 0.070, 0.0,   0.0),
+            (0.2500, 0.015, 0.012, -0.008),
+            (0.3333, 0.150, 0.140, -0.080),  # Push Diagonal
+        ],
+    ),
+    "soft_push_float_gentle_diagonal": (
+        1.02, 0.0, 0.0, [
+            (0.4167, 0.070, 0.0,   0.0),
+            (0.2500, 0.015, 0.012, -0.008),
+            (0.3333, 0.080, 0.140, -0.090),  # Gentle Diagonal
+        ],
+    ),
+    "soft_push_float_strong_push": (
+        1.02, 0.0, 0.0, [
+            (0.4167, 0.070, 0.0, 0.0),
+            (0.2500, 0.015, 0.012, -0.008),
+            (0.3333, 0.240, 0.0, 0.0),       # Strong Push
+        ],
+    ),
+
+    # Direction-change family — one movement, then a distinct second one.
+    "push_tilt_up": (
+        1.02, 0.0, 0.0,
+        [(0.5, 0.180, 0.0, 0.0), (0.5, 0.0, 0.0, 0.240)],
+    ),
+    "push_tilt_down": (
+        1.02, 0.0, 0.0,
+        [(0.5, 0.180, 0.0, 0.0), (0.5, 0.0, 0.0, -0.240)],
+    ),
+    "push_pan_left": (
+        1.02, 0.0, 0.0,
+        [(0.5, 0.180, 0.0, 0.0), (0.5, 0.0, -0.240, 0.0)],
+    ),
+    "push_pan_right": (
+        1.02, 0.0, 0.0,
+        [(0.5, 0.180, 0.0, 0.0), (0.5, 0.0, 0.240, 0.0)],
+    ),
+    "pan_left_push": (
+        1.16, 0.12, 0.0,
+        [(0.5, 0.0, -0.240, 0.0), (0.5, 0.180, 0.0, 0.0)],
+    ),
+    "pan_right_push": (
+        1.16, -0.12, 0.0,
+        [(0.5, 0.0, 0.240, 0.0), (0.5, 0.180, 0.0, 0.0)],
+    ),
+}
+
+
+def _compound_curve_state(t, start_zoom, start_x, start_y, phases):
+    """
+    Evaluate a compound preset's phase list at time t (0.0-1.0).
+
+    Walks the phases in order, fully committing each completed phase's
+    delta before moving to the next, so every phase's math is anchored to
+    the exact state the previous phase ended at — zero seam between beats,
+    per the production spec's "each phase starts from the exact ending
+    state of the prior phase" requirement.
+    """
+    zoom, pan_x, pan_y = start_zoom, start_x, start_y
+    elapsed = 0.0
+
+    for fraction, dz, dx, dy in phases:
+        if t <= elapsed:
+            break  # not reached yet — state already reflects prior phases
+
+        local_t = min((t - elapsed) / fraction, 1.0)
+        eased = ease_in_out(local_t)
+
+        zoom  += dz * eased
+        pan_x += dx * eased
+        pan_y += dy * eased
+
+        if local_t < 1.0:
+            break  # currently mid-phase — later phases haven't started
+
+        elapsed += fraction
+
+    return zoom, pan_x, pan_y
 
 
 # ── MOTION CURVES ─────────────────────────────────────────────────────────────
@@ -288,6 +428,12 @@ def build_motion_curve(preset, n_frames, start_zoom):
             zoom  = start_zoom + RESTRAINED_PUSH_AMOUNT * ease_in_out(t)
             pan_x = 0.0
             pan_y = 0.0
+
+        elif preset in COMPOUND_PRESETS:
+            c_start_zoom, c_start_x, c_start_y, phases = COMPOUND_PRESETS[preset]
+            zoom, pan_x, pan_y = _compound_curve_state(
+                t, c_start_zoom, c_start_x, c_start_y, phases
+            )
 
         else:  # static
             zoom  = 1.0
