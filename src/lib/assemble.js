@@ -466,11 +466,23 @@ async function concatenateClips(clipPaths, workDir) {
 // comment for the exact xfade-offset math (wipe duration is TIME SPENT
 // crossfading, not extra time added on top of the two phase durations).
 //
-// pull_back is excluded from every preset's End Motion list on purpose —
-// paired with ANY opener (soft_hold or restrained_push), a pull_back
-// continuation would reverse the reveal direction and read as a
-// collision, exactly the problem Sam flagged with the old hardcoded
-// pull_back(vacant)+push_in(staged) pairing.
+// pull_back is available as an End Motion on Classic Reveal and Cinematic
+// Reveal ([DATE], Sam's explicit call: Ken Burns is deterministic/flat —
+// no depth-hallucination risk the way Kling has, so the reasoning that
+// gates AI Motion presets doesn't carry over here). Still excluded from
+// Luxury Drift, matching that identity's existing push/tilt exclusion,
+// pending confirmation either way.
+//
+// REAL MECHANICAL NOTE (found while making this change, not yet fixed):
+// pull_back's own math in motionRenderer.py treats whatever start_zoom
+// it's given as the CENTER of its range (max_zoom = start_zoom+0.5,
+// min_zoom = start_zoom-0.5), not the literal starting composition.
+// Since every Reveal continuation starts fresh at start_zoom=1.0
+// (renderPipeline.js hardcodes this for every preset), pull_back as a
+// continuation renders its first frame at 1.5x zoom, easing DOWN to 1.0
+// — a real, visible jump right after the wipe, independent of the
+// opener's own direction. Watch for this on the first real render;
+// worth a motionRenderer.py fix if it reads badly.
 // RAISED from 4.0 to 6.0 (this session — Sam's request: standardize Ken
 // Burns clip duration to match AI Motion/LTX's ~6s continuation, closing
 // the gap that was forcing every Ken Burns segment into a tighter
@@ -560,7 +572,7 @@ const REVEAL_PRESETS = {
     openerMotion: "soft_hold",
     wipeTransition: "wipeleft",
     allowedEndMotions: [
-      "push_in", "pan_left", "pan_right", "tilt_up", "tilt_down", "drift", "float", "luxury_parallax",
+      "push_in", "pull_back", "float_pull_back", "pan_left", "pan_right", "tilt_up", "tilt_down", "drift", "float", "luxury_parallax",
       ...COMPOUND_END_MOTIONS,
       "cinematic_push", "luxury_drift", "floating_camera_drift", "architectural_glide", "corner_to_corner_drift",
       "orbit_arc", "rack_focus", "drone_boom_up", "crane_up", "crane_down", "parallax_push", "pan_zoom_reveal",
@@ -575,13 +587,13 @@ const REVEAL_PRESETS = {
     // hard-left wipe would.
     wipeTransition: "circleopen",
     allowedEndMotions: [
-      "drift", "pan_left", "pan_right", "float", "luxury_parallax",
+      "drift", "float_pull_back", "pan_left", "pan_right", "float", "luxury_parallax",
       ...COMPOUND_END_MOTIONS,
       // Push-in-feeling motions (Ken Burns push_in/pull_back/tilt_up/
       // tilt_down, Kling cinematic_push/rack_focus) deliberately excluded
       // on both namespaces — this preset's identity is purely lateral.
-      // The 11 compounds above are the one deliberate exception (Sam's
-      // call) despite several of them containing a push phase.
+      // The 11 compounds above, and float_pull_back, are the deliberate
+      // exceptions (Sam's call) despite several containing a push phase.
       "luxury_drift", "floating_camera_drift", "architectural_glide", "corner_to_corner_drift",
       "orbit_arc", "drone_boom_up", "crane_up", "crane_down", "pan_zoom_reveal",
       "living_room_ambient", "fireplace_flicker", "water_motion", "outdoor_breeze",
@@ -595,7 +607,7 @@ const REVEAL_PRESETS = {
     // push feel of a restrained_push opener.
     wipeTransition: "smoothleft",
     allowedEndMotions: [
-      "push_in", "pan_left", "pan_right", "tilt_up", "tilt_down", "drift", "float", "luxury_parallax",
+      "push_in", "pull_back", "float_pull_back", "pan_left", "pan_right", "tilt_up", "tilt_down", "drift", "float", "luxury_parallax",
       ...COMPOUND_END_MOTIONS,
       "cinematic_push", "luxury_drift", "floating_camera_drift", "architectural_glide", "corner_to_corner_drift",
       "orbit_arc", "rack_focus", "drone_boom_up", "crane_up", "crane_down", "parallax_push", "pan_zoom_reveal",
