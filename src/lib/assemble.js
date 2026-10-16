@@ -4,6 +4,7 @@
 const path = require("path");
 const fs = require("fs");
 const ffmpeg = require("fluent-ffmpeg");
+const { badgeGeometry } = require("./badgeAssets");
 
 const CROSSFADE_DURATION = 0.6; // seconds between clips
 
@@ -80,7 +81,9 @@ const NORMALIZE_WIDTH  = 1920;
 const NORMALIZE_HEIGHT = 1080;
 const NORMALIZE_FPS    = 20;
 
-function normalizeClip(clipPath, workDir, index) {
+function normalizeClip(clipPath, workDir, index, canvas) {
+  const CW = (canvas && canvas.w) || NORMALIZE_WIDTH;
+  const CH = (canvas && canvas.h) || NORMALIZE_HEIGHT;
   return new Promise(async (resolve, reject) => {
     const outputPath = path.join(workDir, `normalized_${index}.mp4`);
 
@@ -124,8 +127,8 @@ function normalizeClip(clipPath, workDir, index) {
         // scale step itself to only ever produce even numbers, closing
         // off that failure mode regardless of the source clip's own
         // aspect ratio.
-        `scale=${NORMALIZE_WIDTH}:${NORMALIZE_HEIGHT}:force_original_aspect_ratio=decrease:force_divisible_by=2`,
-        `pad=${NORMALIZE_WIDTH}:${NORMALIZE_HEIGHT}:(ow-iw)/2:(oh-ih)/2`,
+        `scale=${CW}:${CH}:force_original_aspect_ratio=decrease:force_divisible_by=2`,
+        `pad=${CW}:${CH}:(ow-iw)/2:(oh-ih)/2`,
         `fps=${NORMALIZE_FPS}`,
       ])
       .outputOptions(["-pix_fmt", "yuv420p", "-c:v", "libx264", "-preset", "fast"])
@@ -343,7 +346,7 @@ function xfadeChain(paths, durations, workDir, outputName) {
 const XFADE_BATCH_SIZE = 3;
 
 // ── CONCATENATE CLIPS (batched) ───────────────────────────────────────
-async function concatenateClips(clipPaths, workDir) {
+async function concatenateClips(clipPaths, workDir, canvas) {
   // NEW — normalize every clip BEFORE the single-clip early-return check
   // too. A single Kling clip still needs to end up at a known, consistent
   // resolution/fps/pixel format for mixAudio()/renderFormat() downstream,
@@ -352,7 +355,7 @@ async function concatenateClips(clipPaths, workDir) {
   // FIX (July 14, 2026 — real test failure): was Promise.all, unbounded —
   // see mapWithConcurrencyLimit's header comment for the full reasoning.
   const normalizedPaths = await mapWithConcurrencyLimit(
-    clipPaths, FFMPEG_CONCURRENCY_LIMIT, (clip, i) => normalizeClip(clip, workDir, i)
+    clipPaths, FFMPEG_CONCURRENCY_LIMIT, (clip, i) => normalizeClip(clip, workDir, i, canvas)
   );
 
   if (normalizedPaths.length === 1) {
@@ -638,7 +641,7 @@ const REVEAL_PRESETS = {
 // doesn't need to change for this — offset only depends on opener/wipe
 // durations, both still fixed, since it's measured from the start of the
 // FIRST input regardless of how long the second input's trimmed clip is.
-function buildRevealClip(beforeClipPath, afterClipPath, presetKey, workDir, outputName, continuationDurationOverride) {
+function buildRevealClip(beforeClipPath, afterClipPath, presetKey, workDir, outputName, continuationDurationOverride, canvas) {
   return new Promise(async (resolve, reject) => {
     const preset = REVEAL_PRESETS[presetKey];
     if (!preset) {
@@ -676,8 +679,8 @@ function buildRevealClip(beforeClipPath, afterClipPath, presetKey, workDir, outp
     let normalizedBefore, normalizedAfter;
     try {
       [normalizedBefore, normalizedAfter] = await Promise.all([
-        normalizeClip(beforeClipPath, workDir, `${baseName}_reveal_opener`),
-        normalizeClip(afterClipPath, workDir, `${baseName}_reveal_continuation`),
+        normalizeClip(beforeClipPath, workDir, `${baseName}_reveal_opener`, canvas),
+        normalizeClip(afterClipPath, workDir, `${baseName}_reveal_continuation`, canvas),
       ]);
     } catch (err) {
       reject(new Error(`Reveal Preset "${presetKey}" clip normalization failed before the wipe could even run: ${err.message}`));
@@ -936,7 +939,7 @@ function mixAudio(videoPath, musicPath, workDir, narrationSegments, knownVideoDu
 
 // ── RENDER FORMAT (16:9 master, 9:16 reframe) ────────────────────────────
 
-function renderFormat(inputPath, dimensions, workDir, outputName) {
+function renderFormat(inputPath, dimensions, workDir, outputName, nativeVertical) {
   return new Promise((resolve, reject) => {
     const outputPath = path.join(workDir, outputName);
     const [w, h] = dimensions.split("x");
@@ -944,7 +947,7 @@ function renderFormat(inputPath, dimensions, workDir, outputName) {
     // 9:16 reframe crops to center — smart subject-aware cropping is a
     // Phase 2B refinement; center crop is the correct safe default for v1.
     const filter =
-      dimensions === "1080x1920"
+      dimensions === "1080x1920" && !nativeVertical
         ? `crop=ih*9/16:ih,scale=${w}:${h}`
         : `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2`;
 
@@ -1032,7 +1035,7 @@ const CLOSING_CARD_BAND_HEIGHT_FRAC = 0.30;
 // function (not imported from endFrame.js) since this file has no
 // dependency on that one and the two are simple enough not to warrant a
 // shared module for four lines of math.
-function buildCardGradientFilters(bandY, bandH, inputLabel) {
+function buildCardGradientFilters(bandY, bandH, inputLabel, canvasW) {
   const filters = [];
   let prevLabel = inputLabel;
   for (let i = 0; i < CLOSING_CARD_GRADIENT_STEPS; i++) {
@@ -1042,13 +1045,64 @@ function buildCardGradientFilters(bandY, bandH, inputLabel) {
     const alpha = (CLOSING_CARD_GRADIENT_PEAK_ALPHA * (1 - Math.cos(posInBand * Math.PI * 2))) / 2;
     const alphaClamped = Math.max(0, Math.min(CLOSING_CARD_GRADIENT_PEAK_ALPHA, alpha)).toFixed(3);
     const outLabel = `cg${i}`;
-    filters.push(`[${prevLabel}]drawbox=x=0:y=${sliceY}:w=1920:h=${sliceH}:color=black@${alphaClamped}:t=fill[${outLabel}]`);
+    filters.push(`[${prevLabel}]drawbox=x=0:y=${sliceY}:w=${canvasW || 1920}:h=${sliceH}:color=black@${alphaClamped}:t=fill[${outLabel}]`);
     prevLabel = outLabel;
   }
   return { filters, outLabel: prevLabel };
 }
 
-function renderClosingCardClip(stillImagePath, addressLine, ctaLine, workDir, fps) {
+// Greedy word wrap for the vertical card; prefers breaking after commas.
+function wrapCardText(text, maxChars) {
+  const words = String(text || "").trim().split(/\s+/).filter(Boolean);
+  const lines = [];
+  let cur = "";
+  for (const w of words) {
+    if (!cur) { cur = w; continue; }
+    if ((cur + " " + w).length <= maxChars) { cur += " " + w; }
+    else { lines.push(cur); cur = w; }
+    if (cur.endsWith(",") && cur.length >= maxChars * 0.5) { lines.push(cur); cur = ""; }
+  }
+  if (cur) lines.push(cur);
+  return lines.length ? lines : [""];
+}
+
+// Composites the fixed AB 723 badge onto an existing clip (used for Kling
+// output, which is generated from the CLEAN staged image). Returns the new
+// clip path; on any failure returns the original path (never breaks a render
+// — but logs loudly, since an un-badged staged clip is a compliance gap).
+function overlayBadgeOnClip(clipPath, badgePng, workDir, outputName, vertical) {
+  return new Promise((resolve) => {
+    ffmpeg.ffprobe(clipPath, (err, meta) => {
+      const vs = !err && meta && meta.streams && meta.streams.find((x) => x.codec_type === "video");
+      if (!vs) {
+        console.error(`[overlayBadgeOnClip] [BADGE MISSING] could not probe ${clipPath}: ${err && err.message}`);
+        return resolve(clipPath);
+      }
+      const W = vs.width, H = vs.height, geo = badgeGeometry(!!vertical);
+      const outputPath = path.join(workDir, outputName);
+      ffmpeg(clipPath)
+        .input(badgePng)
+        .complexFilter([
+          `[1:v]scale=${Math.round(W * geo.wFrac)}:-1[bdg]`,
+          `[0:v][bdg]overlay=x=${Math.round(W * geo.leftFrac)}:y=H-h-${Math.round(H * geo.bottomFrac)}[outv]`,
+        ])
+        .outputOptions(["-map", "[outv]", "-pix_fmt", "yuv420p", "-c:v", "libx264", "-preset", "fast", "-crf", "18"])
+        .noAudio()
+        .output(outputPath)
+        .on("end", () => resolve(outputPath))
+        .on("error", (e) => {
+          console.error(`[overlayBadgeOnClip] [BADGE MISSING] overlay failed for ${clipPath}: ${e.message}`);
+          resolve(clipPath);
+        })
+        .run();
+    });
+  });
+}
+
+function renderClosingCardClip(stillImagePath, addressLine, ctaLine, workDir, fps, opts) {
+  const vertical = !!(opts && opts.vertical);
+  const focalX = vertical && opts && opts.focal && Number.isFinite(opts.focal.fx) ? opts.focal.fx : 0.5;
+  const badgePng = (opts && opts.badgePng) || null;
   return new Promise((resolve, reject) => {
     const outputPath = path.join(workDir, "closing_card.mp4");
     const command = ffmpeg()
@@ -1066,37 +1120,74 @@ function renderClosingCardClip(stillImagePath, addressLine, ctaLine, workDir, fp
     // narration timing at all anymore, since the card only ever starts
     // after the main video (narration + its buffer) has already ended.
     const alphaExpr = `min(1,t/${CLOSING_CARD_FADE_SECONDS})`;
-    const bandY = Math.round(1080 * CLOSING_CARD_BAND_Y_START_FRAC);
-    const bandH = Math.round(1080 * CLOSING_CARD_BAND_HEIGHT_FRAC);
+    const CW = vertical ? 1080 : 1920;
+    const CH = vertical ? 1920 : 1080;
+    // Vertical: band centred at ~45% of the height so text clears the
+    // platform caption/UI zone at the bottom of Reels/Shorts/TikTok.
+    const bandStartFrac = vertical ? 0.30 : CLOSING_CARD_BAND_Y_START_FRAC;
+    const bandY = Math.round(CH * bandStartFrac);
+    const bandH = Math.round(CH * CLOSING_CARD_BAND_HEIGHT_FRAC);
 
-    // scale+crop handles native-resolution source photos correctly
-    // regardless of their real dimensions (this part was already right
-    // in the original build) — the fix this session is everything after
-    // it: a real gradient instead of a flat darken.
-    const { filters: gradientFilters, outLabel: gradientOut } = buildCardGradientFilters(bandY, bandH, "scaled");
-    const filterParts = [
-      `[0:v]scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080[scaled]`,
-      ...gradientFilters,
-    ];
-
-    // FIX (July 17, 2026 — real render, first card ever seen on screen):
-    // was one drawtext with address + CTA jammed into a single line at a
-    // single fontsize (54) — Sam's real screenshot showed it cramped and
-    // hard to read. drawtext doesn't handle multi-line text reliably in
-    // one call, so this is two separate stacked drawtext filters instead:
-    // address (if present) smaller, above center; CTA larger, below
-    // center — CTA is the action we actually want taken, so it gets the
-    // visual weight. Degrades gracefully to a single centered CTA line
-    // (old single-line layout) when there's no address at all.
-    if (addressLine) {
+    const { filters: gradientFilters, outLabel: gradientOut } = buildCardGradientFilters(bandY, bandH, "scaled", CW);
+    const filterParts = [];
+    if (vertical) {
+      // Cover-scale then crop a 9:16 window centred on the subject focal
+      // point (same focal the Ken Burns clips use) instead of a blind centre crop.
       filterParts.push(
-        `[${gradientOut}]drawtext=text='${escapeDrawtext(addressLine)}':fontcolor=${CLOSING_CARD_TEXT_COLOR}:fontsize=42:borderw=2:bordercolor=black@0.6:x=(w-text_w)/2:y=(h/2)-60:alpha='${alphaExpr}'[with_addr]`,
-        `[with_addr]drawtext=text='${escapeDrawtext(ctaLine)}':fontcolor=${CLOSING_CARD_TEXT_COLOR}:fontsize=68:borderw=3:bordercolor=black@0.6:x=(w-text_w)/2:y=(h/2)+10:alpha='${alphaExpr}'[outv]`
+        `[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920:x='min(max(iw*${focalX.toFixed(4)}-540,0),iw-1080)':y='(ih-1920)/2'[scaled]`
       );
     } else {
+      filterParts.push(`[0:v]scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080[scaled]`);
+    }
+    filterParts.push(...gradientFilters);
+
+    // FIX (July 17, 2026 — real render, first card ever seen on screen):
+    // two stacked drawtext blocks — address smaller above, CTA larger
+    // below. Vertical wraps each onto short centred lines (1080px wide).
+    let textLabel = gradientOut;
+    if (!vertical) {
+      textLabel = "withtext";
+      if (addressLine) {
+        filterParts.push(
+          `[${gradientOut}]drawtext=text='${escapeDrawtext(addressLine)}':fontcolor=${CLOSING_CARD_TEXT_COLOR}:fontsize=42:borderw=2:bordercolor=black@0.6:x=(w-text_w)/2:y=(h/2)-60:alpha='${alphaExpr}'[with_addr]`,
+          `[with_addr]drawtext=text='${escapeDrawtext(ctaLine)}':fontcolor=${CLOSING_CARD_TEXT_COLOR}:fontsize=68:borderw=3:bordercolor=black@0.6:x=(w-text_w)/2:y=(h/2)+10:alpha='${alphaExpr}'[withtext]`
+        );
+      } else {
+        filterParts.push(
+          `[${gradientOut}]drawtext=text='${escapeDrawtext(ctaLine)}':fontcolor=${CLOSING_CARD_TEXT_COLOR}:fontsize=68:borderw=3:bordercolor=black@0.6:x=(w-text_w)/2:y=(h-text_h)/2:alpha='${alphaExpr}'[withtext]`
+        );
+      }
+    } else {
+      const addrLines = addressLine ? wrapCardText(addressLine, 24) : [];
+      const ctaLines  = wrapCardText(ctaLine, 16);
+      const ADDR_FS = 54, ADDR_LH = 70, CTA_FS = 84, CTA_LH = 104, GAP = addrLines.length ? 36 : 0;
+      const blockH = addrLines.length * ADDR_LH + GAP + ctaLines.length * CTA_LH;
+      let y = Math.round(bandY + bandH / 2 - blockH / 2);
+      let prev = gradientOut;
+      let n = 0;
+      const addLine = (txt, fs, lh, bw) => {
+        const out = `vt${n++}`;
+        filterParts.push(
+          `[${prev}]drawtext=text='${escapeDrawtext(txt)}':fontcolor=${CLOSING_CARD_TEXT_COLOR}:fontsize=${fs}:borderw=${bw}:bordercolor=black@0.6:x=(w-text_w)/2:y=${y}:alpha='${alphaExpr}'[${out}]`
+        );
+        prev = out; y += lh;
+      };
+      addrLines.forEach((l) => addLine(l, ADDR_FS, ADDR_LH, 2));
+      y += GAP;
+      ctaLines.forEach((l) => addLine(l, CTA_FS, CTA_LH, 3));
+      textLabel = prev;
+    }
+
+    // Fixed AB 723 badge overlay (clean-copy architecture) — drawn last, never faded.
+    if (badgePng) {
+      const geo = badgeGeometry(vertical);
+      command.input(badgePng);
       filterParts.push(
-        `[${gradientOut}]drawtext=text='${escapeDrawtext(ctaLine)}':fontcolor=${CLOSING_CARD_TEXT_COLOR}:fontsize=68:borderw=3:bordercolor=black@0.6:x=(w-text_w)/2:y=(h-text_h)/2:alpha='${alphaExpr}'[outv]`
+        `[1:v]scale=${Math.round(CW * geo.wFrac)}:-1[bdg]`,
+        `[${textLabel}][bdg]overlay=x=${Math.round(CW * geo.leftFrac)}:y=H-h-${Math.round(CH * geo.bottomFrac)}[outv]`
       );
+    } else {
+      filterParts.push(`[${textLabel}]null[outv]`);
     }
 
     // Standalone single-image render — much simpler than the old
@@ -1181,13 +1272,17 @@ function buildCardAudioStinger(musicPath, workDir) {
 // concats the card's own short stinger onto the end of the main audio
 // track. No dependency on the main track's internal duration/fade math
 // at all; the two audio pieces are simply placed back to back.
-function appendClosingCardWithAudio(mainPath, closingCard, musicPath, workDir) {
+function appendClosingCardWithAudio(mainPath, closingCard, musicPath, workDir, opts) {
   return new Promise(async (resolve, reject) => {
     try {
       const outputPath = path.join(workDir, "with_closing_card.mp4");
       const mainDuration = await probeDuration(mainPath);
       const fps = await probeFps(mainPath);
-      const cardPath = await renderClosingCardClip(closingCard.stillImagePath, closingCard.addressLine, closingCard.ctaLine, workDir, fps);
+      const cardPath = await renderClosingCardClip(closingCard.stillImagePath, closingCard.addressLine, closingCard.ctaLine, workDir, fps, {
+        vertical: !!(opts && opts.vertical),
+        focal: closingCard.focal || null,
+        badgePng: closingCard.badgePng || null,
+      });
       const cardAudioPath = await buildCardAudioStinger(musicPath, workDir);
 
       const command = ffmpeg().input(mainPath).input(cardPath).input(cardAudioPath);
@@ -1230,8 +1325,13 @@ function appendClosingCardWithAudio(mainPath, closingCard, musicPath, workDir) {
   });
 }
 
-async function assembleVideo({ clipPaths, musicPath, narrationSegments, formats, workDir, closingCard }) {
-  let concatenated = await concatenateClips(clipPaths, workDir);
+// nativeVertical (new): clipPaths are already native 1080x1920 clips (rendered
+// from the full photo by motionRenderer.py) — the canvas is 1080x1920 end to
+// end and the final step is a plain scale/pad pass-through, NOT the legacy
+// centre-crop of a 16:9 master. Default (undefined) = exactly the old behaviour.
+async function assembleVideo({ clipPaths, musicPath, narrationSegments, formats, workDir, closingCard, nativeVertical }) {
+  const canvas = nativeVertical ? { w: 1080, h: 1920 } : undefined;
+  let concatenated = await concatenateClips(clipPaths, workDir, canvas);
 
   // CHANGE (July 17, 2026 — see appendClosingCardWithAudio's header
   // comment above for the full reasoning): mixAudio now runs on the
@@ -1260,7 +1360,7 @@ async function assembleVideo({ clipPaths, musicPath, narrationSegments, formats,
   if (closingCard) {
     try {
       console.log("[assembleVideo] Appending closing card with music stinger...");
-      withMusic = await appendClosingCardWithAudio(withMusic, closingCard, musicPath, workDir);
+      withMusic = await appendClosingCardWithAudio(withMusic, closingCard, musicPath, workDir, { vertical: !!nativeVertical });
     } catch (err) {
       console.warn(`Closing card skipped (non-fatal, video proceeds without it): ${err.message}`);
     }
@@ -1272,10 +1372,10 @@ async function assembleVideo({ clipPaths, musicPath, narrationSegments, formats,
     outputs["16x9"] = await renderFormat(withMusic, "1920x1080", workDir, "output_16x9.mp4");
   }
   if (formats.includes("9x16")) {
-    outputs["9x16"] = await renderFormat(withMusic, "1080x1920", workDir, "output_9x16.mp4");
+    outputs["9x16"] = await renderFormat(withMusic, "1080x1920", workDir, "output_9x16.mp4", !!nativeVertical);
   }
 
   return outputs;
 }
 
-module.exports = { assembleVideo, buildRevealClip, REVEAL_PRESETS, REVEAL_OPENER_DURATION, REVEAL_WIPE_DURATION, REVEAL_CONTINUATION_DURATION, concatenateClips, mixAudio, renderFormat, computeClipTimeline, extractMidpointFrame, probeDuration, mapWithConcurrencyLimit, FFMPEG_CONCURRENCY_LIMIT, NARRATION_END_BUFFER_SECONDS };
+module.exports = { overlayBadgeOnClip, assembleVideo, buildRevealClip, REVEAL_PRESETS, REVEAL_OPENER_DURATION, REVEAL_WIPE_DURATION, REVEAL_CONTINUATION_DURATION, concatenateClips, mixAudio, renderFormat, computeClipTimeline, extractMidpointFrame, probeDuration, mapWithConcurrencyLimit, FFMPEG_CONCURRENCY_LIMIT, NARRATION_END_BUFFER_SECONDS };
