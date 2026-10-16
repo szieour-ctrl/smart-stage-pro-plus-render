@@ -266,7 +266,7 @@ function xfadeChain(paths, durations, workDir, outputName) {
     // gives it a generous window (this file's own batches are small,
     // ≤3 clips each) before force-killing the process and failing
     // cleanly instead of silently consuming Railway resources forever.
-    const XFADE_TIMEOUT_MS = 120000; // 2 minutes — generous for a ≤3-clip batch
+    const XFADE_TIMEOUT_MS = 300000; // 5 min — both formats now assemble concurrently, so ffmpeg runs slower under load
     let settled = false;
     const timeoutHandle = setTimeout(() => {
       if (settled) return;
@@ -1205,7 +1205,7 @@ function renderClosingCardClip(stillImagePath, addressLine, ctaLine, workDir, fp
     // Standalone single-image render — much simpler than the old
     // overlay version, so 30s is generous rather than needing the full
     // 60s the old, more complex filter graph was given.
-    const CLOSING_CARD_TIMEOUT_MS = 30000;
+    const CLOSING_CARD_TIMEOUT_MS = 120000; // was 30s — raised: both formats assemble concurrently
     let settled = false;
     const timeoutHandle = setTimeout(() => {
       if (settled) return;
@@ -1304,7 +1304,7 @@ function appendClosingCardWithAudio(mainPath, closingCard, musicPath, workDir, o
         `[0:a][2:a]concat=n=2:v=0:a=1[outa]`,
       ];
 
-      const CARD_APPEND_TIMEOUT_MS = 60000;
+      const CARD_APPEND_TIMEOUT_MS = 300000; // was 60s — re-encodes the whole video and now shares CPU with the other format's assembly
       let settled = false;
       const timeoutHandle = setTimeout(() => {
         if (settled) return;
@@ -1372,9 +1372,15 @@ async function assembleVideo({ clipPaths, musicPath, narrationSegments, formats,
   if (closingCard) {
     try {
       console.log("[assembleVideo] Appending closing card with music stinger...");
-      withMusic = await appendClosingCardWithAudio(withMusic, closingCard, musicPath, workDir, { vertical: !!nativeVertical });
+      try {
+        withMusic = await appendClosingCardWithAudio(withMusic, closingCard, musicPath, workDir, { vertical: !!nativeVertical });
+      } catch (firstErr) {
+        // One retry — a transient failure (e.g. CPU contention) shouldn't silently drop the end card.
+        console.warn(`Closing card attempt 1 failed (${firstErr.message}) — retrying once...`);
+        withMusic = await appendClosingCardWithAudio(withMusic, closingCard, musicPath, workDir, { vertical: !!nativeVertical });
+      }
     } catch (err) {
-      console.warn(`Closing card skipped (non-fatal, video proceeds without it): ${err.message}`);
+      console.error(`[END CARD MISSING] Closing card skipped (non-fatal, video proceeds without it): ${err.message}`);
     }
   }
 
