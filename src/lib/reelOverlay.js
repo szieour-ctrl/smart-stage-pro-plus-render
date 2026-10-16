@@ -83,7 +83,10 @@ async function prepLogo(buf) {
   return { buf: out, w: m.width, h: m.height };
 }
 
-async function justListedSvg(p) {
+// part: "opening" (headline/address/details pill), "closing" (details + CTA + identity panel),
+// or "all". The two parts are separate layers so each appears only in its own clip.
+async function justListedSvg(p, part = "all") {
+  const showTop = part !== "closing", showBottom = part !== "opening";
   const brand = p.brand || {};
   const prim = hex(brand.primary, "#B8860B");
   const sec = hex(brand.secondary, "#0B2545");
@@ -96,6 +99,8 @@ async function justListedSvg(p) {
   const as = fit(p.address, 920, 56, 36, 0.6);
   const ds = fit(detail, 880, 40, 28, 0.58);
   const cs = fit(cta, 560, 38, 26, 0.64);
+  const dsO = fit(detail, 860, 40, 28, 0.58);
+  const pillW = Math.min(940, Math.round(detail.length * dsO * 0.58) + 96);
   const ctaW = Math.min(820, Math.max(520, cta.length * cs * 0.66 + 110));
 
   const warnings = p.warnings;
@@ -164,16 +169,19 @@ async function justListedSvg(p) {
     <linearGradient id="t" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#000" stop-opacity="0.6"/><stop offset="1" stop-color="#000" stop-opacity="0"/></linearGradient>
     <linearGradient id="b" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#000" stop-opacity="0"/><stop offset="1" stop-color="#000" stop-opacity="0.55"/></linearGradient>
   </defs>
-  <rect x="0" y="0" width="${W}" height="760" fill="url(#t)"/>
-  <rect x="0" y="${panelY - 120}" width="${W}" height="${H - panelY + 120}" fill="url(#b)"/>
+${showTop ? `  <rect x="0" y="0" width="${W}" height="760" fill="url(#t)"/>
   <text x="${W / 2}" y="400" text-anchor="middle" font-family="Montserrat" font-weight="700" font-size="${hs}" fill="#fff" letter-spacing="4">${esc(headline)}</text>
   <rect x="${W / 2 - 90}" y="436" width="180" height="6" rx="3" fill="${prim}"/>
   <text x="${W / 2}" y="512" text-anchor="middle" font-family="Montserrat" font-weight="600" font-size="${as}" fill="#fff">${esc(p.address)}</text>
   ${p.cityLine ? `<text x="${W / 2}" y="568" text-anchor="middle" font-family="Montserrat" font-weight="500" font-size="34" fill="#fff" fill-opacity="0.9">${esc(p.cityLine)}</text>` : ""}
+  ${hasDetail ? `<rect x="${(W - pillW) / 2}" y="604" width="${pillW}" height="74" rx="37" fill="${sec}" fill-opacity="0.94" stroke="${bord}" stroke-width="3"/>
+  <text x="${W / 2}" y="654" text-anchor="middle" font-family="Montserrat" font-weight="600" font-size="${dsO}" fill="${ink}">${esc(detail)}</text>` : ""}` : ""}
+${showBottom ? `  <rect x="0" y="${panelY - 120}" width="${W}" height="${H - panelY + 120}" fill="url(#b)"/>
   <rect x="60" y="${panelY}" width="960" height="${panelH}" rx="28" fill="${sec}" fill-opacity="0.94" stroke="${bord}" stroke-width="3"/>
   ${hasDetail ? `<text x="${W / 2}" y="${detailBase}" text-anchor="middle" font-family="Montserrat" font-weight="600" font-size="${ds}" fill="${ink}">${esc(detail)}</text>` : ""}
   <rect x="${W / 2 - ctaW / 2}" y="${ctaY}" width="${ctaW}" height="76" rx="38" fill="${prim}"/>
   <text x="${W / 2}" y="${ctaY + 50}" text-anchor="middle" font-family="Montserrat" font-weight="700" font-size="${cs}" fill="${textOn(prim)}" letter-spacing="1">${esc(cta)}</text>${identity}
+` : ""}
 </svg>`;
 }
 
@@ -185,8 +193,8 @@ function fitText(text, maxW, size, k = 0.58) {
 
 // params.logoBuf / params.headshotBuf: optional image Buffers from the Marketing Profile.
 // params.warnings: optional array; images that can't be decoded are skipped and reported there.
-async function renderBrandedOverlay(params, outPng) {
-  const svg = await justListedSvg(params);
+async function renderBrandedOverlay(params, outPng, part = "all") {
+  const svg = await justListedSvg(params, part);
   await sharp(Buffer.from(svg)).png().toFile(outPng);
   return outPng;
 }
@@ -251,7 +259,12 @@ async function compositeLayers(baseVideo, layers, outVideo) {
   let prev = "0:v";
   layers.forEach((l, i) => {
     const start = Math.max(0, l.startSec || 0), fade = l.fadeSec ?? 0.4;
-    parts.push(`[${i + 1}:v]format=rgba,fade=t=in:st=${start.toFixed(3)}:d=${fade}:alpha=1[ov${i}]`);
+    let f = `[${i + 1}:v]format=rgba,fade=t=in:st=${start.toFixed(3)}:d=${fade}:alpha=1`;
+    if (l.endSec != null) {
+      const fo = l.fadeOutSec ?? 0.4;
+      f += `,fade=t=out:st=${Math.max(start, l.endSec - fo).toFixed(3)}:d=${fo}:alpha=1`;
+    }
+    parts.push(`${f}[ov${i}]`);
     parts.push(`[${prev}][ov${i}]overlay=0:0:format=auto:shortest=1[v${i}]`);
     prev = `v${i}`;
   });
@@ -262,12 +275,27 @@ async function compositeLayers(baseVideo, layers, outVideo) {
   return outVideo;
 }
 
-// Convenience: build the layer list for a variant given already-rendered PNGs.
-// qrLeadSec = how long before the end the QR appears (and then holds to the end).
-async function compositeReel(baseVideo, { textPng, badgePng, qrPng }, outVideo, { qrLeadSec = 1.0 } = {}) {
+// Build the Reel timeline and composite it.
+//   openingPng — headline/address/details pill. Shown early, then fades out so it never sits on
+//                every room.
+//   closingPng — details + CTA + identity panel. Fades in as an overlay on the LAST photo and
+//                holds to the end (no separate end-card clip).
+//   badgePng   — AB 723 badge, always on.
+//   qrPng      — compliance QR, last qrLeadSec seconds, holds to the end.
+// Scene hooks (optional, seconds on the final timeline): firstSceneEndSec and lastSceneStartSec
+// let the real storyboard pin the opening and closing windows to actual clips. Without them the
+// windows are time-based (openSec from the start, closeSec before the end).
+async function compositeReel(baseVideo, { openingPng, closingPng, textPng, badgePng, qrPng }, outVideo, opts = {}) {
+  const { openStartSec = 0.4, openSec = 3.5, closeSec = 3.5, qrLeadSec = 1.0,
+    firstSceneEndSec = null, lastSceneStartSec = null } = opts;
   const dur = await probeDuration(baseVideo);
+  const openEnd = firstSceneEndSec != null ? Math.max(openStartSec + 1, firstSceneEndSec - 0.2) : openStartSec + openSec;
+  let closeStart = lastSceneStartSec != null ? lastSceneStartSec + 0.4 : dur - closeSec;
+  closeStart = Math.min(Math.max(closeStart, openEnd), Math.max(0, dur - 1.5));
   const layers = [];
-  if (textPng) layers.push({ png: textPng, startSec: 0.5, fadeSec: 0.4 });
+  if (textPng) layers.push({ png: textPng, startSec: 0.5, fadeSec: 0.4 }); // legacy single-layer
+  if (openingPng) layers.push({ png: openingPng, startSec: openStartSec, fadeSec: 0.4, endSec: openEnd, fadeOutSec: 0.4 });
+  if (closingPng) layers.push({ png: closingPng, startSec: closeStart, fadeSec: 0.5 });
   if (badgePng) layers.push({ png: badgePng, startSec: 0, fadeSec: 0.2 });
   if (qrPng) layers.push({ png: qrPng, startSec: Math.max(0, dur - qrLeadSec), fadeSec: 0.3 });
   return compositeLayers(baseVideo, layers, outVideo);
