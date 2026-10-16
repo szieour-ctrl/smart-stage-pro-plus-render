@@ -9,6 +9,7 @@
 
 require("dotenv").config();
 const express = require("express");
+const axios = require("axios");
 const os = require("os");
 const path = require("path");
 const fs = require("fs");
@@ -24,7 +25,7 @@ const { runHdrTest } = require("./lib/hdrTestPipeline");
 const { downloadFrames } = require("./lib/downloadFrames");
 const { applyMotionPreset, VALID_PRESETS } = require("./lib/motionPresets");
 const { uploadScratchFile } = require("./lib/s3Upload");
-const { renderBrandedOverlay, renderUnbrandedOverlay, compositeOverlay } = require("./lib/reelOverlay");
+const { renderBrandedOverlay, renderBadgeLayer, renderQrLayer, compositeReel } = require("./lib/reelOverlay");
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
@@ -462,6 +463,7 @@ app.get("/test-motion", requireSecret, async (req, res) => {
 //   /test-reel-overlay?imageUrl=<url>&address=<street>&cityLine=<city>
 //     &price=<text>&beds=<n>&baths=<n>&sqft=<n>&name=<licensed name>
 //     &dre=<DRE#>&brokerage=<name>&duration=<seconds, default 8>
+//     &logoUrl=<public image url>&headshotUrl=<public image url>   (both optional)
 //   x-railway-secret header required, same as /test-motion.
 //
 // Remove once the Reels overlay engine is promoted out of spike status.
@@ -470,7 +472,7 @@ app.get("/test-reel-overlay", requireSecret, async (req, res) => {
   if (!q.imageUrl) {
     return res.status(400).json({
       error: "Missing required query param: imageUrl",
-      optional: ["address", "cityLine", "price", "beds", "baths", "sqft", "name", "dre", "brokerage", "duration"],
+      optional: ["address", "cityLine", "price", "beds", "baths", "sqft", "name", "dre", "brokerage", "duration", "logoUrl", "headshotUrl"],
     });
   }
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "test-reel-overlay-"));
@@ -486,22 +488,32 @@ app.get("/test-reel-overlay", requireSecret, async (req, res) => {
 
     const details = [q.price, q.beds && `${q.beds} Bd`, q.baths && `${q.baths} Ba`, q.sqft && `${Number(q.sqft).toLocaleString("en-US")} Sq Ft`];
     const t1 = Date.now();
-    const brandedPng = await renderBrandedOverlay({
+    // Optional Marketing Profile images (public URLs). A failed fetch just falls back to text-only.
+    const fetchBuf = async (u) => {
+      if (!u) return null;
+      try { return Buffer.from((await axios.get(u, { responseType: "arraybuffer", timeout: 15000 })).data); }
+      catch (e) { console.warn(`[test-reel-overlay] could not fetch ${u}: ${e.message}`); return null; }
+    };
+    const [logoBuf, headshotBuf] = await Promise.all([fetchBuf(q.logoUrl), fetchBuf(q.headshotUrl)]);
+    const textPng = await renderBrandedOverlay({
       headline: "JUST LISTED",
       address: q.address || "123 Example Street",
       cityLine: q.cityLine || "",
       details,
       cta: "Schedule a Private Tour",
       brand: { licensedName: q.name || "", dre: q.dre || "", brokerage: q.brokerage || "" },
-    }, path.join(workDir, "overlay_branded.png"));
+      logoBuf, headshotBuf,
+    }, path.join(workDir, "overlay_text.png"));
+    const badgePng = await renderBadgeLayer({ badgeType: "virtually_staged" }, path.join(workDir, "overlay_badge.png"));
     const QRCode = require("qrcode");
-    const qrPng = await QRCode.toBuffer("https://smartstagepro.com", { margin: 1, width: 200 });
-    const unbrandedPng = await renderUnbrandedOverlay({ badgeType: "virtually_staged", qrPng }, path.join(workDir, "overlay_unbranded.png"));
+    const qrBuf = await QRCode.toBuffer("https://smartstagepro.com", { margin: 1, width: 300 });
+    const qrPng = await renderQrLayer({ qrPng: qrBuf }, path.join(workDir, "overlay_qr.png"));
     const overlayMs = Date.now() - t1;
 
+    // BRANDED = text + badge + end QR. UNBRANDED (MLS) = badge + end QR only.
     const t2 = Date.now();
-    const brandedMp4 = await compositeOverlay(base.path, brandedPng, path.join(workDir, "reel_branded.mp4"));
-    const unbrandedMp4 = await compositeOverlay(base.path, unbrandedPng, path.join(workDir, "reel_unbranded.mp4"));
+    const brandedMp4 = await compositeReel(base.path, { textPng, badgePng, qrPng }, path.join(workDir, "reel_branded.mp4"));
+    const unbrandedMp4 = await compositeReel(base.path, { badgePng, qrPng }, path.join(workDir, "reel_unbranded.mp4"));
     const compositeMs = Date.now() - t2;
 
     const stamp = Date.now();
