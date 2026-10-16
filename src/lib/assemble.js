@@ -266,7 +266,7 @@ function xfadeChain(paths, durations, workDir, outputName) {
     // gives it a generous window (this file's own batches are small,
     // ≤3 clips each) before force-killing the process and failing
     // cleanly instead of silently consuming Railway resources forever.
-    const XFADE_TIMEOUT_MS = 120000; // 2 minutes — generous for a ≤3-clip batch
+    const XFADE_TIMEOUT_MS = 300000; // 5 min — both formats now assemble concurrently, so ffmpeg runs slower under load
     let settled = false;
     const timeoutHandle = setTimeout(() => {
       if (settled) return;
@@ -278,7 +278,7 @@ function xfadeChain(paths, durations, workDir, outputName) {
 
     command
       .complexFilter(filterParts)
-      .outputOptions(["-map", "[outv]", "-pix_fmt", "yuv420p"])
+      .outputOptions(["-map", "[outv]", "-pix_fmt", "yuv420p", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20"])
       .output(outputPath)
       .on("end", async () => {
         if (settled) return;
@@ -703,7 +703,7 @@ function buildRevealClip(beforeClipPath, afterClipPath, presetKey, workDir, outp
         `[1:v]trim=duration=${continuationDuration},setpts=PTS-STARTPTS[continuation]`,
         `[opener][continuation]xfade=transition=${preset.wipeTransition}:duration=${REVEAL_WIPE_DURATION}:offset=${offset}[out]`,
       ])
-      .outputOptions(["-map", "[out]", "-pix_fmt", "yuv420p"])
+      .outputOptions(["-map", "[out]", "-pix_fmt", "yuv420p", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20"])
       .output(outputPath)
       .on("end", () => resolve(outputPath))
       .on("error", (err) => reject(new Error(`Reveal Preset "${presetKey}" wipe failed: ${err.message}`)))
@@ -944,20 +944,32 @@ function renderFormat(inputPath, dimensions, workDir, outputName, nativeVertical
     const outputPath = path.join(workDir, outputName);
     const [w, h] = dimensions.split("x");
 
-    // 9:16 reframe crops to center — smart subject-aware cropping is a
-    // Phase 2B refinement; center crop is the correct safe default for v1.
-    const filter =
-      dimensions === "1080x1920" && !nativeVertical
-        ? `crop=ih*9/16:ih,scale=${w}:${h}`
-        : `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2`;
+    // Legacy 9:16 reframe crops to the centre of the 16:9 master (only used when native
+    // 9:16 is off, i.e. legacy payloads).
+    const legacyCrop = dimensions === "1080x1920" && !nativeVertical;
+    const filter = legacyCrop
+      ? `crop=ih*9/16:ih,scale=${w}:${h}`
+      : `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2`;
 
-    ffmpeg(inputPath)
-      .videoFilters(filter)
-      .outputOptions(["-c:a", "copy", "-movflags", "+faststart"])
-      .output(outputPath)
-      .on("end", () => resolve(outputPath))
-      .on("error", (err) => reject(new Error(`Format render failed (${dimensions}): ${err.message}`)))
-      .run();
+    // SPEED: when the assembled video is ALREADY the target size (the normal case now —
+    // 16:9 clips are 1920x1080 and native 9:16 clips are 1080x1920), the scale/pad is a
+    // no-op, so stream-copy instead of re-encoding the entire video a final time.
+    ffmpeg.ffprobe(inputPath, (probeErr, meta) => {
+      const vs = !probeErr && meta && meta.streams && meta.streams.find((x) => x.codec_type === "video");
+      const alreadyTarget = !legacyCrop && vs && String(vs.width) === w && String(vs.height) === h;
+
+      const cmd = ffmpeg(inputPath);
+      if (alreadyTarget) {
+        cmd.outputOptions(["-c", "copy", "-movflags", "+faststart"]);
+      } else {
+        cmd.videoFilters(filter)
+           .outputOptions(["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-c:a", "copy", "-movflags", "+faststart"]);
+      }
+      cmd.output(outputPath)
+        .on("end", () => resolve(outputPath))
+        .on("error", (err) => reject(new Error(`Format render failed (${dimensions}): ${err.message}`)))
+        .run();
+    });
   });
 }
 
@@ -1193,7 +1205,7 @@ function renderClosingCardClip(stillImagePath, addressLine, ctaLine, workDir, fp
     // Standalone single-image render — much simpler than the old
     // overlay version, so 30s is generous rather than needing the full
     // 60s the old, more complex filter graph was given.
-    const CLOSING_CARD_TIMEOUT_MS = 30000;
+    const CLOSING_CARD_TIMEOUT_MS = 120000; // was 30s — raised: both formats assemble concurrently
     let settled = false;
     const timeoutHandle = setTimeout(() => {
       if (settled) return;
@@ -1292,7 +1304,7 @@ function appendClosingCardWithAudio(mainPath, closingCard, musicPath, workDir, o
         `[0:a][2:a]concat=n=2:v=0:a=1[outa]`,
       ];
 
-      const CARD_APPEND_TIMEOUT_MS = 60000;
+      const CARD_APPEND_TIMEOUT_MS = 300000; // was 60s — re-encodes the whole video and now shares CPU with the other format's assembly
       let settled = false;
       const timeoutHandle = setTimeout(() => {
         if (settled) return;
@@ -1304,7 +1316,7 @@ function appendClosingCardWithAudio(mainPath, closingCard, musicPath, workDir, o
 
       command
         .complexFilter(filterParts)
-        .outputOptions(["-map", "[outv]", "-map", "[outa]", "-c:v", "libx264", "-c:a", "aac", "-pix_fmt", "yuv420p"])
+        .outputOptions(["-map", "[outv]", "-map", "[outa]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-c:a", "aac", "-pix_fmt", "yuv420p"])
         .output(outputPath)
         .on("end", () => {
           if (settled) return;
@@ -1360,9 +1372,15 @@ async function assembleVideo({ clipPaths, musicPath, narrationSegments, formats,
   if (closingCard) {
     try {
       console.log("[assembleVideo] Appending closing card with music stinger...");
-      withMusic = await appendClosingCardWithAudio(withMusic, closingCard, musicPath, workDir, { vertical: !!nativeVertical });
+      try {
+        withMusic = await appendClosingCardWithAudio(withMusic, closingCard, musicPath, workDir, { vertical: !!nativeVertical });
+      } catch (firstErr) {
+        // One retry — a transient failure (e.g. CPU contention) shouldn't silently drop the end card.
+        console.warn(`Closing card attempt 1 failed (${firstErr.message}) — retrying once...`);
+        withMusic = await appendClosingCardWithAudio(withMusic, closingCard, musicPath, workDir, { vertical: !!nativeVertical });
+      }
     } catch (err) {
-      console.warn(`Closing card skipped (non-fatal, video proceeds without it): ${err.message}`);
+      console.error(`[END CARD MISSING] Closing card skipped (non-fatal, video proceeds without it): ${err.message}`);
     }
   }
 
