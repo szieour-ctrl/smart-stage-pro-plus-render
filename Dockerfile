@@ -13,6 +13,7 @@ RUN apt-get update && \
         python3-pip \
         libglib2.0-0 \
         libimage-exiftool-perl \
+        fontconfig \
     && rm -rf /var/lib/apt/lists/*
 
 # Python dependencies for motionRenderer.py
@@ -27,6 +28,11 @@ RUN pip3 install --no-cache-dir --break-system-packages \
     opencv-python-headless \
     numpy \
     scikit-image
+
+# Reels overlay fonts (Montserrat, OFL) — installed system-wide so sharp's
+# librsvg text rendering resolves font-family="Montserrat" via fontconfig.
+COPY src/assets/fonts/*.ttf /usr/local/share/fonts/sspp/
+RUN fc-cache -f
 
 WORKDIR /app
 
