@@ -513,6 +513,10 @@ app.get("/test-reel-overlay", requireSecret, async (req, res) => {
     };
     const openingPng = await renderBrandedOverlay(brandedParams, path.join(workDir, "overlay_opening.png"), "opening");
     const closingPng = await renderBrandedOverlay(brandedParams, path.join(workDir, "overlay_closing.png"), "closing");
+    // UNBRANDED (MLS) keeps headline/address/details/CTA but drops name, DRE, brokerage, headshot and logo.
+    const unbrandedParams = { ...brandedParams, unbranded: true, brand: {}, logoBuf: null, headshotBuf: null };
+    const uOpeningPng = await renderBrandedOverlay(unbrandedParams, path.join(workDir, "overlay_u_opening.png"), "opening");
+    const uClosingPng = await renderBrandedOverlay(unbrandedParams, path.join(workDir, "overlay_u_closing.png"), "closing");
     const badgePng = await renderBadgeLayer({ badgeType: "virtually_staged" }, path.join(workDir, "overlay_badge.png"));
     const QRCode = require("qrcode");
     const qrBuf = await QRCode.toBuffer("https://smartstagepro.com", { margin: 1, width: 300 });
@@ -520,10 +524,10 @@ app.get("/test-reel-overlay", requireSecret, async (req, res) => {
     const overlayMs = Date.now() - t1;
 
     // BRANDED = opening (headline/address/details) + closing overlay on the last photo (details/CTA/
-    // identity) + badge + end QR. UNBRANDED (MLS) = badge + end QR only.
+    // identity) + badge + end QR. UNBRANDED (MLS) = same minus identity.
     const t2 = Date.now();
     const brandedMp4 = await compositeReel(base.path, { openingPng, closingPng, badgePng, qrPng }, path.join(workDir, "reel_branded.mp4"));
-    const unbrandedMp4 = await compositeReel(base.path, { badgePng, qrPng }, path.join(workDir, "reel_unbranded.mp4"));
+    const unbrandedMp4 = await compositeReel(base.path, { openingPng: uOpeningPng, closingPng: uClosingPng, badgePng, qrPng }, path.join(workDir, "reel_unbranded.mp4"));
     const compositeMs = Date.now() - t2;
 
     const stamp = Date.now();
