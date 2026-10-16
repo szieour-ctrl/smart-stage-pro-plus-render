@@ -46,6 +46,21 @@ function textOn(bgHex) {
   return lum > 0.62 ? "#111111" : "#ffffff";
 }
 
+// Marketing Profile images come from user uploads / URLs, so never let a bad one (HEIC,
+// an HTML error page, a truncated file) fail the whole render. Returns the Buffer if sharp
+// can read it, else null plus a human-readable warning explaining what it actually was.
+async function usableImage(buf, label, warnings, hint = "") {
+  if (!buf) return null;
+  try {
+    await sharp(buf).metadata();
+    return buf;
+  } catch (e) {
+    const head = buf.subarray(0, 24).toString("latin1").replace(/[^\x20-\x7e]/g, ".");
+    if (warnings) warnings.push(`${label} skipped: ${String(e.message).replace(/\s+/g, " ").slice(0, 160)}${hint ? ` (content-type ${hint})` : ""}; first bytes "${head}"`);
+    return null;
+  }
+}
+
 const dataUri = (buf) => `data:image/png;base64,${buf.toString("base64")}`;
 
 // Headshot -> square 84px PNG (circle clip is applied in the SVG).
@@ -74,8 +89,16 @@ async function justListedSvg(p) {
   const cs = fit(cta, 560, 38, 26, 0.64);
   const ctaW = Math.min(820, Math.max(520, cta.length * cs * 0.66 + 110));
 
-  const headshot = p.headshotBuf ? await prepHeadshot(p.headshotBuf) : null;
-  const logo = p.logoBuf ? await prepLogo(p.logoBuf) : null;
+  const warnings = p.warnings;
+  let headshot = null, logo = null;
+  try {
+    const hb = await usableImage(p.headshotBuf, "headshot", warnings, p.headshotType);
+    headshot = hb ? await prepHeadshot(hb) : null;
+  } catch (e) { headshot = null; if (warnings) warnings.push(`headshot skipped: ${e.message}`); }
+  try {
+    const lb = await usableImage(p.logoBuf, "logo", warnings, p.logoType);
+    logo = lb ? await prepLogo(lb) : null;
+  } catch (e) { logo = null; if (warnings) warnings.push(`logo skipped: ${e.message}`); }
   const hasDetail = detail.length > 0;
   const hasIdentity = !!(brand.licensedName || brand.dre || brand.brokerage || headshot || logo);
 
@@ -152,6 +175,7 @@ function fitText(text, maxW, size, k = 0.58) {
 }
 
 // params.logoBuf / params.headshotBuf: optional image Buffers from the Marketing Profile.
+// params.warnings: optional array; images that can't be decoded are skipped and reported there.
 async function renderBrandedOverlay(params, outPng) {
   const svg = await justListedSvg(params);
   await sharp(Buffer.from(svg)).png().toFile(outPng);
