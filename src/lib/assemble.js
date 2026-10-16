@@ -5,6 +5,7 @@ const path = require("path");
 const fs = require("fs");
 const ffmpeg = require("fluent-ffmpeg");
 const { badgeGeometry } = require("./badgeAssets");
+const { compositeEndCard } = require("./reelOverlay");
 
 const CROSSFADE_DURATION = 0.6; // seconds between clips
 
@@ -1341,7 +1342,7 @@ function appendClosingCardWithAudio(mainPath, closingCard, musicPath, workDir, o
 // from the full photo by motionRenderer.py) — the canvas is 1080x1920 end to
 // end and the final step is a plain scale/pad pass-through, NOT the legacy
 // centre-crop of a 16:9 master. Default (undefined) = exactly the old behaviour.
-async function assembleVideo({ clipPaths, musicPath, narrationSegments, formats, workDir, closingCard, nativeVertical }) {
+async function assembleVideo({ clipPaths, musicPath, narrationSegments, formats, workDir, closingCard, nativeVertical, endOverlay }) {
   const canvas = nativeVertical ? { w: 1080, h: 1920 } : undefined;
   let concatenated = await concatenateClips(clipPaths, workDir, canvas);
 
@@ -1369,7 +1370,25 @@ async function assembleVideo({ clipPaths, musicPath, narrationSegments, formats,
   // closing card and its music fade should appear whenever the flag/
   // address/frame checks upstream in renderPipeline.js already passed,
   // regardless of whether narration happens to be on for this render.
-  if (closingCard) {
+  // END CARD AS OVERLAY (Oct 2026): endOverlay = { panelPng, qrPng } fades the closing panel in over
+  // the last ~3.5s of the finished video and adds the compliance QR for the final second. No
+  // appended clip and no audio change (mixAudio's output is only re-muxed, audio stream copied).
+  // If it fails, fall back to the legacy appended card (or nothing) — never fail the render.
+  // Legacy centre-crop 9:16 (not nativeVertical) can't share a landscape overlay (it would be
+  // cropped), so that format keeps the legacy appended card.
+  let cardInput = null; // video used for formats that take the overlay version
+  let usedOverlay = false;
+  if (endOverlay && (endOverlay.panelPng || endOverlay.qrPng) && process.env.END_FRAME_STYLE !== "appended") {
+    try {
+      console.log("[assembleVideo] Compositing end-card overlay (panel + QR) onto the final video...");
+      cardInput = await compositeEndCard(withMusic, endOverlay, path.join(workDir, "with_end_overlay.mp4"));
+      usedOverlay = true;
+    } catch (err) {
+      console.error(`[END CARD MISSING] overlay end card failed (${err.message}); falling back to legacy appended card if configured.`);
+    }
+  }
+  const needLegacyCrop = usedOverlay && !nativeVertical && formats.includes("9x16");
+  if (closingCard && (!usedOverlay || needLegacyCrop)) {
     try {
       console.log("[assembleVideo] Appending closing card with music stinger...");
       try {
@@ -1385,12 +1404,14 @@ async function assembleVideo({ clipPaths, musicPath, narrationSegments, formats,
   }
 
   const outputs = {};
+  // Overlay version feeds 16x9 and native 9x16; the legacy crop 9x16 uses withMusic (legacy card).
+  const mainSrc = usedOverlay ? cardInput : withMusic;
 
   if (formats.includes("16x9")) {
-    outputs["16x9"] = await renderFormat(withMusic, "1920x1080", workDir, "output_16x9.mp4");
+    outputs["16x9"] = await renderFormat(mainSrc, "1920x1080", workDir, "output_16x9.mp4");
   }
   if (formats.includes("9x16")) {
-    outputs["9x16"] = await renderFormat(withMusic, "1080x1920", workDir, "output_9x16.mp4", !!nativeVertical);
+    outputs["9x16"] = await renderFormat(nativeVertical ? mainSrc : withMusic, "1080x1920", workDir, "output_9x16.mp4", !!nativeVertical);
   }
 
   return outputs;

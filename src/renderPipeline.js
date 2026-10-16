@@ -41,6 +41,7 @@ const { notifyWebhook } = require("./lib/notify");
 // Feature-flagged and unbilled — see lib/endFrame.js's header comment
 // for the full kill-switch/billing/fallback reasoning.
 const { isEndFrameEnabled } = require("./lib/endFrame");
+const { buildEndOverlay } = require("./lib/endCardOverlay");
 
 // ── NARRATION VOICE LIBRARY ───────────────────────────────────────────
 // MUST stay in sync with NARRATION_VOICES in build-video-demo.html.
@@ -767,9 +768,18 @@ async function processRenderJob(job) {
     // Vertical clips have usually finished already (they render alongside the 16:9 loop).
     // Errors propagate on purpose: silently shipping a crop of a clean (badge-overlay)
     // 16:9 master could cut the AB 723 badge off.
+    // End card as an overlay (panel over the last seconds + compliance QR). Built per canvas; a build
+    // failure is non-fatal (assembleVideo then falls back to the legacy appended card).
+    const safeEndOverlay = async (canvas, tag) => {
+      try { return await buildEndOverlay(job, workDir, canvas, tag); }
+      catch (e) { console.error(`[${job.jobId}] [END CARD MISSING] overlay build failed (${canvas}): ${e.message}`); return null; }
+    };
+    const endOverlay16 = await safeEndOverlay("landscape", "16x9");
+    const endOverlay9 = nativeVertical ? await safeEndOverlay("portraitVideo", "9x16") : null;
+
     const pass1Formats = nativeVertical ? wantFormats.filter((f) => f !== "9x16") : wantFormats;
     const pass1Promise = pass1Formats.length > 0
-      ? assembleVideo({ clipPaths, musicPath, narrationSegments, formats: pass1Formats, workDir, closingCard })
+      ? assembleVideo({ clipPaths, musicPath, narrationSegments, formats: pass1Formats, workDir, closingCard, endOverlay: endOverlay16 })
       : Promise.resolve({});
     const pass2Promise = nativeVertical
       ? (async () => {
@@ -786,6 +796,7 @@ async function processRenderJob(job) {
             workDir: vAsmDir,
             closingCard: closingCard ? { ...closingCard, focal: lastFocal } : null,
             nativeVertical: true,
+            endOverlay: endOverlay9,
           });
         })()
       : Promise.resolve({});
