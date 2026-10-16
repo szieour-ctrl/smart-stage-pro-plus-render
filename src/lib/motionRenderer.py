@@ -109,6 +109,17 @@ def parse_args():
     # other caller (continuation phase, standalone Ken Burns), so nothing
     # else changes shape.
     p.add_argument("--label-text", default=None, dest="label_text")
+    # Native 9:16 mode (activated automatically when --output-h > --output-w):
+    # the FULL source photo is used (no center crop) and a 9:16 window is
+    # moved across it, anchored on --focal "fx,fy" (fractions of the photo,
+    # default 0.5,0.5). 16:9 rendering is unchanged by any of this.
+    p.add_argument("--focal", default=None,
+                   help="Subject focal point as 'fx,fy' fractions of the photo")
+    # Fixed compliance badge overlay (clean-copy approach). All optional.
+    p.add_argument("--badge-png", default=None, dest="badge_png")
+    p.add_argument("--badge-w-frac", type=float, default=0.30, dest="badge_w_frac")
+    p.add_argument("--badge-left-frac", type=float, default=0.02, dest="badge_left_frac")
+    p.add_argument("--badge-bottom-frac", type=float, default=0.18, dest="badge_bottom_frac")
     return p.parse_args()
 
 
@@ -445,6 +456,100 @@ def build_motion_curve(preset, n_frames, start_zoom):
     return curve
 
 
+# ── NATIVE 9:16 (VERTICAL) MODE ───────────────────────────────────────────────
+#
+# In vertical mode the "source" is the full uncropped photo and the camera is
+# a 9:16 window travelling across it. We reuse the exact same motion curves as
+# 16:9 (build_motion_curve) and translate them into window terms, so every
+# preset keeps its identity while the 16:9 table is never touched:
+#   zoom  -> 1 + (zoom - 1) * V_ZOOM_SCALE   (a 9:16 window is already tight,
+#                                              so zoom depth is toned down)
+#   pan_x -> pan_x * kx * window_width       (sweep sized relative to the
+#                                              window so the subject stays in view)
+#   pan_y -> pan_y * V_TILT_K                (fraction of photo height)
+# The window centre starts on the focal point and is clamped inside the photo.
+
+V_ZOOM_SCALE   = 0.8
+V_ATOMIC_SWEEP = 0.55   # atomic pans sweep ~55% of a window width
+V_COMPOUND_SWEEP = 0.40 # compound pan phases sweep ~40% of a window width
+V_TILT_K       = 1.0
+_PAN_RANGE_16  = (1.0 - 1.0 / 1.25) * 0.60
+_COMPOUND_PAN_UNIT = 0.240
+
+
+def parse_focal(s):
+    if not s:
+        return 0.5, 0.5
+    try:
+        fx, fy = [float(v) for v in s.split(",")]
+        return min(max(fx, 0.0), 1.0), min(max(fy, 0.0), 1.0)
+    except Exception:
+        return 0.5, 0.5
+
+
+def build_vertical_curve(preset, n_frames, start_zoom, src_w, src_h, focal):
+    """
+    Returns list of (cx, cy, win_h) per frame in FULL-PHOTO pixel coordinates.
+    """
+    base = build_motion_curve(preset, n_frames, start_zoom)
+    base_h = min(float(src_h), src_w * 16.0 / 9.0)   # window height at zoom 1
+    fw1 = (base_h * 9.0 / 16.0) / src_w               # window width fraction at zoom 1
+    sweep = V_COMPOUND_SWEEP if preset in COMPOUND_PRESETS else V_ATOMIC_SWEEP
+    unit = _COMPOUND_PAN_UNIT if preset in COMPOUND_PRESETS else _PAN_RANGE_16
+    kx = sweep * fw1 / unit                            # image-width fraction per pan unit
+
+    fx, fy = focal
+    out = []
+    for zoom, pan_x, pan_y in base:
+        zv = 1.0 + (zoom - 1.0) * V_ZOOM_SCALE
+        win_h = base_h / zv
+        win_w = win_h * 9.0 / 16.0
+        cx = fx * src_w + pan_x * kx * src_w
+        cy = fy * src_h + pan_y * V_TILT_K * src_h
+        cx = min(max(cx, win_w / 2.0), max(src_w - win_w / 2.0, win_w / 2.0))
+        cy = min(max(cy, win_h / 2.0), max(src_h - win_h / 2.0, win_h / 2.0))
+        out.append((cx, cy, win_h))
+    return out
+
+
+def render_window(img, cx, cy, win_h, out_w, out_h):
+    win_w = win_h * out_w / out_h
+    x1, y1 = cx - win_w / 2.0, cy - win_h / 2.0
+    src_pts = np.float32([[x1, y1], [x1 + win_w, y1], [x1, y1 + win_h]])
+    dst_pts = np.float32([[0, 0], [out_w, 0], [0, out_h]])
+    M = cv2.getAffineTransform(src_pts, dst_pts)
+    return cv2.warpAffine(img, M, (out_w, out_h), flags=cv2.INTER_CUBIC,
+                          borderMode=cv2.BORDER_REPLICATE)
+
+
+# ── FIXED BADGE OVERLAY ───────────────────────────────────────────────────────
+
+def load_badge(path, out_w, out_h, w_frac, left_frac, bottom_frac):
+    """Pre-scale the badge PNG once. Returns (bgr, alpha, x, y) or None."""
+    if not path:
+        return None
+    bd = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if bd is None or bd.ndim != 3 or bd.shape[2] != 4:
+        return None
+    bw = max(64, int(round(out_w * w_frac)))
+    bh = int(round(bw * bd.shape[0] / bd.shape[1]))
+    bd = cv2.resize(bd, (bw, bh), interpolation=cv2.INTER_AREA)
+    x = int(round(out_w * left_frac))
+    y = int(round(out_h - out_h * bottom_frac - bh))
+    x = max(0, min(x, out_w - bw)); y = max(0, min(y, out_h - bh))
+    bgr = bd[:, :, :3].astype(np.float32)
+    alpha = (bd[:, :, 3:4].astype(np.float32)) / 255.0
+    return bgr, alpha, x, y
+
+
+def apply_badge(frame, badge):
+    bgr, alpha, x, y = badge
+    h, w = bgr.shape[:2]
+    roi = frame[y:y + h, x:x + w].astype(np.float32)
+    frame[y:y + h, x:x + w] = (bgr * alpha + roi * (1.0 - alpha)).astype(np.uint8)
+    return frame
+
+
 # ── PER-FRAME RENDERER ────────────────────────────────────────────────────────
 
 def render_frame(img, zoom, pan_x_frac, pan_y_frac, out_w, out_h):
@@ -513,7 +618,14 @@ def draw_label_badge(frame, text):
 
     (text_w, text_h), baseline = cv2.getTextSize(text, font, font_scale, thickness)
 
-    x1, y1 = 32, 32
+    if h > w:
+        # Vertical canvas: scale down to fit 1080 wide and sit below the
+        # platform top-UI safe zone (~7% from top) instead of the corner.
+        font_scale, thickness, padding = 1.6, 4, 24
+        (text_w, text_h), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+        x1, y1 = 48, int(h * 0.07)
+    else:
+        x1, y1 = 32, 32
     x2, y2 = x1 + text_w + 2 * padding, y1 + text_h + 2 * padding
 
     # Semi-transparent dark rectangle behind the text — alpha-blended onto
@@ -569,18 +681,40 @@ def main():
     out_h    = args.output_h
     n_frames = round(args.duration * fps)
 
-    img   = load_and_crop(args.source, out_w, out_h)
-    curve = build_motion_curve(args.preset, n_frames, args.start_zoom)
+    vertical = out_h > out_w
+    badge = None
+    if args.badge_png:
+        badge = load_badge(args.badge_png, out_w, out_h, args.badge_w_frac,
+                           args.badge_left_frac, args.badge_bottom_frac)
 
-    ending_zoom = curve[-1][0]
+    if vertical:
+        img = cv2.imread(args.source)
+        if img is None:
+            raise ValueError(f"Could not load image: {args.source}")
+        src_h, src_w = img.shape[:2]
+        vcurve = build_vertical_curve(args.preset, n_frames, args.start_zoom,
+                                      src_w, src_h, parse_focal(args.focal))
+        # ending zoom reported in the same 16:9-curve units so callers' carryZoom logic is unchanged
+        ending_zoom = build_motion_curve(args.preset, n_frames, args.start_zoom)[-1][0]
+        frames_iter = ((None, c) for c in vcurve)
+    else:
+        img   = load_and_crop(args.source, out_w, out_h)
+        curve = build_motion_curve(args.preset, n_frames, args.start_zoom)
+        ending_zoom = curve[-1][0]
+        frames_iter = ((c, None) for c in curve)
 
     proc = open_ffmpeg_pipe(args.output, fps, out_w, out_h)
 
     try:
-        for zoom, pan_x, pan_y in curve:
-            frame = render_frame(img, zoom, pan_x, pan_y, out_w, out_h)
+        for c, v in frames_iter:
+            if vertical:
+                frame = render_window(img, v[0], v[1], v[2], out_w, out_h)
+            else:
+                frame = render_frame(img, c[0], c[1], c[2], out_w, out_h)
             if args.label_text:
                 frame = draw_label_badge(frame, args.label_text)
+            elif badge is not None:
+                frame = apply_badge(frame, badge)
             proc.stdin.write(frame.tobytes())
 
         proc.stdin.close()

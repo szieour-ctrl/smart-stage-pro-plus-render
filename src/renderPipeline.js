@@ -15,6 +15,8 @@ const axios = require("axios");
 
 const { downloadFrames } = require("./lib/downloadFrames");
 const { applyMotionPreset, resolveDuration } = require("./lib/motionPresets");
+const { badgePathFor } = require("./lib/badgeAssets");
+const { computeFocals, renderVerticalClips } = require("./lib/verticalPipeline");
 // FULL KLING REVERT (Sep 10, 2026) — ltxMotion.js require() removed
 // entirely. Room Reveal's continuation phase (the last remaining LTX
 // caller in this file) now dispatches to klingMotion.js's
@@ -30,7 +32,7 @@ const { applyMotionPreset, resolveDuration } = require("./lib/motionPresets");
 // the Sep 10 handoff.
 const { applyKlingMotion, generateKlingRevealContinuation, KLING_MOTION_TEMPLATES } = require("./lib/klingMotion");
 const { generateMusic } = require("./lib/musicGen");
-const { assembleVideo, buildRevealClip, REVEAL_PRESETS, REVEAL_OPENER_DURATION, REVEAL_WIPE_DURATION, REVEAL_CONTINUATION_DURATION, computeClipTimeline, extractMidpointFrame, probeDuration, mapWithConcurrencyLimit, FFMPEG_CONCURRENCY_LIMIT } = require("./lib/assemble");
+const { assembleVideo, overlayBadgeOnClip, buildRevealClip, REVEAL_PRESETS, REVEAL_OPENER_DURATION, REVEAL_WIPE_DURATION, REVEAL_CONTINUATION_DURATION, computeClipTimeline, extractMidpointFrame, probeDuration, mapWithConcurrencyLimit, FFMPEG_CONCURRENCY_LIMIT } = require("./lib/assemble");
 const { generateNarration, groupContiguousByRoom } = require("./lib/narrationGen");
 const { uploadToS3 } = require("./lib/s3Upload");
 const { notifyWebhook } = require("./lib/notify");
@@ -113,6 +115,25 @@ async function processRenderJob(job) {
     // ── Step 1: Download all frame images to local disk ──────────────────
     const localFrames = await downloadFrames(job.frames, workDir);
     console.log(`[${job.jobId}] Downloaded ${localFrames.length} frames.`);
+
+    // ── Clean-copy / native 9:16 mode ────────────────────────────────────
+    // Active only when EVERY frame carries a badgeType (video-job.js sends it
+    // together with the unbadged staged image). Legacy payloads (no badgeType)
+    // keep the exact old behaviour: baked badge, 9:16 = centre crop of the 16:9.
+    // In clean mode the AB 723 badge is a fixed overlay in BOTH formats, and
+    // 9:16 is rendered natively from the full photo.
+    const cleanMode = localFrames.length > 0 && localFrames.every((f) => typeof f.badgeType === "string");
+    if (cleanMode) {
+      for (const f of localFrames) f.badgePngPath = badgePathFor(f.badgeType);
+    }
+    const wantFormats = job.formats || ["16x9", "9x16"];
+    const nativeVertical = cleanMode && wantFormats.includes("9x16") && process.env.NATIVE_VERTICAL !== "false";
+    console.log(`[${job.jobId}] Clean-copy mode: ${cleanMode}; native 9:16: ${nativeVertical}.`);
+    // Focal points run in parallel with the 16:9 render below.
+    const focalPromise = nativeVertical
+      ? computeFocals(localFrames, workDir).catch((e) => { console.warn(`[${job.jobId}] focal analysis failed: ${e.message}`); return []; })
+      : Promise.resolve([]);
+    const verticalSpecs = [];
 
     // ── Step 1.5 REMOVED (this session, real architecture correction) ──
     // Previously this step replaced the LAST ROOM FRAME's image with an
@@ -391,6 +412,13 @@ async function processRenderJob(job) {
         );
         clipPath = result.path;
         carryZoom = result.endingZoom;
+        // Clean-copy mode: Kling animated the UNBADGED image, so the AB 723 badge
+        // is composited onto the real Kling clip here. (A Ken Burns fallback clip
+        // already carries it — motionRenderer.py applies the overlay itself.)
+        if (cleanMode && result.source === "kling" && frame.badgePngPath) {
+          clipPath = await overlayBadgeOnClip(clipPath, frame.badgePngPath, workDir, `kling_badged_${i}.mp4`, false);
+        }
+        verticalSpecs[i] = { kind: "kling", clipPath };
 
         // result.source is "kling" (real Kling output) or
         // "ken_burns_fallback" (applyKlingMotion() caught a failure and
@@ -556,6 +584,10 @@ async function processRenderJob(job) {
             );
             continuationResult = klingResult;
             actualContinuationDuration = klingResult.klingDuration;
+            if (cleanMode && frame.badgePngPath) {
+              const badgedPath = await overlayBadgeOnClip(klingResult.path, frame.badgePngPath, workDir, `kling_reveal_badged_${i}.mp4`, false);
+              continuationResult = { ...klingResult, path: badgedPath };
+            }
           } catch (err) {
             // No Kling-preset-to-Ken-Burns-preset mapping exists (the two
             // libraries' names don't correspond 1:1), so this can't fall
@@ -589,6 +621,10 @@ async function processRenderJob(job) {
           actualContinuationDuration
         );
         carryZoom = 1.0; // reset after a reveal beat
+        verticalSpecs[i] = {
+          kind: "reveal", presetKey, openerMotion: preset.openerMotion,
+          endMotion, continuationDuration: actualContinuationDuration,
+        };
 
         if (job.wantsNarration) {
           const expectedRevealDuration = REVEAL_OPENER_DURATION + actualContinuationDuration - REVEAL_WIPE_DURATION;
@@ -606,6 +642,7 @@ async function processRenderJob(job) {
         const result = await applyMotionPreset(frame, workDir, carryZoom);
         clipPath = result.path;
         carryZoom = result.endingZoom;
+        verticalSpecs[i] = { kind: "kb" };
 
         // Kling frames are deliberately excluded from this check — Kling's
         // own returned duration routinely differs from what was requested
@@ -709,20 +746,53 @@ async function processRenderJob(job) {
           stillImagePath: lastFrame.localPath,
           addressLine: job.address,
           ctaLine: process.env.END_FRAME_CTA_TEXT || "Schedule Your Private Showing",
+          // Clean-copy mode: the card background is the unbadged photo, so the
+          // fixed AB 723 overlay is applied to the card too (null in legacy mode).
+          badgePng: cleanMode ? (lastFrame.badgePngPath || null) : null,
         }
       : null;
     if (isEndFrameEnabled() && !closingCard) {
       console.log(`[${job.jobId}] End Frame: skipped — ${!job.address ? "no address available" : "no frames to build a card from"}.`);
     }
 
-    const outputs = await assembleVideo({
-      clipPaths,
-      musicPath,
-      narrationSegments,
-      formats: job.formats || ["16x9", "9x16"],
-      workDir,
-      closingCard,
-    });
+    // Pass 1 — everything except native 9:16 (16:9, or legacy crop 9:16).
+    const pass1Formats = nativeVertical ? wantFormats.filter((f) => f !== "9x16") : wantFormats;
+    let outputs = {};
+    if (pass1Formats.length > 0) {
+      outputs = await assembleVideo({
+        clipPaths,
+        musicPath,
+        narrationSegments,
+        formats: pass1Formats,
+        workDir,
+        closingCard,
+      });
+    }
+
+    // Pass 2 — native 9:16: re-render every room from the full photo with a
+    // subject-aware window, mirroring the 16:9 clip durations so the narration
+    // timeline lines up, then assemble with the SAME music + narration. Errors
+    // propagate on purpose: silently shipping a crop of a clean (badge-overlay)
+    // 16:9 master could cut the AB 723 badge off.
+    if (nativeVertical) {
+      const focals = await focalPromise;
+      const vClipPaths = await renderVerticalClips({
+        jobId: job.jobId, localFrames, specs: verticalSpecs, workDir, focals,
+      });
+      const vAsmDir = path.join(workDir, "v9x16_assembly");
+      fs.mkdirSync(vAsmDir, { recursive: true });
+      const lastFocal = focals[localFrames.length - 1] || null;
+      const vOut = await assembleVideo({
+        clipPaths: vClipPaths,
+        musicPath,
+        narrationSegments,
+        formats: ["9x16"],
+        workDir: vAsmDir,
+        closingCard: closingCard ? { ...closingCard, focal: lastFocal } : null,
+        nativeVertical: true,
+      });
+      outputs = { ...outputs, ...vOut };
+    }
     console.log(`[${job.jobId}] Assembled ${Object.keys(outputs).length} formats.`);
 
     // ── Step 5: Upload finished videos to S3 ──────────────────────

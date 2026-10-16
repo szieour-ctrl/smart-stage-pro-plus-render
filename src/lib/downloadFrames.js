@@ -101,6 +101,12 @@ async function downloadFrames(frames, workDir) {
       // silently never triggered regardless of the room's real layout.
       isOpenPlan: !!frame.isOpenPlan,
       roomType: frame.roomType || "default",
+      // NEW — clean-copy / native 9:16 architecture. imageUrl is now the
+      // UNBADGED staged image when video-job.js has one; badgeType tells the
+      // renderer which AB 723 badge to overlay ("virtually_staged" |
+      // "digitally_enhanced" | "none"). undefined = legacy payload (baked badge,
+      // legacy 9:16 crop). Named explicitly — see this file's picklist history.
+      badgeType: typeof frame.badgeType === "string" ? frame.badgeType : undefined,
       // NEW (July 14, 2026 — footage-grounded narration) — real display
       // name, not the small backend-coded vocabulary roomType uses.
       roomLabel: frame.roomLabel || null,

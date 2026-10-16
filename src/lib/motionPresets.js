@@ -8,6 +8,7 @@ const path      = require("path");
 const { spawn } = require("child_process");
 
 const RENDERER_PY = path.join(__dirname, "motionRenderer.py");
+const { badgeGeometry } = require("./badgeAssets");
 
 // Auto preset assignment by room type.
 // bathroom changed from pan_left → tilt_down (flooring/tile reveal is the
@@ -159,9 +160,24 @@ function applyMotionPreset(frame, workDir, startZoom = 1.0) {
       "--output",     outputPath,
       "--start-zoom", String(startZoom),
       "--fps",        "25",
-      "--output-w",   "1920",
-      "--output-h",   "1080",
+      "--output-w",   frame.vertical ? "1080" : "1920",
+      "--output-h",   frame.vertical ? "1920" : "1080",
     ];
+
+    // Native 9:16 (frame.vertical): the renderer uses the FULL photo and
+    // moves a 9:16 window anchored on the subject focal point.
+    if (frame.vertical && frame.focal && Number.isFinite(frame.focal.fx)) {
+      args.push("--focal", `${frame.focal.fx.toFixed(4)},${Number.isFinite(frame.focal.fy) ? frame.focal.fy.toFixed(4) : "0.5"}`);
+    }
+    // Fixed AB 723 badge overlay (clean-copy architecture). Never combined
+    // with labelText — the "Original" opener carries no disclosure badge.
+    if (frame.badgePngPath && !frame.labelText) {
+      const geo = badgeGeometry(!!frame.vertical);
+      args.push("--badge-png", frame.badgePngPath,
+                "--badge-w-frac", String(geo.wFrac),
+                "--badge-left-frac", String(geo.leftFrac),
+                "--badge-bottom-frac", String(geo.bottomFrac));
+    }
 
     // NEW (July 20, 2026 — Sam's request): burns a small text badge into
     // this clip's frames, e.g. "Original" on the Room Reveal opener phase.
