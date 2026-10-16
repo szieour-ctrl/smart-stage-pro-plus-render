@@ -166,6 +166,8 @@ function applyMotionPreset(frame, workDir, startZoom = 1.0) {
 
     // Native 9:16 (frame.vertical): the renderer uses the FULL photo and
     // moves a 9:16 window anchored on the subject focal point.
+    // Vertical clips are intermediates that get re-encoded during assembly — encode them fast.
+    if (frame.vertical) args.push("--x264-preset", "ultrafast");
     if (frame.vertical && frame.focal && Number.isFinite(frame.focal.fx)) {
       args.push("--focal", `${frame.focal.fx.toFixed(4)},${Number.isFinite(frame.focal.fy) ? frame.focal.fy.toFixed(4) : "0.5"}`);
     }

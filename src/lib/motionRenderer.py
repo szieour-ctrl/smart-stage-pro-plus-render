@@ -117,6 +117,7 @@ def parse_args():
     p.add_argument("--focal", default=None,
                    help="Subject focal point as 'fx,fy' fractions of the photo")
     # Fixed compliance badge overlay (clean-copy approach). All optional.
+    p.add_argument("--x264-preset", default="fast", dest="x264_preset")
     p.add_argument("--badge-png", default=None, dest="badge_png")
     p.add_argument("--badge-w-frac", type=float, default=0.30, dest="badge_w_frac")
     p.add_argument("--badge-left-frac", type=float, default=0.02, dest="badge_left_frac")
@@ -657,7 +658,7 @@ def draw_label_badge(frame, text):
 
 # ── FFMPEG PIPE ───────────────────────────────────────────────────────────────
 
-def open_ffmpeg_pipe(output_path, fps, out_w, out_h):
+def open_ffmpeg_pipe(output_path, fps, out_w, out_h, x264_preset="fast"):
     """Open FFmpeg subprocess accepting raw BGR24 frames on stdin."""
     cmd = [
         "ffmpeg", "-y",
@@ -669,7 +670,7 @@ def open_ffmpeg_pipe(output_path, fps, out_w, out_h):
         "-i",       "pipe:0",
         "-c:v",     "libx264",
         "-pix_fmt", "yuv420p",
-        "-preset",  "fast",
+        "-preset",  x264_preset,
         "-crf",     "18",
         "-movflags", "+faststart",
         "-threads", "2",
@@ -714,7 +715,7 @@ def main():
         ending_zoom = curve[-1][0]
         frames_iter = ((c, None) for c in curve)
 
-    proc = open_ffmpeg_pipe(args.output, fps, out_w, out_h)
+    proc = open_ffmpeg_pipe(args.output, fps, out_w, out_h, args.x264_preset)
 
     try:
         for c, v in frames_iter:

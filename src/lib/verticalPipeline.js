@@ -35,16 +35,24 @@ async function computeFocals(localFrames, workDir) {
   );
 }
 
-async function renderVerticalClips({ jobId, localFrames, specs, workDir, focals }) {
+// Pipelined renderer: enqueue(i, spec) is called by renderPipeline.js the moment the
+// 16:9 clip for frame i exists, so vertical clips render CONCURRENTLY with the rest of the
+// 16:9 loop (and with narration/music) instead of after everything else. Vertical clips
+// are still rendered strictly in order among themselves (zoom continuity carries across
+// standard clips). finish() resolves with the ordered clip paths.
+function createVerticalRenderer({ jobId, localFrames, workDir, focalPromise }) {
   const vdir = path.join(workDir, "v9x16");
   fs.mkdirSync(vdir, { recursive: true });
 
   const clipPaths = [];
   let carryZoom = 1.0;
+  let chain = Promise.resolve();
+  let aborted = false;
 
-  for (let i = 0; i < localFrames.length; i++) {
+  async function renderOne(i, spec) {
+    if (aborted) return;
+    const focals = await focalPromise;
     const frame = localFrames[i];
-    const spec = specs[i] || { kind: "kb" };
     const focal = focals[i] || { fx: 0.5, fy: 0.5 };
     const vBase = { ...frame, vertical: true, focal };
 
@@ -58,13 +66,12 @@ async function renderVerticalClips({ jobId, localFrames, specs, workDir, focals 
         { ...vBase, motionPreset: safeVerticalPreset(spec.endMotion), durationSeconds: spec.continuationDuration },
         vdir, 1.0
       );
-      const revealPath = await buildRevealClip(
+      clipPaths[i] = await buildRevealClip(
         opener.path, cont.path, spec.presetKey, vdir,
         `reveal_v_${i}.mp4`, spec.continuationDuration, V_CANVAS
       );
-      clipPaths.push(revealPath);
       carryZoom = 1.0;
-      continue;
+      return;
     }
 
     let preset, duration;
@@ -77,17 +84,26 @@ async function renderVerticalClips({ jobId, localFrames, specs, workDir, focals 
       preset = frame.motionPreset && frame.motionPreset !== "auto" ? safeVerticalPreset(frame.motionPreset) : "auto";
       duration = resolveDuration(frame);
     }
-
-    // Distinct output name per clip (vdir is shared by all vertical clips).
     const r = await applyMotionPreset(
       { ...vBase, localPath: frame.localPath, motionPreset: preset, durationSeconds: duration },
       vdir, carryZoom
     );
     carryZoom = r.endingZoom;
-    clipPaths.push(r.path);
+    clipPaths[i] = r.path;
   }
-  console.log(`[${jobId}] Native 9:16: rendered ${clipPaths.length} vertical clips.`);
-  return clipPaths;
+
+  return {
+    enqueue(i, spec) {
+      chain = chain.then(() => renderOne(i, spec || { kind: "kb" }));
+      chain.catch(() => {}); // surfaced by finish(); avoids an unhandled-rejection warning meanwhile
+    },
+    abort() { aborted = true; },
+    async finish() {
+      await chain;
+      console.log(`[${jobId}] Native 9:16: rendered ${clipPaths.length} vertical clips.`);
+      return clipPaths;
+    },
+  };
 }
 
-module.exports = { computeFocals, renderVerticalClips, V_CANVAS };
+module.exports = { computeFocals, createVerticalRenderer, V_CANVAS };
