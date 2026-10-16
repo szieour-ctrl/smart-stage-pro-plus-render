@@ -20,11 +20,17 @@
 
 const { spawn } = require("child_process");
 const sharp = require("sharp");
-const { badgePathFor, badgeGeometry } = require("./badgeAssets");
+const { badgePathFor } = require("./badgeAssets");
 
 const W = 1080, H = 1920;
 const QR_CARD = 348;      // white card incl. quiet-zone padding
 const QR_IMG = 300;
+const HS = 124;           // headshot circle diameter
+const LOGO_W = 300, LOGO_H = 108; // logo fits inside this box
+const ID_H = 124;         // identity row height
+// Reels badge sits lower than the 16:9/standard-video geometry: bottom edge ~y=1603, just above
+// the platform UI zone. (badgeAssets' geometry is untouched, so existing videos don't move.)
+const REEL_BADGE = { wFrac: 0.45, leftFrac: 0.05, bottomFrac: 0.165 };
 
 const esc = (s) =>
   String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
@@ -63,13 +69,13 @@ async function usableImage(buf, label, warnings, hint = "") {
 
 const dataUri = (buf) => `data:image/png;base64,${buf.toString("base64")}`;
 
-// Headshot -> square 84px PNG (circle clip is applied in the SVG).
+// Headshot -> square PNG (circle clip is applied in the SVG).
 async function prepHeadshot(buf) {
-  return sharp(buf).rotate().resize(84, 84, { fit: "cover", position: "attention" }).png().toBuffer();
+  return sharp(buf).rotate().resize(HS, HS, { fit: "cover", position: "attention" }).png().toBuffer();
 }
-// Logo -> fits inside 200x70, transparency preserved.
+// Logo -> fits inside LOGO_W x LOGO_H, transparency preserved.
 async function prepLogo(buf) {
-  const out = await sharp(buf).rotate().resize(200, 70, { fit: "inside", withoutEnlargement: true }).png().toBuffer();
+  const out = await sharp(buf).rotate().resize(LOGO_W, LOGO_H, { fit: "inside", withoutEnlargement: true }).png().toBuffer();
   const m = await sharp(out).metadata();
   return { buf: out, w: m.width, h: m.height };
 }
@@ -102,10 +108,10 @@ async function justListedSvg(p) {
   const hasDetail = detail.length > 0;
   const hasIdentity = !!(brand.licensedName || brand.dre || brand.brokerage || headshot || logo);
 
-  // Panel stacks from a fixed bottom edge (y=1372) so it never reaches the badge zone below.
-  const PAD = 26, ROW_D = hasDetail ? 66 : 0, ROW_C = 82, ROW_I = hasIdentity ? 122 : 0;
+  // Panel stacks from a fixed bottom edge (y=1462) so it never reaches the badge zone below.
+  const PAD = 26, ROW_D = hasDetail ? 66 : 0, ROW_C = 82, ROW_I = hasIdentity ? 22 + ID_H : 0;
   const panelH = PAD + ROW_D + ROW_C + ROW_I + PAD;
-  const panelBottom = 1372;
+  const panelBottom = 1462;
   const panelY = panelBottom - panelH;
   let y = panelY + PAD;
   const detailBase = y + 44; y += ROW_D;
@@ -114,36 +120,36 @@ async function justListedSvg(p) {
 
   let identity = "";
   if (hasIdentity) {
-    const left = 100, right = 980;
-    const hsX = left, hsY = idY + 4;
+    const left = 92, right = 988;
+    const hsX = left, hsY = idY + Math.round((ID_H - HS) / 2);
     const logoX = logo ? right - logo.w : right;
-    const logoY = idY + Math.round((92 - (logo ? logo.h : 0)) / 2);
-    const textX = headshot ? hsX + 84 + 22 : left;
+    const logoY = idY + Math.round((ID_H - (logo ? logo.h : 0)) / 2);
+    const textX = headshot ? hsX + HS + 24 : left;
     const maxTextW = (logo ? logoX - 24 : right) - textX;
     const centered = !headshot && !logo;
     const anchor = centered ? "middle" : "start";
     const tx = centered ? W / 2 : textX;
     const line1 = brand.licensedName || "";
     const line2 = [brand.dre ? `DRE #${brand.dre}` : "", brand.brokerage || ""].filter(Boolean);
-    const f1 = fit(line1, maxTextW, 30, 22, 0.62);
-    const f2 = fit(line2.join("  ·  "), maxTextW, 24, 18, 0.58);
+    const f1 = fit(line1, maxTextW, 34, 24, 0.62);
+    const f2 = fit(line2.join("  ·  "), maxTextW, 26, 20, 0.58);
     // If DRE + brokerage don't fit on one line at a readable size, split them.
-    const split = f2 < 21 && line2.length === 2;
+    const split = f2 < 23 && line2.length === 2;
     const rows = [];
     if (line1) rows.push({ t: line1, s: f1, w: 700 });
-    if (split) { rows.push({ t: line2[0], s: 22, w: 500 }); rows.push({ t: fitText(line2[1], maxTextW, 22), s: 22, w: 500 }); }
+    if (split) { rows.push({ t: line2[0], s: 24, w: 500 }); rows.push({ t: fitText(line2[1], maxTextW, 24), s: 24, w: 500 }); }
     else if (line2.length) rows.push({ t: line2.join("  ·  "), s: f2, w: 500 });
-    const lh = rows.length >= 3 ? 30 : 34;
+    const lh = rows.length >= 3 ? 34 : 40;
     const blockH = rows.length * lh;
-    let ty = idY + Math.round((92 - blockH) / 2) + lh - 8;
+    let ty = idY + Math.round((ID_H - blockH) / 2) + lh - 8;
     const textSvg = rows.map((r) => {
       const el = `<text x="${tx}" y="${ty}" text-anchor="${anchor}" font-family="Montserrat" font-weight="${r.w}" font-size="${r.s}" fill="${ink}" fill-opacity="${r.w === 700 ? 1 : 0.9}">${esc(r.t)}</text>`;
       ty += lh; return el;
     }).join("\n  ");
     identity = `
-  ${headshot ? `<clipPath id="hs"><circle cx="${hsX + 42}" cy="${hsY + 42}" r="42"/></clipPath>
-  <image href="${dataUri(headshot)}" x="${hsX}" y="${hsY}" width="84" height="84" clip-path="url(#hs)" preserveAspectRatio="xMidYMid slice"/>
-  <circle cx="${hsX + 42}" cy="${hsY + 42}" r="42" fill="none" stroke="${bord}" stroke-width="3"/>` : ""}
+  ${headshot ? `<clipPath id="hs"><circle cx="${hsX + HS / 2}" cy="${hsY + HS / 2}" r="${HS / 2}"/></clipPath>
+  <image href="${dataUri(headshot)}" x="${hsX}" y="${hsY}" width="${HS}" height="${HS}" clip-path="url(#hs)" preserveAspectRatio="xMidYMid slice"/>
+  <circle cx="${hsX + HS / 2}" cy="${hsY + HS / 2}" r="${HS / 2}" fill="none" stroke="${bord}" stroke-width="3"/>` : ""}
   ${textSvg}
   ${logo ? `<image href="${dataUri(logo.buf)}" x="${logoX}" y="${logoY}" width="${logo.w}" height="${logo.h}"/>` : ""}`;
   }
@@ -184,7 +190,7 @@ async function renderBrandedOverlay(params, outPng) {
 
 // AB 723 badge layer (bottom-left, above the platform caption zone).
 async function renderBadgeLayer({ badgeType = "virtually_staged" } = {}, outPng) {
-  const geo = badgeGeometry(true);
+  const geo = REEL_BADGE;
   const badgePath = badgePathFor(badgeType);
   const layers = [];
   if (badgePath) {
