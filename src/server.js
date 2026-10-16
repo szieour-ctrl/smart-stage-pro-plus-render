@@ -501,7 +501,7 @@ app.get("/test-reel-overlay", requireSecret, async (req, res) => {
       }
     };
     const [logo, headshot] = await Promise.all([fetchImg("logo", q.logoUrl), fetchImg("headshot", q.headshotUrl)]);
-    const textPng = await renderBrandedOverlay({
+    const brandedParams = {
       headline: "JUST LISTED",
       address: q.address || "123 Example Street",
       cityLine: q.cityLine || "",
@@ -510,16 +510,19 @@ app.get("/test-reel-overlay", requireSecret, async (req, res) => {
       brand: { licensedName: q.name || "", dre: q.dre || "", brokerage: q.brokerage || "" },
       logoBuf: logo.buf, logoType: logo.type, headshotBuf: headshot.buf, headshotType: headshot.type,
       warnings,
-    }, path.join(workDir, "overlay_text.png"));
+    };
+    const openingPng = await renderBrandedOverlay(brandedParams, path.join(workDir, "overlay_opening.png"), "opening");
+    const closingPng = await renderBrandedOverlay(brandedParams, path.join(workDir, "overlay_closing.png"), "closing");
     const badgePng = await renderBadgeLayer({ badgeType: "virtually_staged" }, path.join(workDir, "overlay_badge.png"));
     const QRCode = require("qrcode");
     const qrBuf = await QRCode.toBuffer("https://smartstagepro.com", { margin: 1, width: 300 });
     const qrPng = await renderQrLayer({ qrPng: qrBuf }, path.join(workDir, "overlay_qr.png"));
     const overlayMs = Date.now() - t1;
 
-    // BRANDED = text + badge + end QR. UNBRANDED (MLS) = badge + end QR only.
+    // BRANDED = opening (headline/address/details) + closing overlay on the last photo (details/CTA/
+    // identity) + badge + end QR. UNBRANDED (MLS) = badge + end QR only.
     const t2 = Date.now();
-    const brandedMp4 = await compositeReel(base.path, { textPng, badgePng, qrPng }, path.join(workDir, "reel_branded.mp4"));
+    const brandedMp4 = await compositeReel(base.path, { openingPng, closingPng, badgePng, qrPng }, path.join(workDir, "reel_branded.mp4"));
     const unbrandedMp4 = await compositeReel(base.path, { badgePng, qrPng }, path.join(workDir, "reel_unbranded.mp4"));
     const compositeMs = Date.now() - t2;
 
