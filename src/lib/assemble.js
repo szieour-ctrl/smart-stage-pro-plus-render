@@ -131,7 +131,7 @@ function normalizeClip(clipPath, workDir, index, canvas) {
         `pad=${CW}:${CH}:(ow-iw)/2:(oh-ih)/2`,
         `fps=${NORMALIZE_FPS}`,
       ])
-      .outputOptions(["-pix_fmt", "yuv420p", "-c:v", "libx264", "-preset", "fast"])
+      .outputOptions(["-pix_fmt", "yuv420p", "-c:v", "libx264", "-preset", canvas ? "ultrafast" : "fast"])
       // Audio is dropped here deliberately — concatenateClips' xfade only
       // ever operates on [x:v] video streams (see lastLabel/nextLabel
       // below), and mixAudio() adds the real soundtrack afterward across

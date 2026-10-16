@@ -16,7 +16,7 @@ const axios = require("axios");
 const { downloadFrames } = require("./lib/downloadFrames");
 const { applyMotionPreset, resolveDuration } = require("./lib/motionPresets");
 const { badgePathFor } = require("./lib/badgeAssets");
-const { computeFocals, renderVerticalClips } = require("./lib/verticalPipeline");
+const { computeFocals, createVerticalRenderer } = require("./lib/verticalPipeline");
 // FULL KLING REVERT (Sep 10, 2026) — ltxMotion.js require() removed
 // entirely. Room Reveal's continuation phase (the last remaining LTX
 // caller in this file) now dispatches to klingMotion.js's
@@ -108,6 +108,7 @@ async function processRenderJob(job) {
   // — so this array's emptiness doesn't affect Reveal refund logic at all.
   // Safe to delete outright once video-notify.js is confirmed not to read it.
   let ltxFrameOutcomes = [];
+  let vRendererForAbort = null;
 
   try {
     console.log(`[${job.jobId}] Starting render. ${job.frames.length} frames.`);
@@ -134,6 +135,10 @@ async function processRenderJob(job) {
       ? computeFocals(localFrames, workDir).catch((e) => { console.warn(`[${job.jobId}] focal analysis failed: ${e.message}`); return []; })
       : Promise.resolve([]);
     const verticalSpecs = [];
+    // Native 9:16 renders pipelined behind the 16:9 loop (see verticalPipeline.js).
+    const vRenderer = nativeVertical
+      ? createVerticalRenderer({ jobId: job.jobId, localFrames, workDir, focalPromise })
+      : null;
 
     // ── Step 1.5 REMOVED (this session, real architecture correction) ──
     // Previously this step replaced the LAST ROOM FRAME's image with an
@@ -655,6 +660,8 @@ async function processRenderJob(job) {
         }
       }
       clipPaths.push(clipPath);
+      vRendererForAbort = vRenderer;
+      if (vRenderer) vRenderer.enqueue(i, verticalSpecs[i] || { kind: "kb" });
     }
     console.log(`[${job.jobId}] Motion applied to ${clipPaths.length} clips.`);
 
@@ -755,44 +762,35 @@ async function processRenderJob(job) {
       console.log(`[${job.jobId}] End Frame: skipped — ${!job.address ? "no address available" : "no frames to build a card from"}.`);
     }
 
-    // Pass 1 — everything except native 9:16 (16:9, or legacy crop 9:16).
-    const pass1Formats = nativeVertical ? wantFormats.filter((f) => f !== "9x16") : wantFormats;
-    let outputs = {};
-    if (pass1Formats.length > 0) {
-      outputs = await assembleVideo({
-        clipPaths,
-        musicPath,
-        narrationSegments,
-        formats: pass1Formats,
-        workDir,
-        closingCard,
-      });
-    }
-
-    // Pass 2 — native 9:16: re-render every room from the full photo with a
-    // subject-aware window, mirroring the 16:9 clip durations so the narration
-    // timeline lines up, then assemble with the SAME music + narration. Errors
-    // propagate on purpose: silently shipping a crop of a clean (badge-overlay)
+    // Pass 1 (16:9, or legacy crop 9:16) and pass 2 (native 9:16) assemble CONCURRENTLY —
+    // they use separate work folders and only read the shared music/narration files.
+    // Vertical clips have usually finished already (they render alongside the 16:9 loop).
+    // Errors propagate on purpose: silently shipping a crop of a clean (badge-overlay)
     // 16:9 master could cut the AB 723 badge off.
-    if (nativeVertical) {
-      const focals = await focalPromise;
-      const vClipPaths = await renderVerticalClips({
-        jobId: job.jobId, localFrames, specs: verticalSpecs, workDir, focals,
-      });
-      const vAsmDir = path.join(workDir, "v9x16_assembly");
-      fs.mkdirSync(vAsmDir, { recursive: true });
-      const lastFocal = focals[localFrames.length - 1] || null;
-      const vOut = await assembleVideo({
-        clipPaths: vClipPaths,
-        musicPath,
-        narrationSegments,
-        formats: ["9x16"],
-        workDir: vAsmDir,
-        closingCard: closingCard ? { ...closingCard, focal: lastFocal } : null,
-        nativeVertical: true,
-      });
-      outputs = { ...outputs, ...vOut };
-    }
+    const pass1Formats = nativeVertical ? wantFormats.filter((f) => f !== "9x16") : wantFormats;
+    const pass1Promise = pass1Formats.length > 0
+      ? assembleVideo({ clipPaths, musicPath, narrationSegments, formats: pass1Formats, workDir, closingCard })
+      : Promise.resolve({});
+    const pass2Promise = nativeVertical
+      ? (async () => {
+          const vClipPaths = await vRenderer.finish();
+          const focals = await focalPromise;
+          const vAsmDir = path.join(workDir, "v9x16_assembly");
+          fs.mkdirSync(vAsmDir, { recursive: true });
+          const lastFocal = focals[localFrames.length - 1] || null;
+          return assembleVideo({
+            clipPaths: vClipPaths,
+            musicPath,
+            narrationSegments,
+            formats: ["9x16"],
+            workDir: vAsmDir,
+            closingCard: closingCard ? { ...closingCard, focal: lastFocal } : null,
+            nativeVertical: true,
+          });
+        })()
+      : Promise.resolve({});
+    const [out1, out2] = await Promise.all([pass1Promise, pass2Promise]);
+    const outputs = { ...out1, ...out2 };
     console.log(`[${job.jobId}] Assembled ${Object.keys(outputs).length} formats.`);
 
     // ── Step 5: Upload finished videos to S3 ──────────────────────
@@ -815,6 +813,7 @@ async function processRenderJob(job) {
 
     console.log(`[${job.jobId}] Done.`);
   } catch (err) {
+    if (vRendererForAbort) vRendererForAbort.abort();
     console.error(`[${job.jobId}] Render failed:`, err);
     await notifyWebhook({
       jobId: job.jobId,
