@@ -130,7 +130,7 @@ async function justListedSvg(p, part = "all") {
   const hasIdentity = !p.unbranded && !!(brand.licensedName || brand.dre || brand.brokerage || headshot || logo);
 
   // Panel stacks from a fixed bottom edge (y=1462) so it never reaches the badge zone below.
-  const PAD = 26, ROW_D = hasDetail ? detailH + 14 : 0, ROW_C = 82, ROW_I = hasIdentity ? 22 + ID_H : 0;
+  const PAD = 26, ROW_D = hasDetail ? detailH + 14 : 0, ROW_C = p.unbranded ? 0 : 82, ROW_I = hasIdentity ? 22 + ID_H : 0;
   const panelH = PAD + ROW_D + ROW_C + ROW_I + PAD;
   const panelBottom = 1462;
   const panelY = panelBottom - panelH;
@@ -192,8 +192,8 @@ ${showTop ? `  <rect x="0" y="0" width="${W}" height="760" fill="url(#t)"/>
 ${showBottom ? `  <rect x="0" y="${panelY - 120}" width="${W}" height="${H - panelY + 120}" fill="url(#b)"/>
   <rect x="60" y="${panelY}" width="960" height="${panelH}" rx="28" fill="${sec}" fill-opacity="0.94" stroke="${bord}" stroke-width="3"/>
   ${hasDetail ? detailSvg(W / 2, detailTop) : ""}
-  <rect x="${W / 2 - ctaW / 2}" y="${ctaY}" width="${ctaW}" height="76" rx="38" fill="${prim}"/>
-  <text x="${W / 2}" y="${ctaY + 50}" text-anchor="middle" font-family="Montserrat" font-weight="700" font-size="${cs}" fill="${textOn(prim)}" letter-spacing="1">${esc(cta)}</text>${identity}
+${p.unbranded ? "" : `<rect x="${W / 2 - ctaW / 2}" y="${ctaY}" width="${ctaW}" height="76" rx="38" fill="${prim}"/>
+  <text x="${W / 2}" y="${ctaY + 50}" text-anchor="middle" font-family="Montserrat" font-weight="700" font-size="${cs}" fill="${textOn(prim)}" letter-spacing="1">${esc(cta)}</text>`}${identity}
 ` : ""}
 </svg>`;
 }

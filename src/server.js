@@ -513,7 +513,7 @@ app.get("/test-reel-overlay", requireSecret, async (req, res) => {
     };
     const openingPng = await renderBrandedOverlay(brandedParams, path.join(workDir, "overlay_opening.png"), "opening");
     const closingPng = await renderBrandedOverlay(brandedParams, path.join(workDir, "overlay_closing.png"), "closing");
-    // UNBRANDED (MLS) keeps headline/address/details/CTA but drops name, DRE, brokerage, headshot and logo.
+    // UNBRANDED (MLS) keeps headline/address/details only: no CTA, name, DRE, brokerage, headshot or logo.
     const unbrandedParams = { ...brandedParams, unbranded: true, brand: {}, logoBuf: null, headshotBuf: null };
     const uOpeningPng = await renderBrandedOverlay(unbrandedParams, path.join(workDir, "overlay_u_opening.png"), "opening");
     const uClosingPng = await renderBrandedOverlay(unbrandedParams, path.join(workDir, "overlay_u_closing.png"), "closing");
