@@ -278,7 +278,7 @@ function xfadeChain(paths, durations, workDir, outputName) {
 
     command
       .complexFilter(filterParts)
-      .outputOptions(["-map", "[outv]", "-pix_fmt", "yuv420p"])
+      .outputOptions(["-map", "[outv]", "-pix_fmt", "yuv420p", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20"])
       .output(outputPath)
       .on("end", async () => {
         if (settled) return;
@@ -703,7 +703,7 @@ function buildRevealClip(beforeClipPath, afterClipPath, presetKey, workDir, outp
         `[1:v]trim=duration=${continuationDuration},setpts=PTS-STARTPTS[continuation]`,
         `[opener][continuation]xfade=transition=${preset.wipeTransition}:duration=${REVEAL_WIPE_DURATION}:offset=${offset}[out]`,
       ])
-      .outputOptions(["-map", "[out]", "-pix_fmt", "yuv420p"])
+      .outputOptions(["-map", "[out]", "-pix_fmt", "yuv420p", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20"])
       .output(outputPath)
       .on("end", () => resolve(outputPath))
       .on("error", (err) => reject(new Error(`Reveal Preset "${presetKey}" wipe failed: ${err.message}`)))
@@ -944,20 +944,32 @@ function renderFormat(inputPath, dimensions, workDir, outputName, nativeVertical
     const outputPath = path.join(workDir, outputName);
     const [w, h] = dimensions.split("x");
 
-    // 9:16 reframe crops to center — smart subject-aware cropping is a
-    // Phase 2B refinement; center crop is the correct safe default for v1.
-    const filter =
-      dimensions === "1080x1920" && !nativeVertical
-        ? `crop=ih*9/16:ih,scale=${w}:${h}`
-        : `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2`;
+    // Legacy 9:16 reframe crops to the centre of the 16:9 master (only used when native
+    // 9:16 is off, i.e. legacy payloads).
+    const legacyCrop = dimensions === "1080x1920" && !nativeVertical;
+    const filter = legacyCrop
+      ? `crop=ih*9/16:ih,scale=${w}:${h}`
+      : `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2`;
 
-    ffmpeg(inputPath)
-      .videoFilters(filter)
-      .outputOptions(["-c:a", "copy", "-movflags", "+faststart"])
-      .output(outputPath)
-      .on("end", () => resolve(outputPath))
-      .on("error", (err) => reject(new Error(`Format render failed (${dimensions}): ${err.message}`)))
-      .run();
+    // SPEED: when the assembled video is ALREADY the target size (the normal case now —
+    // 16:9 clips are 1920x1080 and native 9:16 clips are 1080x1920), the scale/pad is a
+    // no-op, so stream-copy instead of re-encoding the entire video a final time.
+    ffmpeg.ffprobe(inputPath, (probeErr, meta) => {
+      const vs = !probeErr && meta && meta.streams && meta.streams.find((x) => x.codec_type === "video");
+      const alreadyTarget = !legacyCrop && vs && String(vs.width) === w && String(vs.height) === h;
+
+      const cmd = ffmpeg(inputPath);
+      if (alreadyTarget) {
+        cmd.outputOptions(["-c", "copy", "-movflags", "+faststart"]);
+      } else {
+        cmd.videoFilters(filter)
+           .outputOptions(["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-c:a", "copy", "-movflags", "+faststart"]);
+      }
+      cmd.output(outputPath)
+        .on("end", () => resolve(outputPath))
+        .on("error", (err) => reject(new Error(`Format render failed (${dimensions}): ${err.message}`)))
+        .run();
+    });
   });
 }
 
@@ -1304,7 +1316,7 @@ function appendClosingCardWithAudio(mainPath, closingCard, musicPath, workDir, o
 
       command
         .complexFilter(filterParts)
-        .outputOptions(["-map", "[outv]", "-map", "[outa]", "-c:v", "libx264", "-c:a", "aac", "-pix_fmt", "yuv420p"])
+        .outputOptions(["-map", "[outv]", "-map", "[outa]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-c:a", "aac", "-pix_fmt", "yuv420p"])
         .output(outputPath)
         .on("end", () => {
           if (settled) return;
