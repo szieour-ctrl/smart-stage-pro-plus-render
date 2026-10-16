@@ -489,12 +489,18 @@ app.get("/test-reel-overlay", requireSecret, async (req, res) => {
     const details = [q.price, q.beds && `${q.beds} Bd`, q.baths && `${q.baths} Ba`, q.sqft && `${Number(q.sqft).toLocaleString("en-US")} Sq Ft`];
     const t1 = Date.now();
     // Optional Marketing Profile images (public URLs). A failed fetch just falls back to text-only.
-    const fetchBuf = async (u) => {
-      if (!u) return null;
-      try { return Buffer.from((await axios.get(u, { responseType: "arraybuffer", timeout: 15000 })).data); }
-      catch (e) { console.warn(`[test-reel-overlay] could not fetch ${u}: ${e.message}`); return null; }
+    const warnings = [];
+    const fetchImg = async (label, u) => {
+      if (!u) return { buf: null, type: "" };
+      try {
+        const r = await axios.get(u, { responseType: "arraybuffer", timeout: 15000 });
+        return { buf: Buffer.from(r.data), type: String(r.headers["content-type"] || "") };
+      } catch (e) {
+        warnings.push(`${label} skipped: could not fetch (${e.message})`);
+        return { buf: null, type: "" };
+      }
     };
-    const [logoBuf, headshotBuf] = await Promise.all([fetchBuf(q.logoUrl), fetchBuf(q.headshotUrl)]);
+    const [logo, headshot] = await Promise.all([fetchImg("logo", q.logoUrl), fetchImg("headshot", q.headshotUrl)]);
     const textPng = await renderBrandedOverlay({
       headline: "JUST LISTED",
       address: q.address || "123 Example Street",
@@ -502,7 +508,8 @@ app.get("/test-reel-overlay", requireSecret, async (req, res) => {
       details,
       cta: "Schedule a Private Tour",
       brand: { licensedName: q.name || "", dre: q.dre || "", brokerage: q.brokerage || "" },
-      logoBuf, headshotBuf,
+      logoBuf: logo.buf, logoType: logo.type, headshotBuf: headshot.buf, headshotType: headshot.type,
+      warnings,
     }, path.join(workDir, "overlay_text.png"));
     const badgePng = await renderBadgeLayer({ badgeType: "virtually_staged" }, path.join(workDir, "overlay_badge.png"));
     const QRCode = require("qrcode");
@@ -523,6 +530,7 @@ app.get("/test-reel-overlay", requireSecret, async (req, res) => {
     res.json({
       success: true,
       timingsMs: { baseKenBurns: baseMs, overlayPngs: overlayMs, compositeBothVariants: compositeMs },
+      warnings,
       brandedUrl,
       unbrandedUrl,
       note: "Uploaded to the smart-stage-scratch/ S3 prefix — auto-expires in 1-2 days.",
