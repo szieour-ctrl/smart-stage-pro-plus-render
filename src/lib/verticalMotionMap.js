@@ -41,7 +41,7 @@ const KLING_TO_KEN_BURNS = {
 };
 
 // Presets that exist in the JS allow-list but not in motionRenderer.py's argparse choices.
-const RENDERER_ALIASES = { float_pull_back: "pull_back" };
+const RENDERER_ALIASES = {};
 
 function mapKlingPresetToKenBurns(klingPreset) {
   return KLING_TO_KEN_BURNS[klingPreset] || null;

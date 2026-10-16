@@ -94,7 +94,8 @@ def parse_args():
                              "soft_push_float_strong_push",
                              "push_tilt_up", "push_tilt_down",
                              "push_pan_left", "push_pan_right",
-                             "pan_left_push", "pan_right_push"])
+                             "pan_left_push", "pan_right_push",
+                             "float_pull_back"])
     p.add_argument("--duration",   type=float, required=True)
     p.add_argument("--output",     required=True,  help="Output .mp4 path")
     p.add_argument("--start-zoom", type=float, default=1.0, dest="start_zoom")
@@ -245,6 +246,16 @@ COMPOUND_PRESETS = {
     "pan_right_push": (
         1.16, -0.12, 0.0,
         [(0.5, 0.0, 0.240, 0.0), (0.5, 0.180, 0.0, 0.0)],
+    ),
+
+    # Float, then a full pull-back settle (Reveal End Motion). This preset was
+    # listed in motionPresets.js / REVEAL_PRESETS but never existed in the
+    # renderer, so any Reveal using it crashed with an argparse "invalid choice".
+    "float_pull_back": (
+        1.18, 0.0, 0.0, [
+            (0.40, 0.012, 0.010, -0.006),   # Float
+            (0.60, -0.190, 0.0, 0.0),       # Pull back to ~full frame
+        ],
     ),
 }
 
