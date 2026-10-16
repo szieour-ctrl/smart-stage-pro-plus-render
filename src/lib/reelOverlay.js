@@ -93,14 +93,27 @@ async function justListedSvg(p, part = "all") {
   const bord = hex(brand.border, "#D4AF37");
   const ink = textOn(sec);
   const headline = p.headline || "JUST LISTED";
-  const detail = (p.details || []).filter(Boolean).join("   •   ");
+  // Details render on two lines so they can be big: price on top, "Bd • Ba • Sq Ft" beneath.
+  const dItems = (p.details || []).filter(Boolean);
+  const dLine1 = dItems.length > 1 ? dItems[0] : "";
+  const dLine2 = dItems.length > 1 ? dItems.slice(1).join("  •  ") : dItems.join("  •  ");
+  const detail = dItems.join(" ");
   const cta = p.cta || "Schedule a Private Tour";
   const hs = fit(headline, 920, 120, 70);
   const as = fit(p.address, 920, 56, 36, 0.6);
-  const ds = fit(detail, 880, 40, 28, 0.58);
+  const d1 = dLine1 ? fit(dLine1, 860, 68, 44, 0.6) : 0;
+  const d2 = dLine2 ? fit(dLine2, 860, 50, 34, 0.58) : 0;
+  const detailH = (d1 ? 74 : 0) + (d2 ? 62 : 0);
+  const detailW = Math.max(dLine1.length * d1 * 0.6, dLine2.length * d2 * 0.58);
+  const detailSvg = (cx, top) => {
+    let yy = top, out = "";
+    if (d1) { yy += d1 * 0.95; out += `<text x="${cx}" y="${Math.round(yy)}" text-anchor="middle" font-family="Montserrat" font-weight="700" font-size="${d1}" fill="${ink}">${esc(dLine1)}</text>`; yy += 18; }
+    if (d2) { yy += d2 * 0.95; out += `<text x="${cx}" y="${Math.round(yy)}" text-anchor="middle" font-family="Montserrat" font-weight="600" font-size="${d2}" fill="${ink}">${esc(dLine2)}</text>`; }
+    return out;
+  };
   const cs = fit(cta, 560, 38, 26, 0.64);
-  const dsO = fit(detail, 860, 40, 28, 0.58);
-  const pillW = Math.min(940, Math.round(detail.length * dsO * 0.58) + 96);
+  const pillW = Math.min(980, Math.round(detailW) + 110);
+  const pillH = detailH + 40;
   const ctaW = Math.min(820, Math.max(520, cta.length * cs * 0.66 + 110));
 
   const warnings = p.warnings;
@@ -114,15 +127,15 @@ async function justListedSvg(p, part = "all") {
     logo = lb ? await prepLogo(lb) : null;
   } catch (e) { logo = null; if (warnings) warnings.push(`logo skipped: ${e.message}`); }
   const hasDetail = detail.length > 0;
-  const hasIdentity = !!(brand.licensedName || brand.dre || brand.brokerage || headshot || logo);
+  const hasIdentity = !p.unbranded && !!(brand.licensedName || brand.dre || brand.brokerage || headshot || logo);
 
   // Panel stacks from a fixed bottom edge (y=1462) so it never reaches the badge zone below.
-  const PAD = 26, ROW_D = hasDetail ? 66 : 0, ROW_C = 82, ROW_I = hasIdentity ? 22 + ID_H : 0;
+  const PAD = 26, ROW_D = hasDetail ? detailH + 14 : 0, ROW_C = p.unbranded ? 0 : 82, ROW_I = hasIdentity ? 22 + ID_H : 0;
   const panelH = PAD + ROW_D + ROW_C + ROW_I + PAD;
   const panelBottom = 1462;
   const panelY = panelBottom - panelH;
   let y = panelY + PAD;
-  const detailBase = y + 44; y += ROW_D;
+  const detailTop = y; y += ROW_D;
   const ctaY = y; y += ROW_C;
   const idY = y + 22; // identity row top
 
@@ -174,13 +187,13 @@ ${showTop ? `  <rect x="0" y="0" width="${W}" height="760" fill="url(#t)"/>
   <rect x="${W / 2 - 90}" y="436" width="180" height="6" rx="3" fill="${prim}"/>
   <text x="${W / 2}" y="512" text-anchor="middle" font-family="Montserrat" font-weight="600" font-size="${as}" fill="#fff">${esc(p.address)}</text>
   ${p.cityLine ? `<text x="${W / 2}" y="568" text-anchor="middle" font-family="Montserrat" font-weight="500" font-size="34" fill="#fff" fill-opacity="0.9">${esc(p.cityLine)}</text>` : ""}
-  ${hasDetail ? `<rect x="${(W - pillW) / 2}" y="604" width="${pillW}" height="74" rx="37" fill="${sec}" fill-opacity="0.94" stroke="${bord}" stroke-width="3"/>
-  <text x="${W / 2}" y="654" text-anchor="middle" font-family="Montserrat" font-weight="600" font-size="${dsO}" fill="${ink}">${esc(detail)}</text>` : ""}` : ""}
+  ${hasDetail ? `<rect x="${(W - pillW) / 2}" y="604" width="${pillW}" height="${pillH}" rx="40" fill="${sec}" fill-opacity="0.94" stroke="${bord}" stroke-width="3"/>
+  ${detailSvg(W / 2, 604 + 20)}` : ""}` : ""}
 ${showBottom ? `  <rect x="0" y="${panelY - 120}" width="${W}" height="${H - panelY + 120}" fill="url(#b)"/>
   <rect x="60" y="${panelY}" width="960" height="${panelH}" rx="28" fill="${sec}" fill-opacity="0.94" stroke="${bord}" stroke-width="3"/>
-  ${hasDetail ? `<text x="${W / 2}" y="${detailBase}" text-anchor="middle" font-family="Montserrat" font-weight="600" font-size="${ds}" fill="${ink}">${esc(detail)}</text>` : ""}
-  <rect x="${W / 2 - ctaW / 2}" y="${ctaY}" width="${ctaW}" height="76" rx="38" fill="${prim}"/>
-  <text x="${W / 2}" y="${ctaY + 50}" text-anchor="middle" font-family="Montserrat" font-weight="700" font-size="${cs}" fill="${textOn(prim)}" letter-spacing="1">${esc(cta)}</text>${identity}
+  ${hasDetail ? detailSvg(W / 2, detailTop) : ""}
+${p.unbranded ? "" : `<rect x="${W / 2 - ctaW / 2}" y="${ctaY}" width="${ctaW}" height="76" rx="38" fill="${prim}"/>
+  <text x="${W / 2}" y="${ctaY + 50}" text-anchor="middle" font-family="Montserrat" font-weight="700" font-size="${cs}" fill="${textOn(prim)}" letter-spacing="1">${esc(cta)}</text>`}${identity}
 ` : ""}
 </svg>`;
 }
