@@ -26,7 +26,7 @@ const V_CANVAS = { w: 1080, h: 1920 };
 
 function safeVerticalPreset(name) {
   const mapped = toVerticalKenBurns(name);
-  return mapped && VALID_PRESETS.has(mapped) && mapped !== "float_pull_back" ? mapped : "push_in";
+  return mapped && VALID_PRESETS.has(mapped) ? mapped : "push_in";
 }
 
 async function computeFocals(localFrames, workDir) {
