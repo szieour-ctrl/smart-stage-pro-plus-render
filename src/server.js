@@ -24,6 +24,7 @@ const { runHdrTest } = require("./lib/hdrTestPipeline");
 const { downloadFrames } = require("./lib/downloadFrames");
 const { applyMotionPreset, VALID_PRESETS } = require("./lib/motionPresets");
 const { uploadScratchFile } = require("./lib/s3Upload");
+const { renderBrandedOverlay, renderUnbrandedOverlay, compositeOverlay } = require("./lib/reelOverlay");
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
@@ -442,6 +443,76 @@ app.get("/test-motion", requireSecret, async (req, res) => {
       duration: duration ? Number(duration) : 6.0,
       endingZoom: result.endingZoom,
       videoUrl,
+      note: "Uploaded to the smart-stage-scratch/ S3 prefix — auto-expires in 1-2 days.",
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    fs.rm(workDir, { recursive: true, force: true }, () => {});
+  }
+});
+
+// ── TEMPORARY DIAGNOSTIC — REELS v1 OVERLAY TEMPLATE SPIKE ──────────────
+// Renders ONE room photo as a native 9:16 Ken Burns base (no text), then runs
+// the overlay pass twice: BRANDED (Just Listed template + licensed identity
+// footer) and UNBRANDED (MLS: AB 723 badge + compliance QR only). Both mp4s go
+// to the smart-stage-scratch/ S3 prefix (1-2 day expiry). Nothing here touches
+// credits, Supabase, or the private video-finals prefix.
+//
+//   /test-reel-overlay?imageUrl=<url>&address=<street>&cityLine=<city>
+//     &price=<text>&beds=<n>&baths=<n>&sqft=<n>&name=<licensed name>
+//     &dre=<DRE#>&brokerage=<name>&duration=<seconds, default 8>
+//   x-railway-secret header required, same as /test-motion.
+//
+// Remove once the Reels overlay engine is promoted out of spike status.
+app.get("/test-reel-overlay", requireSecret, async (req, res) => {
+  const q = req.query;
+  if (!q.imageUrl) {
+    return res.status(400).json({
+      error: "Missing required query param: imageUrl",
+      optional: ["address", "cityLine", "price", "beds", "baths", "sqft", "name", "dre", "brokerage", "duration"],
+    });
+  }
+  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "test-reel-overlay-"));
+  try {
+    const t0 = Date.now();
+    const [localFrame] = await downloadFrames([{ imageUrl: q.imageUrl }], workDir);
+    const duration = q.duration ? Math.min(Math.max(Number(q.duration) || 8, 4), 15) : 8;
+    const base = await applyMotionPreset(
+      { ...localFrame, vertical: true, focal: { fx: 0.5, fy: 0.5 }, motionPreset: "push_in", durationSeconds: duration },
+      workDir, 1.0
+    );
+    const baseMs = Date.now() - t0;
+
+    const details = [q.price, q.beds && `${q.beds} Bd`, q.baths && `${q.baths} Ba`, q.sqft && `${Number(q.sqft).toLocaleString("en-US")} Sq Ft`];
+    const t1 = Date.now();
+    const brandedPng = await renderBrandedOverlay({
+      headline: "JUST LISTED",
+      address: q.address || "123 Example Street",
+      cityLine: q.cityLine || "",
+      details,
+      cta: "Schedule a Private Tour",
+      brand: { licensedName: q.name || "", dre: q.dre || "", brokerage: q.brokerage || "" },
+    }, path.join(workDir, "overlay_branded.png"));
+    const QRCode = require("qrcode");
+    const qrPng = await QRCode.toBuffer("https://smartstagepro.com", { margin: 1, width: 200 });
+    const unbrandedPng = await renderUnbrandedOverlay({ badgeType: "virtually_staged", qrPng }, path.join(workDir, "overlay_unbranded.png"));
+    const overlayMs = Date.now() - t1;
+
+    const t2 = Date.now();
+    const brandedMp4 = await compositeOverlay(base.path, brandedPng, path.join(workDir, "reel_branded.mp4"));
+    const unbrandedMp4 = await compositeOverlay(base.path, unbrandedPng, path.join(workDir, "reel_unbranded.mp4"));
+    const compositeMs = Date.now() - t2;
+
+    const stamp = Date.now();
+    const brandedUrl = await uploadScratchFile(brandedMp4, `test-reel-branded_${stamp}.mp4`, "video/mp4");
+    const unbrandedUrl = await uploadScratchFile(unbrandedMp4, `test-reel-unbranded_${stamp}.mp4`, "video/mp4");
+
+    res.json({
+      success: true,
+      timingsMs: { baseKenBurns: baseMs, overlayPngs: overlayMs, compositeBothVariants: compositeMs },
+      brandedUrl,
+      unbrandedUrl,
       note: "Uploaded to the smart-stage-scratch/ S3 prefix — auto-expires in 1-2 days.",
     });
   } catch (err) {
