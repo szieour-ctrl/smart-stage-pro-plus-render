@@ -35,6 +35,14 @@ const ID_H = 124;         // identity row height
 // bottomFrac (e.g. 0.165 puts the bottom edge at ~y=1603) if a Reel will be posted there.
 const REEL_BADGE = { wFrac: 0.45, leftFrac: 0.05, bottomFrac: 0.06 };
 
+// Canvas layouts. Portrait = Reels / native 9:16 video; landscape = 16:9 video end card.
+const PORTRAIT = { w: W, h: H, cx: 540, panelX: 60, panelW: 960, panelBottom: 1462, qrTop: 640, qrCard: QR_CARD, qrImg: QR_IMG, detailMaxW: 860, d1: 68, d2: 50 };
+const LANDSCAPE = { w: 1920, h: 1080, cx: 1190, panelX: 640, panelW: 1100, panelBottom: 990, qrTop: 130, qrCard: 300, qrImg: 256, detailMaxW: 1000, d1: 60, d2: 44 };
+// Native 9:16 VIDEO (not Reels): its AB 723 badge keeps badgeAssets' geometry (y~1368-1498), so the
+// end panel sits above it.
+const PORTRAIT_VIDEO = { ...PORTRAIT, panelBottom: 1340, qrTop: 430 };
+const canvasFor = (c) => (c === "landscape" ? LANDSCAPE : c === "portraitVideo" ? PORTRAIT_VIDEO : PORTRAIT);
+
 const esc = (s) =>
   String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
@@ -85,7 +93,7 @@ async function prepLogo(buf) {
 
 // part: "opening" (headline/address/details pill), "closing" (details + CTA + identity panel),
 // or "all". The two parts are separate layers so each appears only in its own clip.
-async function justListedSvg(p, part = "all") {
+async function justListedSvg(p, part = "all", cv = PORTRAIT) {
   const showTop = part !== "closing", showBottom = part !== "opening";
   const brand = p.brand || {};
   const prim = hex(brand.primary, "#B8860B");
@@ -101,8 +109,8 @@ async function justListedSvg(p, part = "all") {
   const cta = p.cta || "Schedule a Private Tour";
   const hs = fit(headline, 920, 120, 70);
   const as = fit(p.address, 920, 56, 36, 0.6);
-  const d1 = dLine1 ? fit(dLine1, 860, 68, 44, 0.6) : 0;
-  const d2 = dLine2 ? fit(dLine2, 860, 50, 34, 0.58) : 0;
+  const d1 = dLine1 ? fit(dLine1, cv.detailMaxW, cv.d1, 44, 0.6) : 0;
+  const d2 = dLine2 ? fit(dLine2, cv.detailMaxW, cv.d2, 34, 0.58) : 0;
   const detailH = (d1 ? 74 : 0) + (d2 ? 62 : 0);
   const detailW = Math.max(dLine1.length * d1 * 0.6, dLine2.length * d2 * 0.58);
   const detailSvg = (cx, top) => {
@@ -130,18 +138,19 @@ async function justListedSvg(p, part = "all") {
   const hasIdentity = !p.unbranded && !!(brand.licensedName || brand.dre || brand.brokerage || headshot || logo);
 
   // Panel stacks from a fixed bottom edge (y=1462) so it never reaches the badge zone below.
-  const PAD = 26, ROW_D = hasDetail ? detailH + 14 : 0, ROW_C = p.unbranded ? 0 : 82, ROW_I = hasIdentity ? 22 + ID_H : 0;
-  const panelH = PAD + ROW_D + ROW_C + ROW_I + PAD;
-  const panelBottom = 1462;
+  const PAD = 26, ROW_D = hasDetail ? detailH + 14 : 0, ROW_C = p.unbranded ? 0 : 82, ROW_A = p.closingAddress ? 52 : 0, ROW_I = hasIdentity ? 22 + ID_H : 0;
+  const panelH = PAD + ROW_A + ROW_D + ROW_C + ROW_I + PAD;
+  const panelBottom = cv.panelBottom;
   const panelY = panelBottom - panelH;
   let y = panelY + PAD;
+  const addrTop = y; y += ROW_A;
   const detailTop = y; y += ROW_D;
   const ctaY = y; y += ROW_C;
   const idY = y + 22; // identity row top
 
   let identity = "";
   if (hasIdentity) {
-    const left = 92, right = 988;
+    const left = cv.panelX + 32, right = cv.panelX + cv.panelW - 32;
     const hsX = left, hsY = idY + Math.round((ID_H - HS) / 2);
     const logoX = logo ? right - logo.w : right;
     const logoY = idY + Math.round((ID_H - (logo ? logo.h : 0)) / 2);
@@ -149,7 +158,7 @@ async function justListedSvg(p, part = "all") {
     const maxTextW = (logo ? logoX - 24 : right) - textX;
     const centered = !headshot && !logo;
     const anchor = centered ? "middle" : "start";
-    const tx = centered ? W / 2 : textX;
+    const tx = centered ? cv.cx : textX;
     const line1 = brand.licensedName || "";
     const line2 = [brand.dre ? `DRE #${brand.dre}` : "", brand.brokerage || ""].filter(Boolean);
     const f1 = fit(line1, maxTextW, 34, 24, 0.62);
@@ -177,7 +186,7 @@ async function justListedSvg(p, part = "all") {
 
   // Scrims fade to fully transparent on the photo side and run to the frame edge, so
   // there is no visible hard edge anywhere.
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}">
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${cv.w}" height="${cv.h}">
   <defs>
     <linearGradient id="t" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#000" stop-opacity="0.6"/><stop offset="1" stop-color="#000" stop-opacity="0"/></linearGradient>
     <linearGradient id="b" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#000" stop-opacity="0"/><stop offset="1" stop-color="#000" stop-opacity="0.55"/></linearGradient>
@@ -189,11 +198,12 @@ ${showTop ? `  <rect x="0" y="0" width="${W}" height="760" fill="url(#t)"/>
   ${p.cityLine ? `<text x="${W / 2}" y="568" text-anchor="middle" font-family="Montserrat" font-weight="500" font-size="34" fill="#fff" fill-opacity="0.9">${esc(p.cityLine)}</text>` : ""}
   ${hasDetail ? `<rect x="${(W - pillW) / 2}" y="604" width="${pillW}" height="${pillH}" rx="40" fill="${sec}" fill-opacity="0.94" stroke="${bord}" stroke-width="3"/>
   ${detailSvg(W / 2, 604 + 20)}` : ""}` : ""}
-${showBottom ? `  <rect x="0" y="${panelY - 120}" width="${W}" height="${H - panelY + 120}" fill="url(#b)"/>
-  <rect x="60" y="${panelY}" width="960" height="${panelH}" rx="28" fill="${sec}" fill-opacity="0.94" stroke="${bord}" stroke-width="3"/>
-  ${hasDetail ? detailSvg(W / 2, detailTop) : ""}
-${p.unbranded ? "" : `<rect x="${W / 2 - ctaW / 2}" y="${ctaY}" width="${ctaW}" height="76" rx="38" fill="${prim}"/>
-  <text x="${W / 2}" y="${ctaY + 50}" text-anchor="middle" font-family="Montserrat" font-weight="700" font-size="${cs}" fill="${textOn(prim)}" letter-spacing="1">${esc(cta)}</text>`}${identity}
+${showBottom ? `  <rect x="0" y="${panelY - 120}" width="${cv.w}" height="${cv.h - panelY + 120}" fill="url(#b)"/>
+  <rect x="${cv.panelX}" y="${panelY}" width="${cv.panelW}" height="${panelH}" rx="28" fill="${sec}" fill-opacity="0.94" stroke="${bord}" stroke-width="3"/>
+  ${p.closingAddress ? `<text x="${cv.cx}" y="${addrTop + 36}" text-anchor="middle" font-family="Montserrat" font-weight="600" font-size="${fit(p.closingAddress, cv.panelW - 80, 34, 24, 0.6)}" fill="${ink}" fill-opacity="0.92">${esc(p.closingAddress)}</text>` : ""}
+  ${hasDetail ? detailSvg(cv.cx, detailTop) : ""}
+${p.unbranded ? "" : `<rect x="${cv.cx - ctaW / 2}" y="${ctaY}" width="${ctaW}" height="76" rx="38" fill="${prim}"/>
+  <text x="${cv.cx}" y="${ctaY + 50}" text-anchor="middle" font-family="Montserrat" font-weight="700" font-size="${cs}" fill="${textOn(prim)}" letter-spacing="1">${esc(cta)}</text>`}${identity}
 ` : ""}
 </svg>`;
 }
@@ -206,8 +216,8 @@ function fitText(text, maxW, size, k = 0.58) {
 
 // params.logoBuf / params.headshotBuf: optional image Buffers from the Marketing Profile.
 // params.warnings: optional array; images that can't be decoded are skipped and reported there.
-async function renderBrandedOverlay(params, outPng, part = "all") {
-  const svg = await justListedSvg(params, part);
+async function renderBrandedOverlay(params, outPng, part = "all", canvas = "portrait") {
+  const svg = await justListedSvg(params, part, canvasFor(canvas));
   await sharp(Buffer.from(svg)).png().toFile(outPng);
   return outPng;
 }
@@ -229,15 +239,16 @@ async function renderBadgeLayer({ badgeType = "virtually_staged" } = {}, outPng)
 
 // Compliance QR as a centered white card. Only composited for the last second.
 // qrPng is a PNG Buffer (generate-qr.js output on the Netlify side).
-async function renderQrLayer({ qrPng }, outPng) {
-  const qr = await sharp(qrPng).resize(QR_IMG, QR_IMG, { kernel: "nearest" }).png().toBuffer();
+async function renderQrLayer({ qrPng }, outPng, canvas = "portrait") {
+  const cv = canvasFor(canvas);
+  const qr = await sharp(qrPng).resize(cv.qrImg, cv.qrImg, { kernel: "nearest" }).png().toBuffer();
   const card = Buffer.from(
-    `<svg xmlns="http://www.w3.org/2000/svg" width="${QR_CARD}" height="${QR_CARD}"><rect width="${QR_CARD}" height="${QR_CARD}" rx="28" fill="#fff"/></svg>`
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${cv.qrCard}" height="${cv.qrCard}"><rect width="${cv.qrCard}" height="${cv.qrCard}" rx="28" fill="#fff"/></svg>`
   );
-  const pad = Math.round((QR_CARD - QR_IMG) / 2);
+  const pad = Math.round((cv.qrCard - cv.qrImg) / 2);
   const cardPng = await sharp(card).composite([{ input: qr, left: pad, top: pad }]).png().toBuffer();
-  await sharp({ create: { width: W, height: H, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } } })
-    .composite([{ input: cardPng, left: Math.round((W - QR_CARD) / 2), top: 640 }])
+  await sharp({ create: { width: cv.w, height: cv.h, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } } })
+    .composite([{ input: cardPng, left: Math.round(cv.cx - cv.qrCard / 2), top: cv.qrTop }])
     .png().toFile(outPng);
   return outPng;
 }
@@ -314,7 +325,17 @@ async function compositeReel(baseVideo, { openingPng, closingPng, textPng, badge
   return compositeLayers(baseVideo, layers, outVideo);
 }
 
+// 16:9 / native 9:16 VIDEO end card: the closing panel fades in over the LAST seconds of the
+// finished video (no appended clip, audio untouched) and the compliance QR joins for the final
+// second. Pass only the layers you have; either may be omitted. Badge is NOT drawn here (the
+// video pipeline already carries the AB 723 badge).
+async function compositeEndCard(baseVideo, { panelPng, qrPng }, outVideo, opts = {}) {
+  return compositeReel(baseVideo, { closingPng: panelPng, qrPng }, outVideo,
+    { openStartSec: 0, openSec: 0, closeSec: 3.5, qrLeadSec: 1.0, ...opts });
+}
+
 module.exports = {
+  compositeEndCard,
   renderBrandedOverlay, renderBadgeLayer, renderQrLayer,
   compositeLayers, compositeReel, probeDuration, W, H,
 };
