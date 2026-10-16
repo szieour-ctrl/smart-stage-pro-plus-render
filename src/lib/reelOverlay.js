@@ -28,9 +28,12 @@ const QR_IMG = 300;
 const HS = 124;           // headshot circle diameter
 const LOGO_W = 300, LOGO_H = 108; // logo fits inside this box
 const ID_H = 124;         // identity row height
-// Reels badge sits lower than the 16:9/standard-video geometry: bottom edge ~y=1603, just above
-// the platform UI zone. (badgeAssets' geometry is untouched, so existing videos don't move.)
-const REEL_BADGE = { wFrac: 0.45, leftFrac: 0.05, bottomFrac: 0.165 };
+// Reels badge geometry (badgeAssets' geometry is untouched, so existing videos don't move).
+// The badge is composited as a fixed overlay on the clean (unbadged) image, so it is not at
+// risk of being cropped and can sit in the lowest part of the frame: bottom edge ~y=1805.
+// NOTE: Instagram/TikTok caption/profile UI covers roughly y>1632 on those platforms; raise
+// bottomFrac (e.g. 0.165 puts the bottom edge at ~y=1603) if a Reel will be posted there.
+const REEL_BADGE = { wFrac: 0.45, leftFrac: 0.05, bottomFrac: 0.06 };
 
 const esc = (s) =>
   String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
