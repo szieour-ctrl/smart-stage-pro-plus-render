@@ -131,12 +131,13 @@ async function renderReel(job, onStep = () => {}) {
     onStep("Finishing the Reel");
     t = Date.now();
     const out = {};
-    await Promise.all(variants.map(async (v) => {
+    // One variant at a time: two parallel composites doubled peak memory and got the job OOM-killed.
+    for (const v of variants) {
       const pngs = [];
       for (let i = 0; i < specs.length; i++) pngs.push(await sb.renderScenePng(specs[i], v.params, path.join(workDir, `scene_${v.key}_${i}.png`), workDir, `${v.key}${i}`));
       const mp4 = await sb.compositeStoryboard(basePath, pngs, path.join(workDir, `reel_${v.key}.mp4`), { ...badgeOpts, qrPng, windows });
       out[v.key] = await uploadReelDraft(mp4, `smart-stage-reel-drafts/${jobId}/${v.key}_${Date.now()}.mp4`);
-    }));
+    }
     timings.compositeMs = Date.now() - t;
     return { keys: out, durationSec: Math.round(total * 10) / 10, scenes: n, timingsMs: timings, warnings };
   } finally {
