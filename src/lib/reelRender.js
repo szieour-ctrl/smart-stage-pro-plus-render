@@ -15,6 +15,7 @@ const axios = require("axios");
 const { execFile } = require("child_process");
 const QRCode = require("qrcode");
 const { downloadFrames } = require("./downloadFrames");
+const { mapWithConcurrencyLimit } = require("./assemble");
 const { computeFocals } = require("./verticalPipeline");
 const { applyMotionPreset, VALID_PRESETS } = require("./motionPresets");
 const { toVerticalKenBurns } = require("./verticalMotionMap");
@@ -64,14 +65,14 @@ async function renderReel(job, onStep = () => {}) {
     onStep("Rendering motion");
     t = Date.now();
     const clipDur = lengthSec / n;
-    const clips = [];
-    for (let i = 0; i < n; i++) {
+    // Clips are independent (hard cuts, no zoom carry-over), so render a few at a time.
+    const clips = await mapWithConcurrencyLimit(scenes, 3, async (sc, i) => {
       const c = await applyMotionPreset(
-        { ...frames[i], roomLabel: scenes[i].roomLabel || null, vertical: true, focal: focals[i] || { fx: 0.5, fy: 0.5 },
-          motionPreset: verticalPreset(scenes[i].motion), durationSeconds: clipDur },
+        { ...frames[i], roomLabel: sc.roomLabel || null, vertical: true, focal: focals[i] || { fx: 0.5, fy: 0.5 },
+          motionPreset: verticalPreset(sc.motion), durationSeconds: clipDur },
         workDir, 1.0);
-      clips.push(c.path);
-    }
+      return c.path;
+    });
     const windows = [];
     let cursor = 0;
     for (const c of clips) { const d = await probeDuration(c); windows.push({ start: cursor, end: cursor + d }); cursor += d; }
@@ -120,12 +121,12 @@ async function renderReel(job, onStep = () => {}) {
     onStep("Finishing the Reel");
     t = Date.now();
     const out = {};
-    for (const v of variants) {
+    await Promise.all(variants.map(async (v) => {
       const pngs = [];
       for (let i = 0; i < specs.length; i++) pngs.push(await sb.renderScenePng(specs[i], v.params, path.join(workDir, `scene_${v.key}_${i}.png`), workDir, `${v.key}${i}`));
       const mp4 = await sb.compositeStoryboard(basePath, pngs, path.join(workDir, `reel_${v.key}.mp4`), { ...badgeOpts, qrPng, windows });
       out[v.key] = await uploadReelDraft(mp4, `smart-stage-reel-drafts/${jobId}/${v.key}_${Date.now()}.mp4`);
-    }
+    }));
     timings.compositeMs = Date.now() - t;
     return { keys: out, durationSec: Math.round(total * 10) / 10, scenes: n, timingsMs: timings, warnings };
   } finally {

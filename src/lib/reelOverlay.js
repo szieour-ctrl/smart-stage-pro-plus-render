@@ -329,19 +329,27 @@ function probeDuration(file) {
 // Each layer fades in at startSec and stays on to the end. overlay=shortest=1 ends each
 // (looped) PNG input with the base video. Audio is copied untouched.
 async function compositeLayers(baseVideo, layers, outVideo) {
+  // Speed (Oct 17 2026): each PNG input is trimmed to the seconds it is actually on screen and shifted to its
+  // start time, so ffmpeg only filters/overlays those frames (it used to process every layer for the whole
+  // video, which made a 45s Reel take minutes). eof_action=pass lets the base show through after a layer ends.
+  const total = await probeDuration(baseVideo);
   const args = ["-y", "-i", baseVideo];
-  layers.forEach((l) => args.push("-loop", "1", "-i", l.png));
+  const meta = layers.map((l) => {
+    const start = Math.max(0, l.startSec || 0), fade = l.fadeSec ?? 0.4;
+    const end = l.endSec != null ? Math.min(total, l.endSec) : total;
+    const fo = l.endSec != null ? (l.fadeOutSec ?? 0.4) : 0;
+    return { start, fade, end, fo, dur: Math.max(0.2, end - start) };
+  });
+  layers.forEach((l, i) => args.push("-framerate", "25", "-loop", "1", "-t", (meta[i].dur + 0.1).toFixed(3), "-i", l.png));
   const parts = [];
   let prev = "0:v";
   layers.forEach((l, i) => {
-    const start = Math.max(0, l.startSec || 0), fade = l.fadeSec ?? 0.4;
-    let f = `[${i + 1}:v]format=rgba,fade=t=in:st=${start.toFixed(3)}:d=${fade}:alpha=1`;
-    if (l.endSec != null) {
-      const fo = l.fadeOutSec ?? 0.4;
-      f += `,fade=t=out:st=${Math.max(start, l.endSec - fo).toFixed(3)}:d=${fo}:alpha=1`;
-    }
+    const m = meta[i];
+    let f = `[${i + 1}:v]format=rgba,fade=t=in:st=0:d=${m.fade}:alpha=1`;
+    if (m.fo > 0) f += `,fade=t=out:st=${Math.max(0, m.dur - m.fo).toFixed(3)}:d=${m.fo}:alpha=1`;
+    f += `,setpts=PTS+${m.start.toFixed(3)}/TB`;
     parts.push(`${f}[ov${i}]`);
-    parts.push(`[${prev}][ov${i}]overlay=0:0:format=auto:shortest=1[v${i}]`);
+    parts.push(`[${prev}][ov${i}]overlay=0:0:format=auto:eof_action=pass[v${i}]`);
     prev = `v${i}`;
   });
   parts.push(`[${prev}]format=yuv420p[out]`);
