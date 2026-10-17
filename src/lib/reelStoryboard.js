@@ -204,6 +204,25 @@ function mergeSpecs(a, b) {
 // Reel photo-count limits per length (Oct 17, 2026): each photo gets 2.5-7.5s.
 const REEL_PHOTO_RANGES = { 15: [3, 6], 30: [4, 8], 45: [6, 8], 60: [8, 8] };
 const MIN_SCENES = 3, MAX_SCENES = 8;
+const REEL_SCENE_MIN = 2.5, REEL_REVEAL_MIN = 3.0; // seconds; a Before -> After reveal scene needs a little longer
+
+// Seconds per scene for a Reel of lengthSec. reveals[i] = scene i is a Before -> After reveal.
+// Every scene starts at an equal share; reveal scenes are raised to REEL_REVEAL_MIN and the others give
+// the time back (down to REEL_SCENE_MIN). Returns null when the reveals cannot fit in this length.
+function allocateDurations(lengthSec, reveals) {
+  const n = reveals.length;
+  let d = reveals.map((r) => (r ? Math.max(lengthSec / n, REEL_REVEAL_MIN) : lengthSec / n));
+  let over = d.reduce((a, b) => a + b, 0) - lengthSec;
+  for (let pass = 0; pass < 6 && over > 1e-9; pass++) {
+    const room = d.map((x, i) => (reveals[i] ? 0 : Math.max(0, x - REEL_SCENE_MIN)));
+    const tot = room.reduce((a, b) => a + b, 0);
+    if (tot <= 1e-9) break;
+    const cut = Math.min(over, tot);
+    d = d.map((x, i) => x - (cut * room[i]) / tot);
+    over -= cut;
+  }
+  return over > 1e-6 ? null : d;
+}
 
 // How many of the intake highlights the template's own scenes already use (probe with sentinels).
 function highlightsUsed(tpl) {
@@ -307,4 +326,4 @@ async function compositeStoryboard(baseVideo, sceneLayers, outVideo, { badgePng,
   return compositeLayers(baseVideo, layers, outVideo);
 }
 
-module.exports = { TEMPLATES, EVENTS, REEL_PHOTO_RANGES, MIN_SCENES, MAX_SCENES, resolveScenes, renderScenePng, compositeStoryboard, sceneWindows, specLines };
+module.exports = { allocateDurations, REEL_SCENE_MIN, REEL_REVEAL_MIN, TEMPLATES, EVENTS, REEL_PHOTO_RANGES, MIN_SCENES, MAX_SCENES, resolveScenes, renderScenePng, compositeStoryboard, sceneWindows, specLines };
