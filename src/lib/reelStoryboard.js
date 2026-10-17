@@ -201,17 +201,46 @@ function mergeSpecs(a, b) {
   return out;
 }
 
-// Returns the ordered scene specs (6, or 5 with the details + first-feature scenes merged).
+// Reel photo-count limits per length (Oct 17, 2026): each photo gets 2.5-7.5s.
+const REEL_PHOTO_RANGES = { 15: [3, 6], 30: [4, 8], 45: [6, 8], 60: [8, 8] };
+const MIN_SCENES = 3, MAX_SCENES = 8;
+
+// How many of the intake highlights the template's own scenes already use (probe with sentinels).
+function highlightsUsed(tpl) {
+  const probe = { highlights: Array.from({ length: 8 }, (_, i) => `\u0001H${i}`), supporting: Array.from({ length: 8 }, (_, i) => `\u0001S${i}`) };
+  const json = JSON.stringify(tpl.scenes.map((s) => s.build(probe)));
+  let hMax = -1, sMax = -1;
+  for (let i = 0; i < 8; i++) { if (json.includes(`\u0001H${i}`) || json.includes(`\\u0001H${i}`)) hMax = i; if (json.includes(`\u0001S${i}`) || json.includes(`\\u0001S${i}`)) sMax = i; }
+  return { h: hMax + 1, s: sMax + 1 };
+}
+
+// Returns the ordered scene specs for 3-8 photos (one scene per photo).
+//  6 = the template as written. 5 = details + first feature merged. 4/3 = then drop the scenes just
+//  before the closing one (opening + closing are always kept). 7/8 = extra highlight scenes inserted
+//  before the closing scene, using the next unused highlights (a photo-only scene if none are left).
 function resolveScenes(eventKey, data, sceneCount = 6) {
   const tpl = TEMPLATES[eventKey];
   if (!tpl) throw new Error(`Unknown Reel event "${eventKey}". Valid: ${EVENTS.join(", ")}`);
+  const n = Math.round(Number(sceneCount));
+  if (!(n >= MIN_SCENES && n <= MAX_SCENES)) throw new Error(`Reel scene count must be ${MIN_SCENES}-${MAX_SCENES}, got ${sceneCount}`);
   const d = { ...data, highlights: (data.highlights || []).filter(has), supporting: (data.supporting || []).filter(has) };
   let scenes = tpl.scenes.map((s) => ({ role: s.role, image: s.image, ...s.build(d) }));
-  if (sceneCount === 5) {
-    const [i, j] = tpl.mergePair;
+  if (n <= 5) {
+    const [i, j] = tpl.mergePair; // adjacent by construction
     const merged = mergeSpecs(scenes[i], scenes[j]);
     scenes = [...scenes.slice(0, i), merged, ...scenes.slice(j + 1)];
-    // mergePair indices are adjacent by construction
+    while (scenes.length > n) scenes.splice(scenes.length - 2, 1); // drop the scene just before the closing one
+  } else if (n > 6) {
+    const used = highlightsUsed(tpl);
+    const isSupporting = used.s > used.h;
+    const pool = isSupporting ? d.supporting : d.highlights;
+    let next = isSupporting ? used.s : used.h;
+    const closingScene = scenes.pop();
+    while (scenes.length < n - 1) {
+      const text = T(pool[next++]);
+      scenes.push({ role: "Feature", image: "Another standout room or angle", ...(text ? { caption: text } : {}) });
+    }
+    scenes.push(closingScene);
   }
   return scenes;
 }
@@ -273,4 +302,4 @@ async function compositeStoryboard(baseVideo, sceneLayers, outVideo, { badgePng,
   return compositeLayers(baseVideo, layers, outVideo);
 }
 
-module.exports = { TEMPLATES, EVENTS, resolveScenes, renderScenePng, compositeStoryboard, sceneWindows, specLines };
+module.exports = { TEMPLATES, EVENTS, REEL_PHOTO_RANGES, MIN_SCENES, MAX_SCENES, resolveScenes, renderScenePng, compositeStoryboard, sceneWindows, specLines };
