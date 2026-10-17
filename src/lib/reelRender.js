@@ -136,7 +136,7 @@ async function renderReel(job, onStep = () => {}) {
     for (const v of variants) {
       const pngs = [];
       for (let i = 0; i < specs.length; i++) pngs.push(await sb.renderScenePng(specs[i], v.params, path.join(workDir, `scene_${v.key}_${i}.png`), workDir, `${v.key}${i}`));
-      const mp4 = await sb.compositeStoryboard(basePath, pngs, path.join(workDir, `reel_${v.key}.mp4`), { ...badgeOpts, qrPng, windows });
+      const mp4 = await sb.compositeStoryboard(basePath, pngs, path.join(workDir, `reel_${v.key}.mp4`), { ...badgeOpts, qrPng, windows, textOffsets: reveals.map((r) => (r ? REVEAL_OPENER_DURATION - REVEAL_WIPE_DURATION : 0.35)) });
       out[v.key] = await uploadReelDraft(mp4, `smart-stage-reel-drafts/${jobId}/${v.key}_${Date.now()}.mp4`);
     }
     timings.compositeMs = Date.now() - t;
