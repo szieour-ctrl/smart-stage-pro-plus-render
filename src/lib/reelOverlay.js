@@ -311,7 +311,11 @@ function runFfmpeg(args, label) {
     let err = "";
     p.stderr.on("data", (d) => { err = (err + d).slice(-2000); });
     p.on("error", reject);
-    p.on("close", (code) => (code === 0 ? resolve() : reject(new Error(`ffmpeg ${label} failed (${code}): ${err}`))));
+    p.on("close", (code, signal) => {
+      if (code === 0) return resolve();
+      const e = new Error(`ffmpeg ${label} failed (${signal ? "killed by " + signal + (signal === "SIGKILL" ? " - likely out of memory" : "") : code}): ${err.split("\r").pop().slice(-600)}`);
+      e.killed = !!signal; reject(e);
+    });
   });
 }
 
@@ -353,9 +357,17 @@ async function compositeLayers(baseVideo, layers, outVideo) {
     prev = `v${i}`;
   });
   parts.push(`[${prev}]format=yuv420p[out]`);
-  args.push("-filter_complex", parts.join(";"), "-map", "[out]", "-map", "0:a?", "-shortest",
-    "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-c:a", "copy", outVideo);
-  await runFfmpeg(args, "layers");
+  // Memory (Oct 17 2026): a 30s Room Reveal Reel with many layers was OOM-killed on Railway. Cap threads
+  // so peak RAM stays modest; if ffmpeg still gets killed, retry once with the lightest settings.
+  const tail = ["-filter_complex", parts.join(";"), "-map", "[out]", "-map", "0:a?", "-shortest"];
+  const enc = (preset) => ["-c:v", "libx264", "-preset", preset, "-pix_fmt", "yuv420p", "-c:a", "copy", outVideo];
+  try {
+    await runFfmpeg(["-threads", "2", "-filter_threads", "1", "-filter_complex_threads", "1", ...args, ...tail, "-threads", "2", ...enc("veryfast")], "layers");
+  } catch (e) {
+    if (!e.killed) throw e;
+    console.warn("[compositeLayers] ffmpeg was killed (" + e.message.slice(0, 80) + "); retrying with 1 thread");
+    await runFfmpeg(["-threads", "1", "-filter_threads", "1", "-filter_complex_threads", "1", ...args, ...tail, "-threads", "1", ...enc("ultrafast")], "layers");
+  }
   return outVideo;
 }
 
