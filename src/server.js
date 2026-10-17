@@ -571,7 +571,7 @@ app.get("/test-reel-storyboard", requireSecret, async (req, res) => {
   }
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "test-reel-storyboard-"));
   try {
-    const sceneCount = Number(q.scenes) === 5 ? 5 : 6;
+    const sceneCount = Math.min(8, Math.max(3, Math.round(Number(q.scenes)) || 6));
     const duration = q.duration ? Math.min(Math.max(Number(q.duration) || 30, 10), 60) : 30;
     const frames = await downloadFrames(urls.map((imageUrl) => ({ imageUrl })), workDir);
     // One photo per scene; fewer photos than scenes cycle.
