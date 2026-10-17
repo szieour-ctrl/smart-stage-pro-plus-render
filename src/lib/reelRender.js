@@ -42,6 +42,15 @@ async function fetchImg(label, u, warnings) {
   } catch (e) { warnings.push(`${label} skipped: could not fetch (${e.message})`); return { buf: null, type: "" }; }
 }
 
+// Re-time one clip to exactly 25 fps and round(seconds * 25) frames (pads with the last frame if short, trims if long).
+async function fitClip(inPath, seconds, workDir, i) {
+  const frames = Math.max(1, Math.round(seconds * 25));
+  const out = path.join(workDir, `fit_${i}.mp4`);
+  await run("ffmpeg", ["-y", "-i", inPath, "-vf", "fps=25,tpad=stop_mode=clone:stop_duration=3", "-frames:v", String(frames), "-r", "25",
+    "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-an", out]);
+  return out;
+}
+
 async function renderReel(job, onStep = () => {}) {
   const { jobId, event, lengthSec } = job;
   const scenes = job.scenes || [];
@@ -79,10 +88,10 @@ async function renderReel(job, onStep = () => {}) {
         const opener = await applyMotionPreset({ ...base, localPath: frames[i].beforeLocalPath, motionPreset: REVEAL_PRESETS[rp].openerMotion,
           durationSeconds: REVEAL_OPENER_DURATION, labelText: "Original" }, workDir, 1.0);
         const cont = await applyMotionPreset({ ...base, motionPreset: verticalPreset(sc.motion === "auto" ? "push_in" : sc.motion), durationSeconds: contDur }, workDir, 1.0);
-        return buildRevealClip(opener.path, cont.path, rp, workDir, `reveal_${i}.mp4`, contDur, { w: 1080, h: 1920 });
+        return fitClip(await buildRevealClip(opener.path, cont.path, rp, workDir, `reveal_${i}.mp4`, contDur, { w: 1080, h: 1920 }), durations[i], workDir, i);
       }
       const c = await applyMotionPreset({ ...base, motionPreset: verticalPreset(sc.motion), durationSeconds: durations[i] }, workDir, 1.0);
-      return c.path;
+      return fitClip(c.path, durations[i], workDir, i);
     });
     const windows = [];
     let cursor = 0;
@@ -90,7 +99,9 @@ async function renderReel(job, onStep = () => {}) {
     const listFile = path.join(workDir, "clips.txt");
     fs.writeFileSync(listFile, clips.map((c) => `file '${c}'`).join("\n"));
     const silentBase = path.join(workDir, "base_silent.mp4");
-    await run("ffmpeg", ["-y", "-f", "concat", "-safe", "0", "-i", listFile, "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-an", silentBase]);
+    // Every clip was normalised to exactly 25 fps and a whole number of frames (fitClip), so a straight stream
+    // copy keeps each scene exactly where its window says. (Mixed 20/25 fps clips used to stretch the video.)
+    await run("ffmpeg", ["-y", "-f", "concat", "-safe", "0", "-i", listFile, "-c", "copy", "-an", silentBase]);
     const total = await probeDuration(silentBase);
     timings.motionMs = Date.now() - t;
 
