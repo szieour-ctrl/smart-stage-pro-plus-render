@@ -3,6 +3,7 @@
 // Payload (from Netlify reel-render.js):
 //   { jobId, event, lengthSec, data: {address, city, neighborhood, price, beds, baths, sqft, headline, cta, ...intake,
 //     highlights[], supporting[]},  scenes: [{ imageUrl, motion, badgeType, roomLabel }],   // one per scene, in order
+//     (a scene may carry reveal: {beforeUrl, preset} = Before -> After wipe, then `motion` as the end motion)
 //     brand: {licensedName, dre, brokerage, primary, secondary, border, logoUrl, headshotUrl} | null,
 //     qrUrl, musicStyle }
 // Output: BRANDED (only when brand is present) and UNBRANDED (MLS) mp4s in the private
@@ -15,7 +16,7 @@ const axios = require("axios");
 const { execFile } = require("child_process");
 const QRCode = require("qrcode");
 const { downloadFrames } = require("./downloadFrames");
-const { mapWithConcurrencyLimit } = require("./assemble");
+const { mapWithConcurrencyLimit, REVEAL_PRESETS, REVEAL_OPENER_DURATION, REVEAL_WIPE_DURATION, buildRevealClip } = require("./assemble");
 const { computeFocals } = require("./verticalPipeline");
 const { applyMotionPreset, VALID_PRESETS } = require("./motionPresets");
 const { toVerticalKenBurns } = require("./verticalMotionMap");
@@ -57,20 +58,29 @@ async function renderReel(job, onStep = () => {}) {
     // 1. photos + subject focal points
     onStep("Preparing photos");
     let t = Date.now();
-    const frames = await downloadFrames(scenes.map((s) => ({ imageUrl: s.imageUrl })), workDir);
+    const reveals = scenes.map((s) => !!(s.reveal && s.reveal.beforeUrl));
+    const durations = sb.allocateDurations(lengthSec, reveals);
+    if (!durations) throw new Error(`Too many Before -> After reveals for a ${lengthSec}s Reel (each reveal scene needs at least ${sb.REEL_REVEAL_MIN}s). Switch some photos to Standard Motion or choose a longer Reel.`);
+    const frames = await downloadFrames(scenes.map((s, i) => ({ imageUrl: s.imageUrl, ...(reveals[i] ? { beforeUrl: s.reveal.beforeUrl, isBeforeAfter: true, useRevealEffect: true } : {}) })), workDir);
     const focals = await computeFocals(frames.map((f, i) => ({ ...f, roomLabel: scenes[i].roomLabel || null })), workDir);
     timings.photosMs = Date.now() - t;
 
     // 2. one Ken Burns clip per photo, equal share of the Reel length, hard cuts
     onStep("Rendering motion");
     t = Date.now();
-    const clipDur = lengthSec / n;
     // Clips are independent (hard cuts, no zoom carry-over), so render a few at a time.
     const clips = await mapWithConcurrencyLimit(scenes, 3, async (sc, i) => {
-      const c = await applyMotionPreset(
-        { ...frames[i], roomLabel: sc.roomLabel || null, vertical: true, focal: focals[i] || { fx: 0.5, fy: 0.5 },
-          motionPreset: verticalPreset(sc.motion), durationSeconds: clipDur },
-        workDir, 1.0);
+      const base = { ...frames[i], roomLabel: sc.roomLabel || null, vertical: true, focal: focals[i] || { fx: 0.5, fy: 0.5 } };
+      if (reveals[i] && frames[i].beforeLocalPath) {
+        // Before -> After: the original photo ("Original" label, no badge), a wipe to the staged photo, then the end motion.
+        const rp = REVEAL_PRESETS[sc.reveal.preset] ? sc.reveal.preset : "classic_reveal";
+        const contDur = Math.max(1.0, durations[i] - REVEAL_OPENER_DURATION + REVEAL_WIPE_DURATION);
+        const opener = await applyMotionPreset({ ...base, localPath: frames[i].beforeLocalPath, motionPreset: REVEAL_PRESETS[rp].openerMotion,
+          durationSeconds: REVEAL_OPENER_DURATION, labelText: "Original" }, workDir, 1.0);
+        const cont = await applyMotionPreset({ ...base, motionPreset: verticalPreset(sc.motion === "auto" ? "push_in" : sc.motion), durationSeconds: contDur }, workDir, 1.0);
+        return buildRevealClip(opener.path, cont.path, rp, workDir, `reveal_${i}.mp4`, contDur, { w: 1080, h: 1920 });
+      }
+      const c = await applyMotionPreset({ ...base, motionPreset: verticalPreset(sc.motion), durationSeconds: durations[i] }, workDir, 1.0);
       return c.path;
     });
     const windows = [];
@@ -110,9 +120,9 @@ async function renderReel(job, onStep = () => {}) {
     const typesUsed = [...new Set(badgeTypes.filter(Boolean))];
     const badgePngs = {};
     for (const bt of typesUsed) badgePngs[bt] = await renderBadgeLayer({ badgeType: bt }, path.join(workDir, `badge_${bt}.png`));
-    const allSame = typesUsed.length === 1 && badgeTypes.every((b) => b === typesUsed[0]);
+    const allSame = typesUsed.length === 1 && badgeTypes.every((b) => b === typesUsed[0]) && !reveals.some(Boolean);
     const badgeOpts = allSame ? { badgePng: badgePngs[typesUsed[0]] }
-      : { badgeLayers: badgeTypes.map((bt, i) => (bt ? { png: badgePngs[bt], startSec: windows[i].start, endSec: windows[i].end } : null)).filter(Boolean) };
+      : { badgeLayers: badgeTypes.map((bt, i) => (bt ? { png: badgePngs[bt], startSec: windows[i].start + (reveals[i] ? REVEAL_OPENER_DURATION : 0), endSec: windows[i].end } : null)).filter(Boolean) };
     const qrBuf = await QRCode.toBuffer(job.qrUrl || "https://smartstagepro.com", { margin: 1, width: 300 });
     const qrPng = await renderQrLayer({ qrPng: qrBuf }, path.join(workDir, "qr.png"));
     timings.overlayMs = Date.now() - t;
