@@ -37,7 +37,9 @@ const REEL_BADGE = { wFrac: 0.45, leftFrac: 0.05, bottomFrac: 0.06 };
 
 // Canvas layouts. Portrait = Reels / native 9:16 video; landscape = 16:9 video end card.
 const PORTRAIT = { w: W, h: H, cx: 540, panelX: 60, panelW: 960, panelBottom: 1462, qrTop: 640, qrCard: QR_CARD, qrImg: QR_IMG, detailMaxW: 860, d1: 68, d2: 50 };
-const LANDSCAPE = { w: 1920, h: 1080, cx: 1190, panelX: 640, panelW: 1100, panelBottom: 990, qrTop: 130, qrCard: 300, qrImg: 256, detailMaxW: 1000, d1: 60, d2: 44 };
+// Oct 17, 2026: the 16:9 panel is centered. The AB 723 badge occupies x 38-614, y ~882-1037 on 1920x1080
+// (badgeAssets.js, 30% wide, bottom-left), so the panel's bottom edge sits at y=860 to clear it.
+const LANDSCAPE = { w: 1920, h: 1080, cx: 960, panelX: 410, panelW: 1100, panelBottom: 860, qrTop: 50, qrCard: 300, qrImg: 256, detailMaxW: 1000, d1: 60, d2: 44 };
 // Native 9:16 VIDEO (not Reels): its AB 723 badge keeps badgeAssets' geometry (y~1368-1498), so the
 // end panel sits above it.
 const PORTRAIT_VIDEO = { ...PORTRAIT, panelBottom: 1340, qrTop: 430 };
