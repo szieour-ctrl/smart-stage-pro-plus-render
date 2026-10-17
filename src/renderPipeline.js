@@ -776,10 +776,22 @@ async function processRenderJob(job) {
     };
     const endOverlay16 = await safeEndOverlay("landscape", "16x9");
     const endOverlay9 = nativeVertical ? await safeEndOverlay("portraitVideo", "9x16") : null;
+    // A branded job also ships an UNBRANDED (MLS) version from the same footage: one extra overlay
+    // pass, no extra render. (Unbranded-only jobs already ship the unbranded one as the main file.)
+    let altEndOverlay16 = null, altEndOverlay9 = null;
+    if (job.endCard && job.endCard.variant === "branded" && process.env.UNBRANDED_VARIANT !== "false") {
+      const altJob = { ...job, endCard: { ...job.endCard, variant: "unbranded", brand: {} } };
+      const safeAlt = async (canvas, tag) => {
+        try { return await buildEndOverlay(altJob, workDir, canvas, tag); }
+        catch (e) { console.error(`[${job.jobId}] [UNBRANDED VARIANT MISSING] overlay build failed (${canvas}): ${e.message}`); return null; }
+      };
+      altEndOverlay16 = await safeAlt("landscape", "16x9_u");
+      altEndOverlay9 = nativeVertical ? await safeAlt("portraitVideo", "9x16_u") : null;
+    }
 
     const pass1Formats = nativeVertical ? wantFormats.filter((f) => f !== "9x16") : wantFormats;
     const pass1Promise = pass1Formats.length > 0
-      ? assembleVideo({ clipPaths, musicPath, narrationSegments, formats: pass1Formats, workDir, closingCard, endOverlay: endOverlay16 })
+      ? assembleVideo({ clipPaths, musicPath, narrationSegments, formats: pass1Formats, workDir, closingCard, endOverlay: endOverlay16, altEndOverlay: altEndOverlay16 })
       : Promise.resolve({});
     const pass2Promise = nativeVertical
       ? (async () => {
@@ -797,6 +809,7 @@ async function processRenderJob(job) {
             closingCard: closingCard ? { ...closingCard, focal: lastFocal } : null,
             nativeVertical: true,
             endOverlay: endOverlay9,
+            altEndOverlay: altEndOverlay9,
           });
         })()
       : Promise.resolve({});
