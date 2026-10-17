@@ -94,35 +94,80 @@ async function prepLogo(buf) {
 // part: "opening" (headline/address/details pill), "closing" (details + CTA + identity panel),
 // or "all". The two parts are separate layers so each appears only in its own clip.
 async function justListedSvg(p, part = "all", cv = PORTRAIT) {
-  const showTop = part !== "closing", showBottom = part !== "opening";
+  const showTop = part === "all" || part === "opening", showBottom = part === "all" || part === "closing", showCaption = part === "caption";
   const brand = p.brand || {};
   const prim = hex(brand.primary, "#B8860B");
   const sec = hex(brand.secondary, "#0B2545");
   const bord = hex(brand.border, "#D4AF37");
   const ink = textOn(sec);
-  const headline = p.headline || "JUST LISTED";
+  const headline = p.headline === undefined ? "JUST LISTED" : p.headline;
   // Details render on two lines so they can be big: price on top, "Bd • Ba • Sq Ft" beneath.
+  // Explicit lines (detailLines / closingDetailLines) win over the details array, so storyboard
+  // scenes can show e.g. a date over a time, or "Now $X" over "Previously $Y".
   const dItems = (p.details || []).filter(Boolean);
-  const dLine1 = dItems.length > 1 ? dItems[0] : "";
-  const dLine2 = dItems.length > 1 ? dItems.slice(1).join("  •  ") : dItems.join("  •  ");
-  const detail = dItems.join(" ");
+  const linesFrom = (arr) => {
+    const a = (arr || []).filter(Boolean);
+    if (!a.length) return ["", ""];
+    return a.length === 1 ? [a[0], ""] : [a[0], a.slice(1).join("  •  ")];
+  };
+  const baseLines = p.detailLines ? linesFrom(p.detailLines)
+    : (dItems.length > 1 ? [dItems[0], dItems.slice(1).join("  •  ")] : ["", dItems.join("  •  ")]);
+  const mkSet = ([l1, l2]) => {
+    const d1 = l1 ? fit(l1, cv.detailMaxW, cv.d1, 44, 0.6) : 0;
+    const d2 = l2 ? fit(l2, cv.detailMaxW, cv.d2, 34, 0.58) : 0;
+    return { l1, l2, d1, d2, h: (d1 ? 74 : 0) + (d2 ? 62 : 0), w: Math.max(l1.length * d1 * 0.6, l2.length * d2 * 0.58), any: !!(l1 || l2) };
+  };
+  const pillSet = mkSet(baseLines);
+  const closeSet = p.closingDetailLines ? mkSet(linesFrom(p.closingDetailLines)) : pillSet;
+  const detail = baseLines.join(" ");
   const cta = p.cta || "Schedule a Private Tour";
-  const hs = fit(headline, 920, 120, 70);
-  const as = fit(p.address, 920, 56, 36, 0.6);
-  const d1 = dLine1 ? fit(dLine1, cv.detailMaxW, cv.d1, 44, 0.6) : 0;
-  const d2 = dLine2 ? fit(dLine2, cv.detailMaxW, cv.d2, 34, 0.58) : 0;
-  const detailH = (d1 ? 74 : 0) + (d2 ? 62 : 0);
-  const detailW = Math.max(dLine1.length * d1 * 0.6, dLine2.length * d2 * 0.58);
-  const detailSvg = (cx, top) => {
+  // Long headlines wrap to two balanced lines; the last line keeps the single-line baseline (y=400)
+  // so the rule, address and details below never move.
+  let headLines = [headline];
+  if (headline.length > 15 && headline.includes(" ")) {
+    const w = headline.split(" ");
+    let best = null;
+    for (let i = 1; i < w.length; i++) {
+      const l1 = w.slice(0, i).join(" "), l2 = w.slice(i).join(" ");
+      const m = Math.max(l1.length, l2.length);
+      if (!best || m < best.m) best = { m, l: [l1, l2] };
+    }
+    if (best && headline.length * 70 * 0.62 > 920) headLines = best.l;
+  }
+  const hs = fit(headLines.reduce((x, y) => (y.length > x.length ? y : x), ""), 920, headLines.length > 1 ? 96 : 120, 56);
+  const as = fit(p.address || "", 920, 56, 36, 0.6);
+  const detailSvg = (set, cx, top) => {
     let yy = top, out = "";
-    if (d1) { yy += d1 * 0.95; out += `<text x="${cx}" y="${Math.round(yy)}" text-anchor="middle" font-family="Montserrat" font-weight="700" font-size="${d1}" fill="${ink}">${esc(dLine1)}</text>`; yy += 18; }
-    if (d2) { yy += d2 * 0.95; out += `<text x="${cx}" y="${Math.round(yy)}" text-anchor="middle" font-family="Montserrat" font-weight="600" font-size="${d2}" fill="${ink}">${esc(dLine2)}</text>`; }
+    if (set.d1) { yy += set.d1 * 0.95; out += `<text x="${cx}" y="${Math.round(yy)}" text-anchor="middle" font-family="Montserrat" font-weight="700" font-size="${set.d1}" fill="${ink}">${esc(set.l1)}</text>`; yy += 18; }
+    if (set.d2) { yy += set.d2 * 0.95; out += `<text x="${cx}" y="${Math.round(yy)}" text-anchor="middle" font-family="Montserrat" font-weight="600" font-size="${set.d2}" fill="${ink}">${esc(set.l2)}</text>`; }
     return out;
   };
   const cs = fit(cta, 560, 38, 26, 0.64);
-  const pillW = Math.min(980, Math.round(detailW) + 110);
-  const pillH = detailH + 40;
+  const pillW = Math.min(980, Math.round(pillSet.w) + 110);
+  const pillH = pillSet.h + 40;
   const ctaW = Math.min(820, Math.max(520, cta.length * cs * 0.66 + 110));
+
+  const pillY = p.pillY ?? (headline ? (p.address ? (p.cityLine ? 604 : 548) : 476) : 420);
+  // Highlight caption: wrap to at most two balanced lines, sized to fit.
+  const capWords = String(p.caption || "").trim().split(/\s+/).filter(Boolean);
+  let capLines = [];
+  if (capWords.length) {
+    const total = capWords.join(" ");
+    if (total.length <= 22) capLines = [total];
+    else {
+      let best = null;
+      for (let i = 1; i < capWords.length; i++) {
+        const l1 = capWords.slice(0, i).join(" "), l2 = capWords.slice(i).join(" ");
+        const w = Math.max(l1.length, l2.length);
+        if (!best || w < best.w) best = { w, l: [l1, l2] };
+      }
+      capLines = best ? best.l : [total];
+    }
+  }
+  const capFs = capLines.length ? fit(capLines.reduce((a, b) => (b.length > a.length ? b : a), ""), 820, 58, 36, 0.62) : 0;
+  const capW = capLines.length ? Math.min(960, Math.round(Math.max(...capLines.map((l) => l.length)) * capFs * 0.62) + 96) : 0;
+  const capH = capLines.length ? Math.round(capLines.length * capFs * 1.2 + 44) : 0;
+  const capY = 1180;
 
   const warnings = p.warnings;
   let headshot = null, logo = null;
@@ -134,11 +179,12 @@ async function justListedSvg(p, part = "all", cv = PORTRAIT) {
     const lb = await usableImage(p.logoBuf, "logo", warnings, p.logoType);
     logo = lb ? await prepLogo(lb) : null;
   } catch (e) { logo = null; if (warnings) warnings.push(`logo skipped: ${e.message}`); }
-  const hasDetail = detail.length > 0;
+  const hasDetail = pillSet.any;
+  const hasCloseDetail = closeSet.any;
   const hasIdentity = !p.unbranded && !!(brand.licensedName || brand.dre || brand.brokerage || headshot || logo);
 
   // Panel stacks from a fixed bottom edge (y=1462) so it never reaches the badge zone below.
-  const PAD = 26, ROW_D = hasDetail ? detailH + 14 : 0, ROW_C = p.unbranded ? 0 : 82, ROW_A = p.closingAddress ? 52 : 0, ROW_I = hasIdentity ? 22 + ID_H : 0;
+  const PAD = 26, ROW_D = hasCloseDetail ? closeSet.h + 14 : 0, ROW_C = p.unbranded ? 0 : 82, ROW_A = p.closingAddress ? 52 : 0, ROW_I = hasIdentity ? 22 + ID_H : 0;
   const panelH = PAD + ROW_A + ROW_D + ROW_C + ROW_I + PAD;
   const panelBottom = cv.panelBottom;
   const panelY = panelBottom - panelH;
@@ -189,19 +235,23 @@ async function justListedSvg(p, part = "all", cv = PORTRAIT) {
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${cv.w}" height="${cv.h}">
   <defs>
     <linearGradient id="t" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#000" stop-opacity="0.6"/><stop offset="1" stop-color="#000" stop-opacity="0"/></linearGradient>
+    <linearGradient id="cap" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#000" stop-opacity="0"/><stop offset="0.5" stop-color="#000" stop-opacity="0.35"/><stop offset="1" stop-color="#000" stop-opacity="0"/></linearGradient>
     <linearGradient id="b" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#000" stop-opacity="0"/><stop offset="1" stop-color="#000" stop-opacity="0.55"/></linearGradient>
   </defs>
 ${showTop ? `  <rect x="0" y="0" width="${W}" height="760" fill="url(#t)"/>
-  <text x="${W / 2}" y="400" text-anchor="middle" font-family="Montserrat" font-weight="700" font-size="${hs}" fill="#fff" letter-spacing="4">${esc(headline)}</text>
-  <rect x="${W / 2 - 90}" y="436" width="180" height="6" rx="3" fill="${prim}"/>
-  <text x="${W / 2}" y="512" text-anchor="middle" font-family="Montserrat" font-weight="600" font-size="${as}" fill="#fff">${esc(p.address)}</text>
+  ${headline ? `${headLines.map((l, i) => `<text x="${W / 2}" y="${400 - (headLines.length - 1 - i) * Math.round(hs * 1.1)}" text-anchor="middle" font-family="Montserrat" font-weight="700" font-size="${hs}" fill="#fff" letter-spacing="4">${esc(l)}</text>`).join("\n  ")}
+  <rect x="${W / 2 - 90}" y="436" width="180" height="6" rx="3" fill="${prim}"/>` : ""}
+  ${p.address ? `<text x="${W / 2}" y="512" text-anchor="middle" font-family="Montserrat" font-weight="600" font-size="${as}" fill="#fff">${esc(p.address)}</text>` : ""}
   ${p.cityLine ? `<text x="${W / 2}" y="568" text-anchor="middle" font-family="Montserrat" font-weight="500" font-size="34" fill="#fff" fill-opacity="0.9">${esc(p.cityLine)}</text>` : ""}
-  ${hasDetail ? `<rect x="${(W - pillW) / 2}" y="604" width="${pillW}" height="${pillH}" rx="40" fill="${sec}" fill-opacity="0.94" stroke="${bord}" stroke-width="3"/>
-  ${detailSvg(W / 2, 604 + 20)}` : ""}` : ""}
+  ${hasDetail ? `<rect x="${(W - pillW) / 2}" y="${pillY}" width="${pillW}" height="${pillH}" rx="40" fill="${sec}" fill-opacity="0.94" stroke="${bord}" stroke-width="3"/>
+  ${detailSvg(pillSet, W / 2, pillY + 20)}` : ""}` : ""}
+${showCaption && capLines.length ? `  <rect x="0" y="1020" width="${W}" height="520" fill="url(#cap)"/>
+  <rect x="${(W - capW) / 2}" y="${capY}" width="${capW}" height="${capH}" rx="36" fill="${sec}" fill-opacity="0.9" stroke="${bord}" stroke-width="3"/>
+  ${capLines.map((l, i) => `<text x="${W / 2}" y="${capY + 22 + capFs * 0.95 + i * capFs * 1.2}" text-anchor="middle" font-family="Montserrat" font-weight="700" font-size="${capFs}" fill="${ink}">${esc(l)}</text>`).join("\n  ")}` : ""}
 ${showBottom ? `  <rect x="0" y="${panelY - 120}" width="${cv.w}" height="${cv.h - panelY + 120}" fill="url(#b)"/>
   <rect x="${cv.panelX}" y="${panelY}" width="${cv.panelW}" height="${panelH}" rx="28" fill="${sec}" fill-opacity="0.94" stroke="${bord}" stroke-width="3"/>
   ${p.closingAddress ? `<text x="${cv.cx}" y="${addrTop + 36}" text-anchor="middle" font-family="Montserrat" font-weight="600" font-size="${fit(p.closingAddress, cv.panelW - 80, 34, 24, 0.6)}" fill="${ink}" fill-opacity="0.92">${esc(p.closingAddress)}</text>` : ""}
-  ${hasDetail ? detailSvg(cv.cx, detailTop) : ""}
+  ${hasCloseDetail ? detailSvg(closeSet, cv.cx, detailTop) : ""}
 ${p.unbranded ? "" : `<rect x="${cv.cx - ctaW / 2}" y="${ctaY}" width="${ctaW}" height="76" rx="38" fill="${prim}"/>
   <text x="${cv.cx}" y="${ctaY + 50}" text-anchor="middle" font-family="Montserrat" font-weight="700" font-size="${cs}" fill="${textOn(prim)}" letter-spacing="1">${esc(cta)}</text>`}${identity}
 ` : ""}
