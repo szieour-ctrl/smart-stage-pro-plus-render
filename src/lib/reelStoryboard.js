@@ -306,7 +306,7 @@ function sceneWindows(duration, n = 6, overlap = 0.5) {
 
 // Render all scene layers and composite them (+ badge + end QR) onto baseVideo.
 // windows (optional): [{start,end}] from the real timeline; default = equal split.
-async function compositeStoryboard(baseVideo, sceneLayers, outVideo, { badgePng, badgeLayers, qrPng, windows, qrLeadSec = 1.0, textInSec = 0.35, textOutLeadSec = 0.2, closeLeadSec = 3.5 } = {}) {
+async function compositeStoryboard(baseVideo, sceneLayers, outVideo, { badgePng, badgeLayers, qrPng, windows, qrLeadSec = 1.0, textInSec = 0.35, textOutLeadSec = 0.2, closeLeadSec = 3.5, textOffsets = null, textMaxSec = 3.0 } = {}) {
   const dur = await probeDuration(baseVideo);
   const n = sceneLayers.length;
   const wins = windows || sceneWindows(dur, n);
@@ -316,9 +316,12 @@ async function compositeStoryboard(baseVideo, sceneLayers, outVideo, { badgePng,
     const w = wins[i], last = i === n - 1;
     // The closing panel (branding / CTA) covers most of the photo, so it comes in with ~closeLeadSec left
     // (never earlier than the closing scene's own start), leaving the last photo visible first.
-    const start = last ? Math.min(Math.max(w.start + textInSec, dur - closeLeadSec), Math.max(w.start + textInSec, dur - 1.5)) : w.start + textInSec;
+    // textOffsets[i]: seconds after the scene starts that its text comes in (Room Reveal scenes: on the wipe).
+    const off = textOffsets && textOffsets[i] != null ? textOffsets[i] : textInSec;
+    const start = last ? Math.min(Math.max(w.start + textInSec, dur - closeLeadSec), Math.max(w.start + textInSec, dur - 1.5)) : Math.min(w.start + off, Math.max(w.start, w.end - 1.2));
     const l = { png, startSec: start, fadeSec: 0.4 };
-    if (!last) { l.endSec = Math.max(start + 1, w.end - textOutLeadSec); l.fadeOutSec = 0.4; }
+    // Highlights hold for textMaxSec at most, then fade out (never longer than the scene itself).
+    if (!last) { l.endSec = Math.max(start + 1, Math.min(start + textMaxSec, w.end - textOutLeadSec)); l.fadeOutSec = 0.4; }
     layers.push(l);
   });
   if (badgePng) layers.push({ png: badgePng, startSec: 0, fadeSec: 0.2 });
