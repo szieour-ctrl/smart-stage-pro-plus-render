@@ -1342,7 +1342,7 @@ function appendClosingCardWithAudio(mainPath, closingCard, musicPath, workDir, o
 // from the full photo by motionRenderer.py) — the canvas is 1080x1920 end to
 // end and the final step is a plain scale/pad pass-through, NOT the legacy
 // centre-crop of a 16:9 master. Default (undefined) = exactly the old behaviour.
-async function assembleVideo({ clipPaths, musicPath, narrationSegments, formats, workDir, closingCard, nativeVertical, endOverlay }) {
+async function assembleVideo({ clipPaths, musicPath, narrationSegments, formats, workDir, closingCard, nativeVertical, endOverlay, altEndOverlay }) {
   const canvas = nativeVertical ? { w: 1080, h: 1920 } : undefined;
   let concatenated = await concatenateClips(clipPaths, workDir, canvas);
 
@@ -1387,6 +1387,7 @@ async function assembleVideo({ clipPaths, musicPath, narrationSegments, formats,
       console.error(`[END CARD MISSING] overlay end card failed (${err.message}); falling back to legacy appended card if configured.`);
     }
   }
+  const masterNoCard = withMusic; // pre-legacy-card master, used for the unbranded variant
   const needLegacyCrop = usedOverlay && !nativeVertical && formats.includes("9x16");
   if (closingCard && (!usedOverlay || needLegacyCrop)) {
     try {
@@ -1412,6 +1413,23 @@ async function assembleVideo({ clipPaths, musicPath, narrationSegments, formats,
   }
   if (formats.includes("9x16")) {
     outputs["9x16"] = await renderFormat(nativeVertical ? mainSrc : withMusic, "1080x1920", workDir, "output_9x16.mp4", !!nativeVertical);
+  }
+
+  // UNBRANDED (MLS) variant of the same video: same master, different end-card overlay. Costs one
+  // extra overlay + encode per format, no extra footage render. Non-fatal. The legacy centre-crop
+  // 9:16 never gets one.
+  if (altEndOverlay && usedOverlay && process.env.UNBRANDED_VARIANT !== "false") {
+    try {
+      const altSrc = await compositeEndCard(masterNoCard, altEndOverlay, path.join(workDir, "with_end_overlay_unbranded.mp4"));
+      if (formats.includes("16x9")) {
+        outputs["16x9_unbranded"] = await renderFormat(altSrc, "1920x1080", workDir, "output_16x9_unbranded.mp4");
+      }
+      if (formats.includes("9x16") && nativeVertical) {
+        outputs["9x16_unbranded"] = await renderFormat(altSrc, "1080x1920", workDir, "output_9x16_unbranded.mp4", true);
+      }
+    } catch (err) {
+      console.error(`[UNBRANDED VARIANT MISSING] could not build the unbranded version (non-fatal): ${err.message}`);
+    }
   }
 
   return outputs;
