@@ -26,6 +26,7 @@ const { downloadFrames } = require("./lib/downloadFrames");
 const { applyMotionPreset, VALID_PRESETS } = require("./lib/motionPresets");
 const { uploadScratchFile } = require("./lib/s3Upload");
 const { renderBrandedOverlay, renderBadgeLayer, renderQrLayer, compositeReel } = require("./lib/reelOverlay");
+const storyboard = require("./lib/reelStoryboard");
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
@@ -540,6 +541,106 @@ app.get("/test-reel-overlay", requireSecret, async (req, res) => {
       warnings,
       brandedUrl,
       unbrandedUrl,
+      note: "Uploaded to the smart-stage-scratch/ S3 prefix — auto-expires in 1-2 days.",
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    fs.rm(workDir, { recursive: true, force: true }, () => {});
+  }
+});
+
+// ── TEMPORARY DIAGNOSTIC — REELS v1 STORYBOARD ENGINE TEST ──────────────
+// Renders a six-scene (or five-scene) Reel for any of the 12 events: Ken Burns clips (one per
+// photo, hard-cut), then the storyboard overlay pass (scene text, details, highlights, closing
+// panel, AB 723 badge, end QR). BRANDED and UNBRANDED (MLS) mp4s go to smart-stage-scratch/.
+//
+//   /test-reel-storyboard?event=teaser|coming_soon|just_listed|for_sale|for_lease|feature_spotlight|
+//     under_contract|back_on_market|price_drop|price_improvement|open_house|just_sold
+//     &imageUrls=<url1,url2,...up to 6 public photo urls>  &scenes=6|5  &duration=<seconds, default 30>
+//     &address= &city= &neighborhood= &price= &beds= &baths= &sqft= &h1= &h2= &h3=
+//     &headline= &cta= &availability= &date= &startTime= &endTime= &newPrice= &oldPrice= &rent=
+//     &s1= &s2= &s3= (feature supporting) &feature= &closingMessage= &thankYou= &statusMessage=
+//     &name= &dre= &brokerage= &logoUrl= &headshotUrl=
+//   x-railway-secret header required. Remove once promoted out of spike status.
+app.get("/test-reel-storyboard", requireSecret, async (req, res) => {
+  const q = req.query;
+  const urls = String(q.imageUrls || q.imageUrl || "").split(",").map((u) => u.trim()).filter(Boolean).slice(0, 6);
+  if (!urls.length || !q.event) {
+    return res.status(400).json({ error: "Missing required query params: event, imageUrls", events: storyboard.EVENTS });
+  }
+  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "test-reel-storyboard-"));
+  try {
+    const sceneCount = Number(q.scenes) === 5 ? 5 : 6;
+    const duration = q.duration ? Math.min(Math.max(Number(q.duration) || 30, 10), 60) : 30;
+    const frames = await downloadFrames(urls.map((imageUrl) => ({ imageUrl })), workDir);
+    // One photo per scene; fewer photos than scenes cycle.
+    const clipDur = duration / sceneCount;
+    const t0 = Date.now();
+    const clips = [];
+    for (let i = 0; i < sceneCount; i++) {
+      const f = frames[i % frames.length];
+      const c = await applyMotionPreset(
+        { ...f, vertical: true, focal: { fx: 0.5, fy: 0.5 }, motionPreset: i % 2 ? "pull_back" : "push_in", durationSeconds: clipDur },
+        workDir, 1.0
+      );
+      clips.push(c.path);
+    }
+    const listFile = path.join(workDir, "clips.txt");
+    fs.writeFileSync(listFile, clips.map((c) => `file '${c}'`).join("\n"));
+    const basePath = path.join(workDir, "base.mp4");
+    await new Promise((resolve, reject) => {
+      require("child_process").execFile("ffmpeg", ["-y", "-f", "concat", "-safe", "0", "-i", listFile, "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-an", basePath],
+        (e) => (e ? reject(e) : resolve()));
+    });
+    const baseMs = Date.now() - t0;
+
+    const warnings = [];
+    const fetchImg = async (label, u) => {
+      if (!u) return { buf: null, type: "" };
+      try {
+        const r = await axios.get(u, { responseType: "arraybuffer", timeout: 15000 });
+        return { buf: Buffer.from(r.data), type: String(r.headers["content-type"] || "") };
+      } catch (e) { warnings.push(`${label} skipped: could not fetch (${e.message})`); return { buf: null, type: "" }; }
+    };
+    const [logo, headshot] = await Promise.all([fetchImg("logo", q.logoUrl), fetchImg("headshot", q.headshotUrl)]);
+    const num = (v) => (v && !isNaN(Number(v)) ? Number(v).toLocaleString("en-US") : v);
+    const data = {
+      address: q.address, city: q.city, neighborhood: q.neighborhood, price: q.price, beds: q.beds, baths: q.baths,
+      sqft: num(q.sqft), highlights: [q.h1, q.h2, q.h3], headline: q.headline, cta: q.cta, availability: q.availability,
+      date: q.date, startTime: q.startTime, endTime: q.endTime, newPrice: q.newPrice, oldPrice: q.oldPrice, rent: q.rent,
+      supporting: [q.s1, q.s2, q.s3], feature: q.feature, closingMessage: q.closingMessage, thankYou: q.thankYou,
+      statusMessage: q.statusMessage, positioning: q.positioning, sellingPoint: q.sellingPoint,
+    };
+    const scenes = storyboard.resolveScenes(String(q.event), data, sceneCount);
+
+    const t1 = Date.now();
+    const params = { address: q.address || "", brand: { licensedName: q.name || "", dre: q.dre || "", brokerage: q.brokerage || "" },
+      logoBuf: logo.buf, logoType: logo.type, headshotBuf: headshot.buf, headshotType: headshot.type, warnings };
+    const bPngs = [], uPngs = [];
+    for (let i = 0; i < scenes.length; i++) {
+      bPngs.push(await storyboard.renderScenePng(scenes[i], params, path.join(workDir, `scene_b_${i}.png`), workDir, `b${i}`));
+      uPngs.push(await storyboard.renderScenePng(scenes[i], { ...params, unbranded: true, brand: {}, logoBuf: null, headshotBuf: null }, path.join(workDir, `scene_u_${i}.png`), workDir, `u${i}`));
+    }
+    const badgePng = await renderBadgeLayer({ badgeType: "virtually_staged" }, path.join(workDir, "overlay_badge.png"));
+    const QRCode = require("qrcode");
+    const qrBuf = await QRCode.toBuffer("https://smartstagepro.com", { margin: 1, width: 300 });
+    const qrPng = await renderQrLayer({ qrPng: qrBuf }, path.join(workDir, "overlay_qr.png"));
+    const overlayMs = Date.now() - t1;
+
+    const t2 = Date.now();
+    const windows = Array.from({ length: sceneCount }, (_, i) => ({ start: i * clipDur, end: (i + 1) * clipDur }));
+    const brandedMp4 = await storyboard.compositeStoryboard(basePath, bPngs, path.join(workDir, "reel_branded.mp4"), { badgePng, qrPng, windows });
+    const unbrandedMp4 = await storyboard.compositeStoryboard(basePath, uPngs, path.join(workDir, "reel_unbranded.mp4"), { badgePng, qrPng, windows });
+    const compositeMs = Date.now() - t2;
+
+    const stamp = Date.now();
+    const brandedUrl = await uploadScratchFile(brandedMp4, `test-storyboard-${q.event}-branded_${stamp}.mp4`, "video/mp4");
+    const unbrandedUrl = await uploadScratchFile(unbrandedMp4, `test-storyboard-${q.event}-unbranded_${stamp}.mp4`, "video/mp4");
+    res.json({
+      success: true, event: q.event, scenes: scenes.map((s) => ({ role: s.role, suggestedImage: s.image, top: s.top || null, caption: s.caption || null, closing: s.closing || null })),
+      timingsMs: { baseKenBurns: baseMs, overlayPngs: overlayMs, compositeBothVariants: compositeMs },
+      warnings, brandedUrl, unbrandedUrl,
       note: "Uploaded to the smart-stage-scratch/ S3 prefix — auto-expires in 1-2 days.",
     });
   } catch (err) {
