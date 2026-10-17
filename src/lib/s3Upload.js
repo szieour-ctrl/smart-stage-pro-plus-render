@@ -85,4 +85,11 @@ async function uploadScratchFile(localPath, filename, contentType) {
   return `https://${S3_BUCKET}.s3.${process.env.S3_REGION}.amazonaws.com/${key}`;
 }
 
-module.exports = { uploadToS3, uploadAudioToS3, uploadScratchFile };
+// Reel drafts (Oct 2026): private prefix, auto-expiring (7-day lifecycle rule on this prefix; copy-on-download
+// to smart-stage-video-finals/ comes with the charging build). Returns the KEY; Netlify presigns it.
+async function uploadReelDraft(localPath, key) {
+  if (!key.startsWith("smart-stage-reel-drafts/")) throw new Error("Reel drafts must use the smart-stage-reel-drafts/ prefix");
+  return uploadFileToS3(localPath, key, "video/mp4");
+}
+
+module.exports = { uploadToS3, uploadAudioToS3, uploadScratchFile, uploadReelDraft };

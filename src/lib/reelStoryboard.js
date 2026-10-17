@@ -223,7 +223,10 @@ function resolveScenes(eventKey, data, sceneCount = 6) {
   if (!tpl) throw new Error(`Unknown Reel event "${eventKey}". Valid: ${EVENTS.join(", ")}`);
   const n = Math.round(Number(sceneCount));
   if (!(n >= MIN_SCENES && n <= MAX_SCENES)) throw new Error(`Reel scene count must be ${MIN_SCENES}-${MAX_SCENES}, got ${sceneCount}`);
-  const d = { ...data, highlights: (data.highlights || []).filter(has), supporting: (data.supporting || []).filter(has) };
+  // positional: highlights/supporting are already aligned to the storyboard's caption slots (blanks kept in place),
+  // so don't compact them. Raw intake data (positional unset) still drops blank entries.
+  const keep = (a) => (data.positional ? (a || []) : (a || []).filter(has));
+  const d = { ...data, highlights: keep(data.highlights), supporting: keep(data.supporting) };
   let scenes = tpl.scenes.map((s) => ({ role: s.role, image: s.image, ...s.build(d) }));
   if (n <= 5) {
     const [i, j] = tpl.mergePair; // adjacent by construction
@@ -284,7 +287,7 @@ function sceneWindows(duration, n = 6, overlap = 0.5) {
 
 // Render all scene layers and composite them (+ badge + end QR) onto baseVideo.
 // windows (optional): [{start,end}] from the real timeline; default = equal split.
-async function compositeStoryboard(baseVideo, sceneLayers, outVideo, { badgePng, qrPng, windows, qrLeadSec = 1.0, textInSec = 0.35, textOutLeadSec = 0.2 } = {}) {
+async function compositeStoryboard(baseVideo, sceneLayers, outVideo, { badgePng, badgeLayers, qrPng, windows, qrLeadSec = 1.0, textInSec = 0.35, textOutLeadSec = 0.2 } = {}) {
   const dur = await probeDuration(baseVideo);
   const n = sceneLayers.length;
   const wins = windows || sceneWindows(dur, n);
@@ -298,6 +301,8 @@ async function compositeStoryboard(baseVideo, sceneLayers, outVideo, { badgePng,
     layers.push(l);
   });
   if (badgePng) layers.push({ png: badgePng, startSec: 0, fadeSec: 0.2 });
+  // badgeLayers: [{ png, startSec, endSec }] — per-scene AB 723 badges (mixed staged / unaltered photos).
+  (badgeLayers || []).forEach((b) => layers.push({ png: b.png, startSec: b.startSec, endSec: b.endSec, fadeSec: 0.15, fadeOutSec: 0.15 }));
   if (qrPng) layers.push({ png: qrPng, startSec: Math.max(0, dur - qrLeadSec), fadeSec: 0.3 });
   return compositeLayers(baseVideo, layers, outVideo);
 }
