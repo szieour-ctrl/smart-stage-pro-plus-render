@@ -71,6 +71,7 @@ async function renderReel(job, onStep = () => {}) {
     // Clips are independent (hard cuts, no zoom carry-over), so render a few at a time.
     const clips = await mapWithConcurrencyLimit(scenes, 3, async (sc, i) => {
       const base = { ...frames[i], roomLabel: sc.roomLabel || null, vertical: true, focal: focals[i] || { fx: 0.5, fy: 0.5 } };
+      if (reveals[i] && !frames[i].beforeLocalPath) warnings.push(`Scene ${i + 1}: the Original photo could not be downloaded, so the Before wipe was skipped (staged photo only).`);
       if (reveals[i] && frames[i].beforeLocalPath) {
         // Before -> After: the original photo ("Original" label, no badge), a wipe to the staged photo, then the end motion.
         const rp = REVEAL_PRESETS[sc.reveal.preset] ? sc.reveal.preset : "classic_reveal";
