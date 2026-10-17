@@ -284,7 +284,7 @@ function sceneWindows(duration, n = 6, overlap = 0.5) {
 
 // Render all scene layers and composite them (+ badge + end QR) onto baseVideo.
 // windows (optional): [{start,end}] from the real timeline; default = equal split.
-async function compositeStoryboard(baseVideo, sceneLayers, outVideo, { badgePng, qrPng, windows, qrLeadSec = 1.0, textInSec = 0.35, textOutLeadSec = 0.2 } = {}) {
+async function compositeStoryboard(baseVideo, sceneLayers, outVideo, { badgePng, badgeLayers, qrPng, windows, qrLeadSec = 1.0, textInSec = 0.35, textOutLeadSec = 0.2 } = {}) {
   const dur = await probeDuration(baseVideo);
   const n = sceneLayers.length;
   const wins = windows || sceneWindows(dur, n);
@@ -298,6 +298,8 @@ async function compositeStoryboard(baseVideo, sceneLayers, outVideo, { badgePng,
     layers.push(l);
   });
   if (badgePng) layers.push({ png: badgePng, startSec: 0, fadeSec: 0.2 });
+  // badgeLayers: [{ png, startSec, endSec }] — per-scene AB 723 badges (mixed staged / unaltered photos).
+  (badgeLayers || []).forEach((b) => layers.push({ png: b.png, startSec: b.startSec, endSec: b.endSec, fadeSec: 0.15, fadeOutSec: 0.15 }));
   if (qrPng) layers.push({ png: qrPng, startSec: Math.max(0, dur - qrLeadSec), fadeSec: 0.3 });
   return compositeLayers(baseVideo, layers, outVideo);
 }

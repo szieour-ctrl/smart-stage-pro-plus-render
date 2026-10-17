@@ -27,6 +27,7 @@ const { applyMotionPreset, VALID_PRESETS } = require("./lib/motionPresets");
 const { uploadScratchFile } = require("./lib/s3Upload");
 const { renderBrandedOverlay, renderBadgeLayer, renderQrLayer, compositeReel } = require("./lib/reelOverlay");
 const storyboard = require("./lib/reelStoryboard");
+const { renderReel } = require("./lib/reelRender");
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
@@ -548,6 +549,38 @@ app.get("/test-reel-overlay", requireSecret, async (req, res) => {
   } finally {
     fs.rm(workDir, { recursive: true, force: true }, () => {});
   }
+});
+
+// ── REELS v1 PRODUCTION RENDER (beta, Oct 17 2026) ────────────────────────
+// POST /render-reel  → 202 {accepted, jobId}; the render runs in the background.
+// GET  /reel-status/:jobId → {status: "queued"|"running"|"done"|"error", step, result?, error?}
+// Job state is in memory (single Railway instance); entries are dropped after 2 hours. A restart
+// loses in-flight jobs — the client then sees "not found" and offers a retry. No charging here.
+const reelJobs = new Map();
+const REEL_MAX_CONCURRENT = 2;
+setInterval(() => { const cut = Date.now() - 2 * 3600 * 1000; for (const [id, j] of reelJobs) if (j.updatedAt < cut) reelJobs.delete(id); }, 15 * 60 * 1000).unref();
+
+app.post("/render-reel", requireSecret, (req, res) => {
+  const job = req.body || {};
+  if (!job.jobId || !job.event || !Array.isArray(job.scenes) || !job.scenes.length) {
+    return res.status(400).json({ error: "Missing jobId, event or scenes" });
+  }
+  const running = [...reelJobs.values()].filter((j) => j.status === "queued" || j.status === "running").length;
+  if (running >= REEL_MAX_CONCURRENT) return res.status(429).json({ error: "Reel renderer is busy, try again in a minute" });
+  const state = { status: "queued", step: "Queued", startedAt: Date.now(), updatedAt: Date.now() };
+  reelJobs.set(job.jobId, state);
+  res.status(202).json({ accepted: true, jobId: job.jobId });
+  state.status = "running";
+  renderReel(job, (step) => { state.step = step; state.updatedAt = Date.now(); })
+    .then((result) => { state.status = "done"; state.result = result; state.step = "Done"; })
+    .catch((err) => { console.error(`Reel ${job.jobId} failed:`, err.message); state.status = "error"; state.error = err.message; })
+    .finally(() => { state.updatedAt = Date.now(); });
+});
+
+app.get("/reel-status/:jobId", requireSecret, (req, res) => {
+  const j = reelJobs.get(req.params.jobId);
+  if (!j) return res.status(404).json({ status: "not_found" });
+  res.json({ status: j.status, step: j.step, result: j.result || null, error: j.error || null, elapsedMs: Date.now() - j.startedAt });
 });
 
 // ── TEMPORARY DIAGNOSTIC — REELS v1 STORYBOARD ENGINE TEST ──────────────
