@@ -306,7 +306,7 @@ function sceneWindows(duration, n = 6, overlap = 0.5) {
 
 // Render all scene layers and composite them (+ badge + end QR) onto baseVideo.
 // windows (optional): [{start,end}] from the real timeline; default = equal split.
-async function compositeStoryboard(baseVideo, sceneLayers, outVideo, { badgePng, badgeLayers, qrPng, windows, qrLeadSec = 1.0, textInSec = 0.35, textOutLeadSec = 0.2 } = {}) {
+async function compositeStoryboard(baseVideo, sceneLayers, outVideo, { badgePng, badgeLayers, qrPng, windows, qrLeadSec = 1.0, textInSec = 0.35, textOutLeadSec = 0.2, closeLeadSec = 3.5 } = {}) {
   const dur = await probeDuration(baseVideo);
   const n = sceneLayers.length;
   const wins = windows || sceneWindows(dur, n);
@@ -314,7 +314,9 @@ async function compositeStoryboard(baseVideo, sceneLayers, outVideo, { badgePng,
   sceneLayers.forEach((png, i) => {
     if (!png) return;
     const w = wins[i], last = i === n - 1;
-    const start = w.start + textInSec;
+    // The closing panel (branding / CTA) covers most of the photo, so it comes in with ~closeLeadSec left
+    // (never earlier than the closing scene's own start), leaving the last photo visible first.
+    const start = last ? Math.min(Math.max(w.start + textInSec, dur - closeLeadSec), Math.max(w.start + textInSec, dur - 1.5)) : w.start + textInSec;
     const l = { png, startSec: start, fadeSec: 0.4 };
     if (!last) { l.endSec = Math.max(start + 1, w.end - textOutLeadSec); l.fadeOutSec = 0.4; }
     layers.push(l);
