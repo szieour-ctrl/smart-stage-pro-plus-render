@@ -223,7 +223,10 @@ function resolveScenes(eventKey, data, sceneCount = 6) {
   if (!tpl) throw new Error(`Unknown Reel event "${eventKey}". Valid: ${EVENTS.join(", ")}`);
   const n = Math.round(Number(sceneCount));
   if (!(n >= MIN_SCENES && n <= MAX_SCENES)) throw new Error(`Reel scene count must be ${MIN_SCENES}-${MAX_SCENES}, got ${sceneCount}`);
-  const d = { ...data, highlights: (data.highlights || []).filter(has), supporting: (data.supporting || []).filter(has) };
+  // positional: highlights/supporting are already aligned to the storyboard's caption slots (blanks kept in place),
+  // so don't compact them. Raw intake data (positional unset) still drops blank entries.
+  const keep = (a) => (data.positional ? (a || []) : (a || []).filter(has));
+  const d = { ...data, highlights: keep(data.highlights), supporting: keep(data.supporting) };
   let scenes = tpl.scenes.map((s) => ({ role: s.role, image: s.image, ...s.build(d) }));
   if (n <= 5) {
     const [i, j] = tpl.mergePair; // adjacent by construction
