@@ -15,6 +15,7 @@
 const MAX = Math.max(1, Number(process.env.RENDER_MAX_CONCURRENT) || 2);
 
 let running = 0;
+const runningLabels = new Set();
 const waiting = []; // { label, start, onStart }
 
 function pump() {
@@ -31,12 +32,13 @@ function pump() {
 function runExclusive(label, fn, { onQueued, onStart } = {}) {
   return new Promise((resolve, reject) => {
     const start = () => {
+      runningLabels.add(label);
       console.log(`[renderGate] start ${label} (running ${running}/${MAX}, waiting ${waiting.length})`);
       if (onStart) { try { onStart(); } catch (_) {} }
       Promise.resolve()
         .then(fn)
         .then(resolve, reject)
-        .finally(() => { running--; pump(); });
+        .finally(() => { running--; runningLabels.delete(label); pump(); });
     };
     if (running < MAX) { running++; start(); return; }
     waiting.push({ label, start });
@@ -45,6 +47,15 @@ function runExclusive(label, fn, { onQueued, onStart } = {}) {
   });
 }
 
+// Where a job stands: { state: "running" | "waiting" | "none", ahead } where
+// "ahead" counts every render that must finish before this one starts.
+function position(label) {
+  if (runningLabels.has(label)) return { state: "running", ahead: 0 };
+  const i = waiting.findIndex((w) => w.label === label);
+  if (i === -1) return { state: "none", ahead: 0 };
+  return { state: "waiting", ahead: running + i };
+}
+
 function stats() { return { running, waiting: waiting.length, max: MAX }; }
 
-module.exports = { runExclusive, stats };
+module.exports = { runExclusive, stats, position };

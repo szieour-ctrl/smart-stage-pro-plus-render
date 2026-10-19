@@ -572,7 +572,10 @@ app.post("/render-reel", requireSecret, (req, res) => {
   // Still refuse when too many Reels are already waiting, so nobody waits past
   // the client's 10-minute patience.
   const pending = [...reelJobs.values()].filter((j) => j.status === "queued" || j.status === "running").length;
-  if (pending >= REEL_MAX_PENDING) return res.status(429).json({ error: "Reel renderer is busy, try again in a minute" });
+  if (pending >= REEL_MAX_PENDING) {
+    const g = renderGate.stats();
+    return res.status(429).json({ error: "Reel renderer is busy", busy: true, running: g.running, waiting: g.waiting });
+  }
   const state = { status: "queued", step: "Waiting for another render to finish", startedAt: Date.now(), updatedAt: Date.now() };
   reelJobs.set(job.jobId, state);
   res.status(202).json({ accepted: true, jobId: job.jobId });
@@ -586,6 +589,13 @@ app.post("/render-reel", requireSecret, (req, res) => {
     .then((result) => { state.status = "done"; state.result = result; state.step = "Done"; })
     .catch((err) => { console.error(`Reel ${job.jobId} failed:`, err.message); state.status = "error"; state.error = err.message; })
     .finally(() => { state.updatedAt = Date.now(); });
+});
+
+// Queue position for any render (video or Reel) — Netlify shows it to the user.
+app.get("/queue/:jobId", requireSecret, (req, res) => {
+  const id = req.params.jobId;
+  const pos = renderGate.position(`video:${id}`).state !== "none" ? renderGate.position(`video:${id}`) : renderGate.position(`reel:${id}`);
+  res.json({ ...pos, ...renderGate.stats() });
 });
 
 app.get("/reel-status/:jobId", requireSecret, (req, res) => {
