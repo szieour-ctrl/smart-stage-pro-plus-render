@@ -201,8 +201,8 @@ function mergeSpecs(a, b) {
   return out;
 }
 
-// Reel photo-count limits per length (Oct 17, 2026): each photo gets 2.5-7.5s.
-const REEL_PHOTO_RANGES = { 15: [3, 6], 30: [4, 8], 45: [6, 8], 60: [8, 8] };
+// Reel photo-count limits per length (Oct 17, 2026; 15s and 30s tightened Oct 18, 2026): each photo gets 3.75-7.5s, so a Before -> After reveal scene always has time for its end motion.
+const REEL_PHOTO_RANGES = { 15: [3, 4], 30: [5, 6], 45: [6, 8], 60: [8, 8] };
 const MIN_SCENES = 3, MAX_SCENES = 8;
 const REEL_SCENE_MIN = 2.5, REEL_REVEAL_MIN = 3.0; // seconds; a Before -> After reveal scene needs a little longer
 
