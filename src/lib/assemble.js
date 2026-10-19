@@ -549,6 +549,10 @@ const COMPOUND_END_MOTIONS = [
   "push_tilt_up", "push_tilt_down",
   "push_pan_left", "push_pan_right",
   "pan_left_push", "pan_right_push",
+  // Oct 18, 2026 — pull-back + pan family (Ken Burns only; real photo pixels,
+  // never AI Motion, which would invent content when pulling back).
+  "pull_back_pan_left", "pull_back_pan_right",
+  "pan_left_pull_back", "pan_right_pull_back",
 ];
 
 const REVEAL_PRESETS = {

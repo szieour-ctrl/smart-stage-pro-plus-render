@@ -84,6 +84,9 @@ const VALID_PRESETS = new Set([
   "pan_left_push", "pan_right_push",
   // Added [DATE], Sam's design — Float, then a full pull-back settle.
   "float_pull_back",
+  // Added Oct 18, 2026 (Sam's request) — pull-back + pan, Ken Burns only.
+  "pull_back_pan_left", "pull_back_pan_right",
+  "pan_left_pull_back", "pan_right_pull_back",
 ]);
 
 // FIX (Sam's catch, real render — confirmed via the room-label

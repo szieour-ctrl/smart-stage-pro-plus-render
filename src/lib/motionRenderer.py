@@ -47,6 +47,8 @@ to real motionRenderer.py curves; production names replace the R&D keys):
   push_tilt_up / push_tilt_down    — Push, then tilt up/down
   push_pan_left / push_pan_right   — Push, then pan left/right
   pan_left_push / pan_right_push   — Pan left/right, then push
+  pull_back_pan_left / _right      — Pull back, then pan left/right
+  pan_left_pull_back / _right      — Pan left/right, then pull back
 
 Each compound preset is one continuous curve made of 2-3 smoothstep-eased
 phases. Phase boundaries are FRACTIONS of total duration, not literal
@@ -95,7 +97,9 @@ def parse_args():
                              "push_tilt_up", "push_tilt_down",
                              "push_pan_left", "push_pan_right",
                              "pan_left_push", "pan_right_push",
-                             "float_pull_back"])
+                             "float_pull_back",
+                             "pull_back_pan_left", "pull_back_pan_right",
+                             "pan_left_pull_back", "pan_right_pull_back"])
     p.add_argument("--duration",   type=float, required=True)
     p.add_argument("--output",     required=True,  help="Output .mp4 path")
     p.add_argument("--start-zoom", type=float, default=1.0, dest="start_zoom")
@@ -247,6 +251,30 @@ COMPOUND_PRESETS = {
     "pan_right_push": (
         1.16, -0.12, 0.0,
         [(0.5, 0.0, 0.240, 0.0), (0.5, 0.180, 0.0, 0.0)],
+    ),
+
+    # Pull-back + pan family (Oct 18, 2026 — Sam's request; Ken Burns only,
+    # never AI Motion). Unlike the push_pan family above, these are sized so
+    # the 16:9 window never leaves the photo: with zoom z the window centre
+    # may sit at most (1 - 1/z)/2 from centre, so each start offset and pan
+    # distance below stays inside that margin at every point of the move
+    # (checked numerically — see the render-test in the PR description).
+    # "left" = window travels left, same sign convention as push_pan_left.
+    "pull_back_pan_left": (
+        1.30, 0.065, 0.0,
+        [(0.5, -0.120, 0.0, 0.0), (0.5, 0.0, -0.130, 0.0)],
+    ),
+    "pull_back_pan_right": (
+        1.30, -0.065, 0.0,
+        [(0.5, -0.120, 0.0, 0.0), (0.5, 0.0, 0.130, 0.0)],
+    ),
+    "pan_left_pull_back": (
+        1.18, 0.065, 0.0,
+        [(0.5, 0.0, -0.130, 0.0), (0.5, -0.180, 0.065, 0.0)],
+    ),
+    "pan_right_pull_back": (
+        1.18, -0.065, 0.0,
+        [(0.5, 0.0, 0.130, 0.0), (0.5, -0.180, -0.065, 0.0)],
     ),
 
     # Float, then a full pull-back settle (Reveal End Motion). This preset was
@@ -487,6 +515,18 @@ V_COMPOUND_SWEEP = 0.40 # compound pan phases sweep ~40% of a window width
 V_TILT_K       = 1.0
 _PAN_RANGE_16  = (1.0 - 1.0 / 1.25) * 0.60
 _COMPOUND_PAN_UNIT = 0.240
+# Oct 18, 2026: the compounds that END or START in a pan (push/pull-back + pan
+# families) now travel much farther in 9:16 — the old 0.40 window-width sweep
+# showed only ~15% of a 3:2 photo's width, so the pan barely revealed anything.
+# Target is V_PAN_COMPOUND_SWEEP window widths over the pan phase (a 9:16
+# window is ~37.5% of a 3:2 photo, so 0.9 -> ~34% of the photo width), capped
+# by V_PAN_MAX_SPEED (window widths per second of the pan phase) so a short
+# scene pans less rather than faster. 16:9 is untouched.
+V_PAN_COMPOUND_SWEEP = 0.90
+V_PAN_MAX_SPEED = 0.45
+PAN_COMPOUNDS = {"push_pan_left", "push_pan_right", "pan_left_push", "pan_right_push",
+                 "pull_back_pan_left", "pull_back_pan_right",
+                 "pan_left_pull_back", "pan_right_pull_back"}
 
 
 def parse_focal(s):
@@ -499,7 +539,7 @@ def parse_focal(s):
         return 0.5, 0.5
 
 
-def build_vertical_curve(preset, n_frames, start_zoom, src_w, src_h, focal):
+def build_vertical_curve(preset, n_frames, start_zoom, src_w, src_h, focal, fps=25):
     """
     Returns list of (cx, cy, win_h) per frame in FULL-PHOTO pixel coordinates.
     """
@@ -509,6 +549,13 @@ def build_vertical_curve(preset, n_frames, start_zoom, src_w, src_h, focal):
     sweep = V_COMPOUND_SWEEP if preset in COMPOUND_PRESETS else V_ATOMIC_SWEEP
     unit = _COMPOUND_PAN_UNIT if preset in COMPOUND_PRESETS else _PAN_RANGE_16
     kx = sweep * fw1 / unit                            # image-width fraction per pan unit
+    if preset in PAN_COMPOUNDS:
+        xs = [c[1] for c in base]
+        pan_range = max(xs) - min(xs)                  # pan units the curve actually travels
+        if pan_range > 1e-9:
+            pan_seconds = 0.5 * n_frames / float(fps)  # the pan is one of two equal phases
+            target = min(V_PAN_COMPOUND_SWEEP, V_PAN_MAX_SPEED * pan_seconds)
+            kx = target * fw1 / pan_range
 
     fx, fy = focal
     out = []
@@ -705,7 +752,7 @@ def main():
             raise ValueError(f"Could not load image: {args.source}")
         src_h, src_w = img.shape[:2]
         vcurve = build_vertical_curve(args.preset, n_frames, args.start_zoom,
-                                      src_w, src_h, parse_focal(args.focal))
+                                      src_w, src_h, parse_focal(args.focal), args.fps)
         # ending zoom reported in the same 16:9-curve units so callers' carryZoom logic is unchanged
         ending_zoom = build_motion_curve(args.preset, n_frames, args.start_zoom)[-1][0]
         frames_iter = ((None, c) for c in vcurve)
