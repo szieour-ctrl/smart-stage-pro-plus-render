@@ -28,6 +28,7 @@ const { uploadScratchFile } = require("./lib/s3Upload");
 const { renderBrandedOverlay, renderBadgeLayer, renderQrLayer, compositeReel } = require("./lib/reelOverlay");
 const storyboard = require("./lib/reelStoryboard");
 const { renderReel } = require("./lib/reelRender");
+const renderGate = require("./lib/renderGate");
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
@@ -176,6 +177,7 @@ app.get("/health", (req, res) => {
     status: "ok",
     service: "smart-stage-pro-plus-render",
     activeJobs: activeJobs.size,
+    renderGate: renderGate.stats(),
     timestamp: new Date().toISOString(),
   });
 });
@@ -199,7 +201,8 @@ app.post("/render", requireSecret, async (req, res) => {
 
   // Process in the background. Errors are caught and reported via webhook —
   // they must never crash the server process.
-  processRenderJob(job)
+  // Shared gate (see lib/renderGate.js): waits here if other renders are running.
+  renderGate.runExclusive(`video:${job.jobId}`, () => processRenderJob(job))
     .catch((err) => {
       console.error(`Job ${job.jobId} failed:`, err.message);
     })
@@ -557,7 +560,7 @@ app.get("/test-reel-overlay", requireSecret, async (req, res) => {
 // Job state is in memory (single Railway instance); entries are dropped after 2 hours. A restart
 // loses in-flight jobs — the client then sees "not found" and offers a retry. No charging here.
 const reelJobs = new Map();
-const REEL_MAX_CONCURRENT = 2;
+const REEL_MAX_PENDING = Math.max(2, Number(process.env.REEL_MAX_PENDING) || 4); // running + waiting Reels, all users
 setInterval(() => { const cut = Date.now() - 2 * 3600 * 1000; for (const [id, j] of reelJobs) if (j.updatedAt < cut) reelJobs.delete(id); }, 15 * 60 * 1000).unref();
 
 app.post("/render-reel", requireSecret, (req, res) => {
@@ -565,13 +568,21 @@ app.post("/render-reel", requireSecret, (req, res) => {
   if (!job.jobId || !job.event || !Array.isArray(job.scenes) || !job.scenes.length) {
     return res.status(400).json({ error: "Missing jobId, event or scenes" });
   }
-  const running = [...reelJobs.values()].filter((j) => j.status === "queued" || j.status === "running").length;
-  if (running >= REEL_MAX_CONCURRENT) return res.status(429).json({ error: "Reel renderer is busy, try again in a minute" });
-  const state = { status: "queued", step: "Queued", startedAt: Date.now(), updatedAt: Date.now() };
+  // Reels now queue behind the shared render gate instead of failing both jobs.
+  // Still refuse when too many Reels are already waiting, so nobody waits past
+  // the client's 10-minute patience.
+  const pending = [...reelJobs.values()].filter((j) => j.status === "queued" || j.status === "running").length;
+  if (pending >= REEL_MAX_PENDING) return res.status(429).json({ error: "Reel renderer is busy, try again in a minute" });
+  const state = { status: "queued", step: "Waiting for another render to finish", startedAt: Date.now(), updatedAt: Date.now() };
   reelJobs.set(job.jobId, state);
   res.status(202).json({ accepted: true, jobId: job.jobId });
-  state.status = "running";
-  renderReel(job, (step) => { state.step = step; state.updatedAt = Date.now(); })
+  renderGate.runExclusive(`reel:${job.jobId}`, () => {
+    state.status = "running";
+    return renderReel(job, (step) => { state.step = step; state.updatedAt = Date.now(); });
+  }, {
+    onQueued: (pos) => { state.step = pos > 1 ? `Waiting for ${pos} renders ahead` : "Waiting for another render to finish"; state.updatedAt = Date.now(); },
+    onStart: () => { state.status = "running"; state.step = "Starting"; state.updatedAt = Date.now(); },
+  })
     .then((result) => { state.status = "done"; state.result = result; state.step = "Done"; })
     .catch((err) => { console.error(`Reel ${job.jobId} failed:`, err.message); state.status = "error"; state.error = err.message; })
     .finally(() => { state.updatedAt = Date.now(); });
