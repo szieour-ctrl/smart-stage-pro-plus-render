@@ -29,6 +29,7 @@ const { renderBrandedOverlay, renderBadgeLayer, renderQrLayer, compositeReel } =
 const storyboard = require("./lib/reelStoryboard");
 const { renderReel } = require("./lib/reelRender");
 const renderGate = require("./lib/renderGate");
+const { notifyWebhook } = require("./lib/notify");
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
@@ -563,6 +564,15 @@ const reelJobs = new Map();
 const REEL_MAX_PENDING = Math.max(2, Number(process.env.REEL_MAX_PENDING) || 4); // running + waiting Reels, all users
 setInterval(() => { const cut = Date.now() - 2 * 3600 * 1000; for (const [id, j] of reelJobs) if (j.updatedAt < cut) reelJobs.delete(id); }, 15 * 60 * 1000).unref();
 
+// Reel completion webhook: same host and secret as video-notify, different function (reel-notify).
+// Fire-and-forget; notifyWebhook never throws. Netlify counting is idempotent, so a missed call is
+// harmless (the status poll in reel-render.js counts the render too).
+function notifyReel(payload) {
+  const base = process.env.REEL_WEBHOOK_URL || (process.env.VIDEO_WEBHOOK_URL || "").replace("video-notify", "reel-notify");
+  if (!base || base === process.env.VIDEO_WEBHOOK_URL) { console.warn("[reel-notify] no webhook URL; skipped", payload.jobId); return; }
+  notifyWebhook(payload, base).catch((e) => console.error("[reel-notify] failed:", e.message));
+}
+
 app.post("/render-reel", requireSecret, (req, res) => {
   const job = req.body || {};
   if (!job.jobId || !job.event || !Array.isArray(job.scenes) || !job.scenes.length) {
@@ -586,8 +596,15 @@ app.post("/render-reel", requireSecret, (req, res) => {
     onQueued: (pos) => { state.step = pos > 1 ? `Waiting for ${pos} renders ahead` : "Waiting for another render to finish"; state.updatedAt = Date.now(); },
     onStart: () => { state.status = "running"; state.step = "Starting"; state.updatedAt = Date.now(); },
   })
-    .then((result) => { state.status = "done"; state.result = result; state.step = "Done"; })
-    .catch((err) => { console.error(`Reel ${job.jobId} failed:`, err.message); state.status = "error"; state.error = err.message; })
+    .then((result) => {
+      state.status = "done"; state.result = result; state.step = "Done";
+      // Tell Netlify so the render is counted (5 undownloaded renders = 1 Image) even if the user left the page.
+      notifyReel({ jobId: job.jobId, status: "done", keys: (result && result.keys) || {} });
+    })
+    .catch((err) => {
+      console.error(`Reel ${job.jobId} failed:`, err.message); state.status = "error"; state.error = err.message;
+      notifyReel({ jobId: job.jobId, status: "error" });
+    })
     .finally(() => { state.updatedAt = Date.now(); });
 });
 
