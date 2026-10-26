@@ -87,7 +87,7 @@ const measureCache = new Map();
 async function measure(text, { family, weight, size, spacing = 0 }) {
   const key = [text, family, weight, size, spacing].join("|");
   if (measureCache.has(key)) return measureCache.get(key);
-  const markup = `<span font_family="${esc(family)}" font_weight="${weight}" letter_spacing="${Math.round(spacing * 1024)}" size="${Math.round(size * 1024)}">${esc(text)}</span>`;
+  const markup = `<span font_family="${esc(family)}" font_weight="${weight}" font_features="lnum" letter_spacing="${Math.round(spacing * 1024)}" size="${Math.round(size * 1024)}">${esc(text)}</span>`;
   const { info } = await sharp({ text: { text: markup, rgba: true, dpi: 72 } }).png().toBuffer({ resolveWithObject: true });
   measureCache.set(key, info.width);
   return info.width;
@@ -306,6 +306,86 @@ async function closingSvg(p, cv) {
   return { svg, warnings: notice ? [] : ["no MetroList notice (noNotice was set)"], textBottom: L.bottom, limit: cv.bottomLimit, fits: L.bottom <= cv.bottomLimit };
 }
 
+// Playfair's default figures are old-style (a "4" drops below the line). librsvg can't switch the font
+// feature on from SVG, so big figures are drawn through pango markup (font_features="lnum") into a
+// trimmed PNG and embedded. Returns the ink-only image plus its size; its bottom edge is the baseline.
+async function liningFigure(text, size, color, weight = 800) {
+  const markup = `<span font_family="${DISPLAY}" font_weight="${weight}" font_features="lnum" foreground="${color}" size="${Math.round(size * 1024)}">${esc(text)}</span>`;
+  const { data, info } = await sharp({ text: { text: markup, rgba: true, dpi: 72 } }).trim().png().toBuffer({ resolveWithObject: true });
+  return { buf: data, w: info.width, h: info.height };
+}
+
+// Big-stat card ---------------------------------------------------------------
+// Middle scene: lead-in line, one huge figure, trailing line, optional icon, and a short code-built
+// source line ("METROLIST · SEPTEMBER 2026") at the bottom. Subtle branding: palette and type only
+// (no headshot, no notice bar; the full notice lives on the opening and closing cards).
+// params: { lead, value, unit?, trail?, icon?: "calendar"|"none", sourceLabel?, period, brand }
+// value MUST come from the verified data, never typed by the planner; lead/trail are script text.
+function calendarIcon(cx, cy, r, pal) {
+  const a = r * 0.46; // half-size of the calendar glyph
+  return `<circle cx="${cx}" cy="${cy}" r="${r * 0.78}" fill="#F0E9D8"/>
+  <path d="M ${cx - r * 0.1} ${cy - r * 1.08} A ${r * 1.1} ${r * 1.1} 0 1 1 ${cx + r * 0.95} ${cy + r * 0.55}" fill="none" stroke="${pal.gold}" stroke-width="${Math.max(6, r * 0.1)}" stroke-linecap="round"/>
+  <g fill="none" stroke="${pal.gold}" stroke-width="${Math.max(4, r * 0.07)}" stroke-linejoin="round" stroke-linecap="round">
+    <rect x="${cx - a}" y="${cy - a * 0.8}" width="${a * 2}" height="${a * 1.7}" rx="${a * 0.18}"/>
+    <path d="M ${cx - a} ${cy - a * 0.2} H ${cx + a} M ${cx - a * 0.5} ${cy - a * 1.15} V ${cy - a * 0.55} M ${cx + a * 0.5} ${cy - a * 1.15} V ${cy - a * 0.55}"/>
+  </g>
+  <g fill="${pal.gold}">${[-0.55, 0, 0.55].flatMap((dx) => [0.25, 0.7].map((dy) => `<circle cx="${cx + a * dx}" cy="${cy + a * dy}" r="${Math.max(3, r * 0.05)}"/>`)).join("")}</g>`;
+}
+
+async function statSvg(p, cv) {
+  const pal = palette(p.brand);
+  const portrait = cv === CANVAS.portrait;
+  const X = cv.marginX;
+  const text = [p.value, p.unit].filter(Boolean).join(" ").toUpperCase();
+  const label = (p.sourceLabel || "MetroList") + (periodLabel(p.period) ? `  ·  ${periodLabel(p.period)}` : "");
+  const colW = portrait ? cv.maxW : 1000;
+  const iconR = p.icon === "none" ? 0 : (portrait ? 70 : 64);
+  let scale = 1, L;
+  for (; scale >= 0.62; scale -= 0.04) {
+    const ls = Math.round(cv.sub * scale);
+    const leadLines = await wrap(p.lead || "", colW, { family: DISPLAY, weight: 500, size: ls });
+    const vs = await fitSize(text, colW, Math.round((portrait ? 270 : 250) * scale), 90, { family: DISPLAY, weight: 800 });
+    const trailMax = iconR ? colW - iconR * 2 - 50 : colW;
+    const trailLines = await wrap(p.trail || "", trailMax, { family: DISPLAY, weight: 500, size: ls });
+    let y = cv.top + 4;
+    const rule1 = y; y += 44;
+    const leadBase = y + ls * 0.8; y += leadLines.length * ls * 1.14 + 10;
+    const valBase = y + vs * 0.82; y = valBase + 40;
+    const trailBase = y + ls * 0.8; y += trailLines.length * ls * 1.14 + 14;
+    const rule2 = y; y += 6;
+    L = { ls, leadLines, vs, trailLines, rule1, leadBase, valBase, trailBase, rule2, bottom: y, trailTop: trailBase - ls * 0.8 };
+    if (y <= cv.bottomLimit + (portrait ? 250 : 120)) break;
+  }
+  const iconCx = portrait ? cv.w - cv.marginX - iconR - 10 : X + colW + iconR + 70;
+  const iconCy = portrait ? L.trailTop + (L.trailLines.length * L.ls * 1.14) / 2 : L.valBase - L.vs * 0.36;
+  const footY = portrait ? cv.h - 64 : cv.h - 46;
+  const fig = await liningFigure(text, L.vs, pal.gold);
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${cv.w}" height="${cv.h}">
+  <defs>
+    <linearGradient id="lt" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff" stop-opacity="0.5"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></linearGradient>
+    <linearGradient id="ll" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#fff" stop-opacity="0.5"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></linearGradient>
+    <linearGradient id="lb" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#000" stop-opacity="0"/><stop offset="1" stop-color="#000" stop-opacity="0.45"/></linearGradient>
+  </defs>
+  ${portrait ? `<rect x="0" y="0" width="${cv.w}" height="${Math.round(cv.h * 0.6)}" fill="url(#lt)"/>` : `<rect x="0" y="0" width="${Math.round(cv.w * 0.66)}" height="${cv.h}" fill="url(#ll)"/>`}
+  <rect x="0" y="${cv.h - 260}" width="${cv.w}" height="260" fill="url(#lb)"/>
+  <rect x="${X}" y="${L.rule1}" width="145" height="4" fill="${pal.gold}"/>
+  ${L.leadLines.map((l, i) => T(X, L.leadBase + i * L.ls * 1.14, l, { size: L.ls, weight: 500, fill: pal.ink })).join("\n  ")}
+  <image href="${dataUri(fig.buf)}" x="${X - 2}" y="${Math.round(L.valBase - fig.h)}" width="${fig.w}" height="${fig.h}"/>
+  ${L.trailLines.map((l, i) => T(X, L.trailBase + i * L.ls * 1.14, l, { size: L.ls, weight: 500, fill: pal.ink })).join("\n  ")}
+  ${iconR ? calendarIcon(iconCx, iconCy, iconR, pal) : ""}
+  <rect x="${X}" y="${L.rule2}" width="145" height="3" fill="${pal.gold}"/>
+  ${T(X, footY, label.toUpperCase(), { size: portrait ? 24 : 20, weight: 500, family: BODY, fill: "#FFFFFF", spacing: 5, opacity: 0.95 })}
+</svg>`;
+  return { svg, warnings: [], textBottom: L.bottom, limit: cv.bottomLimit + (portrait ? 250 : 120), fits: L.bottom <= cv.bottomLimit + (portrait ? 250 : 120) };
+}
+async function renderStatCard(params, outPng, canvas = "portrait") {
+  const cv = CANVAS[canvas] || CANVAS.portrait;
+  if (!params.value) throw new Error("renderStatCard: value is required (it must come from the verified data)");
+  const r = await statSvg(params, cv);
+  await sharp(Buffer.from(r.svg)).png().toFile(outPng);
+  return { png: outPng, warnings: r.warnings, fits: r.fits, textBottom: r.textBottom, limit: r.limit };
+}
+
 // Public API ------------------------------------------------------------------
 // params (opening): { market, kind?, headline, eyebrow?, period:{start,end}, noticeText?, brand?, agent:{name,brokerage}, headshotBuf? }
 // params (closing): { headline:[darkPart, accentPart], support, tagline?, variant?, period, ... same agent/brand }
@@ -322,4 +402,4 @@ async function renderClosingCard(params, outPng, canvas = "portrait") {
   return { png: outPng, warnings: r.warnings, fits: r.fits, textBottom: r.textBottom, limit: r.limit };
 }
 
-module.exports = { renderOpeningCard, renderClosingCard, metroListNotice, periodLabel, CAPTION_BAND, PORTRAIT_ZONE, CANVAS };
+module.exports = { renderOpeningCard, renderClosingCard, renderStatCard, metroListNotice, periodLabel, CAPTION_BAND, PORTRAIT_ZONE, CANVAS };
