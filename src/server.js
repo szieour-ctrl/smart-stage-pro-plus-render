@@ -621,6 +621,56 @@ app.get("/reel-status/:jobId", requireSecret, (req, res) => {
   res.json({ status: j.status, step: j.step, result: j.result || null, error: j.error || null, elapsedMs: Date.now() - j.startedAt });
 });
 
+// ── AGENT MARKETING REELS (beta) ─────────────────────────────────────────
+// POST /render-agent-marketing → 202. Body: {jobId, manifest (am-manifest-2), assets: {key: presignedUrl}, musicStyle?}.
+// The renderer makes no outside calls other than downloading the listed assets, so a failed render can be retried
+// from the same manifest without regenerating images or narration. Netlify's job record is the source of truth;
+// this in-memory map is only a cache. Separate map from Reels v1; shares the render gate. /render-reel is untouched.
+const amJobs = new Map();
+setInterval(() => { const cut = Date.now() - 2 * 3600 * 1000; for (const [id, j] of amJobs) if (j.updatedAt < cut) amJobs.delete(id); }, 15 * 60 * 1000).unref();
+
+app.post("/render-agent-marketing", requireSecret, (req, res) => {
+  const job = req.body || {};
+  if (!job.jobId || !job.manifest || job.manifest.version !== "am-manifest-2") {
+    return res.status(400).json({ error: "Missing jobId or an am-manifest-2 manifest" });
+  }
+  const existing = amJobs.get(job.jobId);
+  if (existing && (existing.status === "queued" || existing.status === "running")) {
+    return res.status(202).json({ accepted: true, jobId: job.jobId, duplicate: true }); // idempotent retry
+  }
+  const pending = [...amJobs.values(), ...reelJobs.values()].filter((j) => j.status === "queued" || j.status === "running").length;
+  if (pending >= REEL_MAX_PENDING) {
+    const g = renderGate.stats();
+    return res.status(429).json({ error: "Reel renderer is busy", busy: true, running: g.running, waiting: g.waiting });
+  }
+  const state = { status: "queued", step: "Waiting for another render to finish", startedAt: Date.now(), updatedAt: Date.now() };
+  amJobs.set(job.jobId, state);
+  res.status(202).json({ accepted: true, jobId: job.jobId });
+  const { renderAgentMarketing } = require("./lib/agentMarketingRender");
+  renderGate.runExclusive(`am:${job.jobId}`, () => {
+    state.status = "running";
+    return renderAgentMarketing(job, (step) => { state.step = step; state.updatedAt = Date.now(); });
+  }, {
+    onQueued: (pos) => { state.step = pos > 1 ? `Waiting for ${pos} renders ahead` : "Waiting for another render to finish"; state.updatedAt = Date.now(); },
+    onStart: () => { state.status = "running"; state.step = "Starting"; state.updatedAt = Date.now(); },
+  })
+    .then((result) => {
+      state.status = "done"; state.result = result; state.step = "Done";
+      notifyReel({ jobId: job.jobId, status: "done", kind: "agent_marketing", keys: (result && result.keys) || {} });
+    })
+    .catch((err) => {
+      console.error(`Agent Marketing ${job.jobId} failed:`, err.message); state.status = "error"; state.error = err.message;
+      notifyReel({ jobId: job.jobId, status: "error", kind: "agent_marketing" });
+    })
+    .finally(() => { state.updatedAt = Date.now(); });
+});
+
+app.get("/agent-marketing-status/:jobId", requireSecret, (req, res) => {
+  const j = amJobs.get(req.params.jobId);
+  if (!j) return res.status(404).json({ status: "not_found" });
+  res.json({ status: j.status, step: j.step, result: j.result || null, error: j.error || null, elapsedMs: Date.now() - j.startedAt, queue: renderGate.position(`am:${req.params.jobId}`) });
+});
+
 // ── TEMPORARY DIAGNOSTIC — REELS v1 STORYBOARD ENGINE TEST ──────────────
 // Renders a six-scene (or five-scene) Reel for any of the 12 events: Ken Burns clips (one per
 // photo, hard-cut), then the storyboard overlay pass (scene text, details, highlights, closing
