@@ -219,15 +219,16 @@ async function openingSvg(p, cv) {
     const ss = Math.round(cv.sub * scale);
     const subLines = await wrap(sub, cv.subMaxW, { family: DISPLAY, weight: 500, size: ss });
     const es = Math.round(cv.eyebrow * scale);
+    const eyeLines = eyebrow ? await wrap(eyebrow, cv.maxW, { family: BODY, weight: 500, size: es, spacing: 5 }) : [];
     let y = cv.top + 4;
     const rule1 = y; y += 40;
     const titleBase = y + ts * 0.8; y = titleBase + (marketLines.length - 1) * ts * 1.04 + 10;
     const kindBase = y + ks * 0.82; y = kindBase + 34;
     const rule2 = y; y += 52;
     const subBase = y + ss * 0.8; y += subLines.length * ss * 1.14 + 18;
-    const eyeBase = y + es; y = eyeBase + 30;
+    const eyeBase = y + es; y = eyeBase + (Math.max(1, eyeLines.length) - 1) * es * 1.5 + 30;
     const rule3 = y; y += 6;
-    layout = { rule1, ts, marketLines, titleBase, ks, kindBase, rule2, ss, subLines, subBase, es, eyeBase, rule3, bottom: y };
+    layout = { eyeLines, rule1, ts, marketLines, titleBase, ks, kindBase, rule2, ss, subLines, subBase, es, eyeBase, rule3, bottom: y };
     if (y <= cv.bottomLimit) break;
   }
   const L = layout;
@@ -240,7 +241,7 @@ async function openingSvg(p, cv) {
   ${T(X - 2, L.kindBase, kind, { size: L.ks, weight: 600, fill: pal.gold })}
   <rect x="${X}" y="${L.rule2}" width="110" height="3" fill="${pal.ink}"/>
   ${L.subLines.map((l, i) => T(X, L.subBase + i * L.ss * 1.14, l, { size: L.ss, weight: 500, fill: pal.ink })).join("\n  ")}
-  ${eyebrow ? T(X, L.eyeBase, eyebrow, { size: L.es, weight: 500, family: BODY, fill: pal.ink, spacing: 5 }) : ""}
+  ${L.eyeLines.map((l, i) => T(X, L.eyeBase + i * L.es * 1.5, l, { size: L.es, weight: 500, family: BODY, fill: pal.ink, spacing: 5 })).join("\n  ")}
   <rect x="${X}" y="${L.rule3}" width="90" height="3" fill="${pal.gold}"/>
   ${agent.name ? await lockup(cv, pal, agent, hs, { cx: X, cy: lockCy, circle: true }) : ""}
   ${nb.svg}
@@ -267,14 +268,15 @@ async function closingSvg(p, cv) {
     const al = await wrap(accent, cv.maxW, { family: DISPLAY, weight: 800, size: hsz });
     const ss = Math.round(cv.support * scale), es = Math.round(cv.eyebrow * scale);
     const sl = await wrap(support, cv.subMaxW, { family: DISPLAY, weight: 500, size: ss });
+    const tagLines = tagline ? await wrap(tagline, cv.maxW, { family: BODY, weight: 500, size: es, spacing: 5 }) : [];
     let y = cv.top + 4;
     const rule1 = y; y += 34;
     const hBase = y + hsz * 0.82; y = hBase + (dl.length + al.length - 1) * hsz * 1.14 + 30;
     const rule2 = y; y += 48;
     const sBase = y + ss * 0.8; y += sl.length * ss * 1.14 + 18;
-    const eBase = tagline ? y + es : 0; if (tagline) y = eBase + 30;
+    const eBase = tagline ? y + es : 0; if (tagline) y = eBase + (tagLines.length - 1) * es * 1.5 + 30;
     const rule3 = y; y += 6;
-    layout = { rule1, hsz, dl, al, hBase, rule2, ss, sl, sBase, es, eBase, rule3, bottom: y };
+    layout = { tagLines, rule1, hsz, dl, al, hBase, rule2, ss, sl, sBase, es, eBase, rule3, bottom: y };
     if (y <= cv.bottomLimit) break;
   }
   const L = layout;
@@ -296,7 +298,7 @@ async function closingSvg(p, cv) {
   ${headSvg}
   <rect x="${X}" y="${L.rule2}" width="110" height="3" fill="${pal.gold}"/>
   ${L.sl.map((l, i) => T(X, L.sBase + i * L.ss * 1.14, l, { size: L.ss, weight: 500, fill: pal.ink })).join("\n  ")}
-  ${tagline ? T(X, L.eBase, tagline, { size: L.es, weight: 500, family: BODY, fill: pal.ink, spacing: 5 }) : ""}
+  ${L.tagLines.map((l, i) => T(X, L.eBase + i * L.es * 1.5, l, { size: L.es, weight: 500, family: BODY, fill: pal.ink, spacing: 5 })).join("\n  ")}
   <rect x="${X}" y="${L.rule3}" width="90" height="3" fill="${pal.gold}"/>
   ${lock}
   ${nb.svg}
