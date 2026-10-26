@@ -44,8 +44,20 @@ const CANVAS = {
 const CAPTION_BAND = { portrait: CANVAS.portrait.captionBand, landscape: CANVAS.landscape.captionBand };
 const PORTRAIT_ZONE = { portrait: CANVAS.portrait.portraitZone, landscape: CANVAS.landscape.portraitZone };
 
-const DISPLAY = "Playfair Display";
-const BODY = "Montserrat";
+// Typefaces. Default look: Playfair Display headlines + Montserrat labels. A subscriber whose Brand DNA names one of the
+// bundled open-license families (brand-themes.js on Netlify) gets that family for everything; the choice travels through
+// AsyncLocalStorage so concurrent renders for different subscribers cannot see each other's font.
+const { AsyncLocalStorage } = require("async_hooks");
+const BRAND_FONTS = ["Montserrat", "Lato", "Open Sans", "Playfair Display", "Bodoni Moda", "Roboto", "Barlow", "Manrope"];
+const DEFAULT_FONTS = { display: "Playfair Display", body: "Montserrat" };
+const fontCtx = new AsyncLocalStorage();
+const D = () => (fontCtx.getStore() || DEFAULT_FONTS).display;
+const B = () => (fontCtx.getStore() || DEFAULT_FONTS).body;
+function fontsFor(brand) {
+  const f = brand && BRAND_FONTS.includes(brand.font) ? brand.font : null;
+  return f ? { display: f, body: f } : DEFAULT_FONTS;
+}
+const withBrandFont = (fn) => (params, ...rest) => fontCtx.run(fontsFor(params && params.brand), () => fn(params, ...rest));
 
 const typo = (s) => String(s ?? "").replace(/'/g, "\u2019");
 const esc = (s) => typo(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
@@ -136,7 +148,7 @@ function palette(brand = {}) {
   return { gold, ink, ring: hex(brand.border, gold) };
 }
 
-const T = (x, y, text, { size, weight = 400, family = DISPLAY, fill, anchor = "start", spacing = 0, opacity = 1 }) =>
+const T = (x, y, text, { size, weight = 400, family = D(), fill, anchor = "start", spacing = 0, opacity = 1 }) =>
   `<text x="${x}" y="${Math.round(y)}" text-anchor="${anchor}" font-family="${family}" font-weight="${weight}" font-size="${size}"${spacing ? ` letter-spacing="${spacing}"` : ""} fill="${fill}"${opacity < 1 ? ` fill-opacity="${opacity}"` : ""}>${esc(text)}</text>`;
 const dataUri = (b) => `data:image/png;base64,${b.toString("base64")}`;
 
@@ -144,13 +156,13 @@ const dataUri = (b) => `data:image/png;base64,${b.toString("base64")}`;
 async function noticeBar(cv, pal, noticeText) {
   const n = cv.notice, top = cv.h - n.h;
   if (!noticeText) return { svg: "", top: cv.h };
-  const font = { family: BODY, weight: 500, size: n.size };
+  const font = { family: B(), weight: 500, size: n.size };
   const lines = await wrap(noticeText, n.maxW, font);
   const lh = Math.round(n.size * 1.38), block = lines.length * lh;
   const y0 = top + Math.round((n.h - block) / 2) + Math.round(n.size * 1.02);
   const svg = `<rect x="0" y="${top}" width="${cv.w}" height="${n.h}" fill="${pal.ink}"/>
   <rect x="0" y="${top}" width="${cv.w}" height="3" fill="${pal.gold}"/>
-  ${lines.map((l, i) => T(cv.w / 2, y0 + i * lh, l, { size: n.size, weight: 500, family: BODY, fill: "#FFFFFF", anchor: "middle", opacity: 0.95 })).join("\n  ")}`;
+  ${lines.map((l, i) => T(cv.w / 2, y0 + i * lh, l, { size: n.size, weight: 500, family: B(), fill: "#FFFFFF", anchor: "middle", opacity: 0.95 })).join("\n  ")}`;
   return { svg, top };
 }
 
@@ -159,11 +171,11 @@ async function lockup(cv, pal, agent, hsBuf, { cx, cy, align = "left", circle = 
   const brokerage = String(agent.brokerage || "").toUpperCase();
   const r = cv.hs / 2;
   const textMaxW = align === "right" ? 560 : cv.maxW - (circle ? cv.hs + 40 : 0);
-  const nameSize = await fitSize(name, textMaxW, cv === CANVAS.portrait ? 64 : 52, 34, { family: DISPLAY, weight: 600 });
+  const nameSize = await fitSize(name, textMaxW, cv === CANVAS.portrait ? 64 : 52, 34, { family: D(), weight: 600 });
   const brkSize = cv === CANVAS.portrait ? 24 : 20, brkSpacing = 5;
-  const brkFont = { family: BODY, weight: 500, size: brkSize, spacing: brkSpacing };
+  const brkFont = { family: B(), weight: 500, size: brkSize, spacing: brkSpacing };
   const brkLines = brokerage ? (await wrap(brokerage, textMaxW, brkFont)).slice(0, 2) : [];
-  const nameW = await measure(name, { family: DISPLAY, weight: 600, size: nameSize });
+  const nameW = await measure(name, { family: D(), weight: 600, size: nameSize });
   let brkW = 0;
   for (const l of brkLines) brkW = Math.max(brkW, await measure(l, brkFont));
   const textW = Math.max(nameW, brkW);
@@ -179,7 +191,7 @@ async function lockup(cv, pal, agent, hsBuf, { cx, cy, align = "left", circle = 
   const barH = nameSize + (brkLines.length ? 22 + brkLines.length * brkLH : 0) + 8, barTop = cy - barH / 2;
   out += `<rect x="${x - 26}" y="${Math.round(barTop)}" width="4" height="${Math.round(barH)}" fill="${pal.gold}"/>`;
   out += T(x, barTop + nameSize * 0.86, name, { size: nameSize, weight: 600, fill: "#FFFFFF" });
-  brkLines.forEach((l, i) => { out += T(x, barTop + nameSize + brkSize + 22 + i * brkLH, l, { size: brkSize, weight: 500, family: BODY, fill: "#FFFFFF", spacing: brkSpacing, opacity: 0.95 }); });
+  brkLines.forEach((l, i) => { out += T(x, barTop + nameSize + brkSize + 22 + i * brkLH, l, { size: brkSize, weight: 500, family: B(), fill: "#FFFFFF", spacing: brkSpacing, opacity: 0.95 }); });
   return out;
 }
 
@@ -207,19 +219,19 @@ async function openingSvg(p, cv) {
   for (; scale >= 0.62; scale -= 0.04) {
     // One line if it fits at >= 62% of the full size, otherwise up to two balanced lines at a smaller size.
     let ts = Math.round(cv.title * scale), marketLines = [market];
-    if ((await measure(market, { family: DISPLAY, weight: 800, size: ts })) > cv.maxW) {
-      ts = await fitSize(market, cv.maxW, ts, Math.round(cv.title * 0.62), { family: DISPLAY, weight: 800 });
-      if ((await measure(market, { family: DISPLAY, weight: 800, size: ts })) > cv.maxW) {
+    if ((await measure(market, { family: D(), weight: 800, size: ts })) > cv.maxW) {
+      ts = await fitSize(market, cv.maxW, ts, Math.round(cv.title * 0.62), { family: D(), weight: 800 });
+      if ((await measure(market, { family: D(), weight: 800, size: ts })) > cv.maxW) {
         ts = Math.round(cv.title * 0.7 * scale);
-        marketLines = await wrap(market, cv.maxW, { family: DISPLAY, weight: 800, size: ts });
-        while (marketLines.length > 2 && ts > 56) { ts -= 4; marketLines = await wrap(market, cv.maxW, { family: DISPLAY, weight: 800, size: ts }); }
+        marketLines = await wrap(market, cv.maxW, { family: D(), weight: 800, size: ts });
+        while (marketLines.length > 2 && ts > 56) { ts -= 4; marketLines = await wrap(market, cv.maxW, { family: D(), weight: 800, size: ts }); }
       }
     }
-    const ks = await fitSize(kind, cv.maxW, Math.min(Math.round(cv.kind * scale), Math.round(ts * 0.68)), 40, { family: DISPLAY, weight: 600 });
+    const ks = await fitSize(kind, cv.maxW, Math.min(Math.round(cv.kind * scale), Math.round(ts * 0.68)), 40, { family: D(), weight: 600 });
     const ss = Math.round(cv.sub * scale);
-    const subLines = await wrap(sub, cv.subMaxW, { family: DISPLAY, weight: 500, size: ss });
+    const subLines = await wrap(sub, cv.subMaxW, { family: D(), weight: 500, size: ss });
     const es = Math.round(cv.eyebrow * scale);
-    const eyeLines = eyebrow ? await wrap(eyebrow, cv.maxW, { family: BODY, weight: 500, size: es, spacing: 5 }) : [];
+    const eyeLines = eyebrow ? await wrap(eyebrow, cv.maxW, { family: B(), weight: 500, size: es, spacing: 5 }) : [];
     let y = cv.top + 4;
     const rule1 = y; y += 40;
     const titleBase = y + ts * 0.8; y = titleBase + (marketLines.length - 1) * ts * 1.04 + 10;
@@ -241,7 +253,7 @@ async function openingSvg(p, cv) {
   ${T(X - 2, L.kindBase, kind, { size: L.ks, weight: 600, fill: pal.gold })}
   <rect x="${X}" y="${L.rule2}" width="110" height="3" fill="${pal.ink}"/>
   ${L.subLines.map((l, i) => T(X, L.subBase + i * L.ss * 1.14, l, { size: L.ss, weight: 500, fill: pal.ink })).join("\n  ")}
-  ${L.eyeLines.map((l, i) => T(X, L.eyeBase + i * L.es * 1.5, l, { size: L.es, weight: 500, family: BODY, fill: pal.ink, spacing: 5 })).join("\n  ")}
+  ${L.eyeLines.map((l, i) => T(X, L.eyeBase + i * L.es * 1.5, l, { size: L.es, weight: 500, family: B(), fill: pal.ink, spacing: 5 })).join("\n  ")}
   <rect x="${X}" y="${L.rule3}" width="90" height="3" fill="${pal.gold}"/>
   ${agent.name ? await lockup(cv, pal, agent, hs, { cx: X, cy: lockCy, circle: true }) : ""}
   ${nb.svg}
@@ -264,11 +276,11 @@ async function closingSvg(p, cv) {
   let scale = 1, layout;
   for (; scale >= 0.62; scale -= 0.04) {
     const hsz = Math.round(cv.headline * scale);
-    const dl = await wrap(dark, cv.maxW, { family: DISPLAY, weight: 800, size: hsz });
-    const al = await wrap(accent, cv.maxW, { family: DISPLAY, weight: 800, size: hsz });
+    const dl = await wrap(dark, cv.maxW, { family: D(), weight: 800, size: hsz });
+    const al = await wrap(accent, cv.maxW, { family: D(), weight: 800, size: hsz });
     const ss = Math.round(cv.support * scale), es = Math.round(cv.eyebrow * scale);
-    const sl = await wrap(support, cv.subMaxW, { family: DISPLAY, weight: 500, size: ss });
-    const tagLines = tagline ? await wrap(tagline, cv.maxW, { family: BODY, weight: 500, size: es, spacing: 5 }) : [];
+    const sl = await wrap(support, cv.subMaxW, { family: D(), weight: 500, size: ss });
+    const tagLines = tagline ? await wrap(tagline, cv.maxW, { family: B(), weight: 500, size: es, spacing: 5 }) : [];
     let y = cv.top + 4;
     const rule1 = y; y += 34;
     const hBase = y + hsz * 0.82; y = hBase + (dl.length + al.length - 1) * hsz * 1.14 + 30;
@@ -298,7 +310,7 @@ async function closingSvg(p, cv) {
   ${headSvg}
   <rect x="${X}" y="${L.rule2}" width="110" height="3" fill="${pal.gold}"/>
   ${L.sl.map((l, i) => T(X, L.sBase + i * L.ss * 1.14, l, { size: L.ss, weight: 500, fill: pal.ink })).join("\n  ")}
-  ${L.tagLines.map((l, i) => T(X, L.eBase + i * L.es * 1.5, l, { size: L.es, weight: 500, family: BODY, fill: pal.ink, spacing: 5 })).join("\n  ")}
+  ${L.tagLines.map((l, i) => T(X, L.eBase + i * L.es * 1.5, l, { size: L.es, weight: 500, family: B(), fill: pal.ink, spacing: 5 })).join("\n  ")}
   <rect x="${X}" y="${L.rule3}" width="90" height="3" fill="${pal.gold}"/>
   ${lock}
   ${nb.svg}
@@ -311,7 +323,7 @@ async function closingSvg(p, cv) {
 // trimmed PNG and embedded. Returns the ink-only image plus its size; its bottom edge is the baseline.
 async function liningFigure(text, size, color, weight = 800) {
   const parts = Array.isArray(text) ? text : [{ t: text }];
-  const spans = parts.map((q) => `<span font_family="${DISPLAY}" font_weight="${weight}" font_features="lnum" foreground="${color}" size="${Math.round(size * (q.s || 1) * 1024)}">${esc(q.t)}</span>`).join("");
+  const spans = parts.map((q) => `<span font_family="${D()}" font_weight="${weight}" font_features="lnum" foreground="${color}" size="${Math.round(size * (q.s || 1) * 1024)}">${esc(q.t)}</span>`).join("");
   const { data, info } = await sharp({ text: { text: spans, rgba: true, dpi: 72 } }).trim().png().toBuffer({ resolveWithObject: true });
   return { buf: data, w: info.width, h: info.height };
 }
@@ -344,10 +356,10 @@ async function statSvg(p, cv) {
   let scale = 1, L;
   for (; scale >= 0.62; scale -= 0.04) {
     const ls = Math.round(cv.sub * scale);
-    const leadLines = await wrap(p.lead || "", colW, { family: DISPLAY, weight: 500, size: ls });
-    const vs = await fitSize(text, colW, Math.round((portrait ? 270 : 250) * scale), 90, { family: DISPLAY, weight: 800 });
+    const leadLines = await wrap(p.lead || "", colW, { family: D(), weight: 500, size: ls });
+    const vs = await fitSize(text, colW, Math.round((portrait ? 270 : 250) * scale), 90, { family: D(), weight: 800 });
     const trailMax = iconR ? colW - iconR * 2 - 50 : colW;
-    const trailLines = await wrap(p.trail || "", trailMax, { family: DISPLAY, weight: 500, size: ls });
+    const trailLines = await wrap(p.trail || "", trailMax, { family: D(), weight: 500, size: ls });
     let y = cv.top + 4;
     const rule1 = y; y += 44;
     const leadBase = y + ls * 0.8; y += leadLines.length * ls * 1.14 + 10;
@@ -375,7 +387,7 @@ async function statSvg(p, cv) {
   ${L.trailLines.map((l, i) => T(X, L.trailBase + i * L.ls * 1.14, l, { size: L.ls, weight: 500, fill: pal.ink })).join("\n  ")}
   ${iconR ? calendarIcon(iconCx, iconCy, iconR, pal) : ""}
   <rect x="${X}" y="${L.rule2}" width="145" height="3" fill="${pal.gold}"/>
-  ${T(X, footY, label.toUpperCase(), { size: portrait ? 24 : 20, weight: 500, family: BODY, fill: "#FFFFFF", spacing: 5, opacity: 0.95 })}
+  ${T(X, footY, label.toUpperCase(), { size: portrait ? 24 : 20, weight: 500, family: B(), fill: "#FFFFFF", spacing: 5, opacity: 0.95 })}
 </svg>`;
   return { svg, warnings: [], textBottom: L.bottom, limit: cv.bottomLimit + (portrait ? 250 : 120), fits: L.bottom <= cv.bottomLimit + (portrait ? 250 : 120) };
 }
@@ -399,7 +411,7 @@ function houseIcon(cx, cy, s, color, pal, badge) {
     <path d="M ${cx - s * 0.7} ${cy - s * 0.12} V ${cy + s * 0.85} H ${cx + s * 0.7} V ${cy - s * 0.12}"/></g>`;
   if (badge === "sold") {
     out += `<rect x="${cx - s * 0.62}" y="${cy + s * 0.5}" width="${s * 1.24}" height="${s * 0.5}" rx="${s * 0.08}" fill="${pal.gold}"/>
-    <text x="${cx}" y="${cy + s * 0.5 + s * 0.35}" text-anchor="middle" font-family="${BODY}" font-weight="700" font-size="${s * 0.3}" letter-spacing="${s * 0.03}" fill="#FFFFFF">SOLD</text>`;
+    <text x="${cx}" y="${cy + s * 0.5 + s * 0.35}" text-anchor="middle" font-family="${B()}" font-weight="700" font-size="${s * 0.3}" letter-spacing="${s * 0.03}" fill="#FFFFFF">SOLD</text>`;
   } else if (badge === "reduced") {
     const bx = cx + s * 0.78, by = cy + s * 0.7, r = s * 0.42;
     out += `<circle cx="${bx}" cy="${by}" r="${r}" fill="${pal.gold}"/>
@@ -428,18 +440,18 @@ async function compareSvg(p, cv) {
   const cardTop = portrait ? 840 : 330, cardH = portrait ? 740 : 520;
   const pad = portrait ? 34 : 40, innerW = cardW - 2 * pad;
   const titleMax = portrait ? cv.maxW : 1000;
-  const ts = await fitSize(p.market || "", titleMax, portrait ? 130 : 96, 60, { family: DISPLAY, weight: 800 });
-  const ks = await fitSize(p.kind || "Market Update", titleMax, Math.round(ts * 0.68), 40, { family: DISPLAY, weight: 600 });
+  const ts = await fitSize(p.market || "", titleMax, portrait ? 130 : 96, 60, { family: D(), weight: 800 });
+  const ks = await fitSize(p.kind || "Market Update", titleMax, Math.round(ts * 0.68), 40, { family: D(), weight: 600 });
   const cards = [{ d: l, x: cardsX, light: true }, { d: r, x: cardsX + cardW + gap, light: false }];
   let svg = "";
   for (const c of cards) {
     const ink = c.light ? pal.ink : "#FFFFFF", fill = c.light ? "#FBF8F1" : pal.ink;
     const leadS = portrait ? 42 : 40, capS = portrait ? 22 : 20;
-    const leadLines = await wrap(c.d.lead || "", innerW, { family: DISPLAY, weight: 600, size: leadS });
-    const capLines = await wrap(String(c.d.caption || "").toUpperCase(), innerW, { family: BODY, weight: 600, size: capS, spacing: 4 });
+    const leadLines = await wrap(c.d.lead || "", innerW, { family: D(), weight: 600, size: leadS });
+    const capLines = await wrap(String(c.d.caption || "").toUpperCase(), innerW, { family: B(), weight: 600, size: capS, spacing: 4 });
     // Never drop script words silently: too-long text is an error so the planner can shorten and retry.
     if (leadLines.length > 3 || capLines.length > 4) throw new Error(`renderCompareCard: text too long for the card (lead ${leadLines.length} lines, caption ${capLines.length} lines; max 3 and 4)`);
-    const vs = await fitSize(c.light ? leftParts[0].t : `${hi} of ${total}`, innerW, portrait ? 150 : 128, 70, { family: DISPLAY, weight: 800 });
+    const vs = await fitSize(c.light ? leftParts[0].t : `${hi} of ${total}`, innerW, portrait ? 150 : 128, 70, { family: D(), weight: 800 });
     const fig = await liningFigure(c.light ? leftParts : rightParts, vs, pal.gold);
     const figW = Math.min(fig.w, innerW);
     const cx = c.x + cardW / 2;
@@ -473,7 +485,7 @@ async function compareSvg(p, cv) {
       }
       y += rows * step + (portrait ? 14 : 10);
     }
-    capLines.forEach((t, i) => { svg += T(cx, y + capS + i * capS * 1.5, t, { size: capS, weight: 600, family: BODY, fill: ink, anchor: "middle", spacing: 4, opacity: 0.95 }); });
+    capLines.forEach((t, i) => { svg += T(cx, y + capS + i * capS * 1.5, t, { size: capS, weight: 600, family: B(), fill: ink, anchor: "middle", spacing: 4, opacity: 0.95 }); });
     c.bottom = y + capS + (capLines.length - 1) * capS * 1.5;
     c.fits = c.bottom <= cardTop + cardH - 18;
   }
@@ -489,7 +501,7 @@ async function compareSvg(p, cv) {
   ${T(X - 4, cv.top + 4 + 40 + ts * 0.8, p.market || "", { size: ts, weight: 800, fill: pal.ink })}
   ${T(X - 2, cv.top + 4 + 40 + ts * 0.8 + 10 + ks * 0.82, p.kind || "Market Update", { size: ks, weight: 600, fill: pal.gold })}
   ${svg}
-  ${T(cv.w / 2, footY, label.toUpperCase(), { size: portrait ? 24 : 20, weight: 500, family: BODY, fill: "#FFFFFF", spacing: 5, anchor: "middle", opacity: 0.95 })}
+  ${T(cv.w / 2, footY, label.toUpperCase(), { size: portrait ? 24 : 20, weight: 500, family: B(), fill: "#FFFFFF", spacing: 5, anchor: "middle", opacity: 0.95 })}
 </svg>`;
   return { svg: body, warnings: [], fits: cards.every((c) => c.fits), textBottom: Math.max(...cards.map((c) => c.bottom)), limit: cardTop + cardH - 18 };
 }
@@ -516,7 +528,7 @@ function pointIcon(kind, cx, cy, r, pal) {
     const s = r * 0.5;
     glyph = `<path ${g} d="M ${cx - s * 0.2} ${cy - s * 1.0} H ${cx + s * 0.95} V ${cy + s * 0.15} L ${cx - s * 0.1} ${cy + s * 1.0} L ${cx - s * 1.05} ${cy + s * 0.05} Z"/>
     <circle cx="${cx + s * 0.5}" cy="${cy - s * 0.5}" r="${s * 0.12}" fill="${pal.gold}"/>
-    <text x="${cx - s * 0.1}" y="${cy + s * 0.32}" text-anchor="middle" font-family="${BODY}" font-weight="700" font-size="${s * 0.9}" fill="${pal.gold}">$</text>`;
+    <text x="${cx - s * 0.1}" y="${cy + s * 0.32}" text-anchor="middle" font-family="${B()}" font-weight="700" font-size="${s * 0.9}" fill="${pal.gold}">$</text>`;
   } else if (kind === "timing") {
     const s = r * 0.52;
     glyph = `<circle cx="${cx}" cy="${cy}" r="${s}" ${g}/><path ${g} d="M ${cx} ${cy - s * 0.55} V ${cy} L ${cx + s * 0.4} ${cy + s * 0.25}"/>`;
@@ -540,10 +552,10 @@ async function expertSvg(p, cv) {
   let L;
   for (let scale = 1; scale >= 0.6; scale -= 0.04) {
     const hs = Math.round((portrait ? 112 : 78) * scale), ss = Math.round((portrait ? 60 : 44) * scale), us = Math.round((portrait ? 36 : 27) * scale);
-    const dl = await wrap(dark, colW, { family: DISPLAY, weight: 800, size: hs });
-    const al = await wrap(accent, colW, { family: DISPLAY, weight: 800, size: hs });
-    const stl = await wrap(p.statement || "", portrait ? 800 : 900, { family: DISPLAY, weight: 500, size: ss });
-    const sul = p.support ? await wrap(p.support, portrait ? 760 : 900, { family: BODY, weight: 500, size: us }) : [];
+    const dl = await wrap(dark, colW, { family: D(), weight: 800, size: hs });
+    const al = await wrap(accent, colW, { family: D(), weight: 800, size: hs });
+    const stl = await wrap(p.statement || "", portrait ? 800 : 900, { family: D(), weight: 500, size: ss });
+    const sul = p.support ? await wrap(p.support, portrait ? 760 : 900, { family: B(), weight: 500, size: us }) : [];
     let y = cv.top + 4;
     const rule1 = y; y += 40;
     const hBase = y + hs * 0.82; y = hBase + (dl.length + al.length - 1) * hs * 1.14 + 28;
@@ -557,7 +569,7 @@ async function expertSvg(p, cv) {
     const items = [];
     for (const q of pts) {
       const tw = portrait ? colW - ir * 2 - 70 : colWp - ir * 2 - 50;
-      const capL = await wrap(String(q.caption || "").toUpperCase(), tw, { family: BODY, weight: 600, size: capS, spacing: 3 });
+      const capL = await wrap(String(q.caption || "").toUpperCase(), tw, { family: B(), weight: 600, size: capS, spacing: 3 });
       if (capL.length > 3) throw new Error("renderExpertCard: a point caption is too long (max 3 lines)");
       items.push({ q, capL, tw });
     }
@@ -580,7 +592,7 @@ async function expertSvg(p, cv) {
     svg += `<rect x="${tx - 20}" y="${Math.round(cy - barH / 2)}" width="4" height="${Math.round(barH)}" fill="${pal.gold}"/>`;
     const top = cy - barH / 2;
     svg += T(tx, top + L.ttS * 0.84, q.title || "", { size: L.ttS, weight: 600, fill: pal.ink });
-    it.capL.forEach((t, k) => { svg += T(tx, top + L.ttS + 10 + L.capS + k * L.capS * 1.45, t, { size: L.capS, weight: 600, family: BODY, fill: pal.ink, spacing: 3, opacity: 0.9 }); });
+    it.capL.forEach((t, k) => { svg += T(tx, top + L.ttS + 10 + L.capS + k * L.capS * 1.45, t, { size: L.capS, weight: 600, family: B(), fill: pal.ink, spacing: 3, opacity: 0.9 }); });
   });
   const footY = portrait ? cv.h - 64 : cv.h - 46;
   const body = `<svg xmlns="http://www.w3.org/2000/svg" width="${cv.w}" height="${cv.h}">
@@ -595,9 +607,9 @@ async function expertSvg(p, cv) {
   ${[...L.dl.map((l) => ({ l, c: pal.ink })), ...L.al.map((l) => ({ l, c: pal.gold }))].map((r, i) => T(X - 4, L.hBase + i * L.hs * 1.14, r.l, { size: L.hs, weight: 800, fill: r.c })).join("\n  ")}
   <rect x="${X}" y="${L.rule2}" width="110" height="3" fill="${pal.ink}"/>
   ${L.stl.map((l, i) => T(X, L.stBase + i * L.ss * 1.14, l, { size: L.ss, weight: 500, fill: pal.ink })).join("\n  ")}
-  ${L.sul.map((l, i) => T(X, L.suBase + i * L.us * 1.45, l, { size: L.us, weight: 500, family: BODY, fill: pal.ink, opacity: 0.9 })).join("\n  ")}
+  ${L.sul.map((l, i) => T(X, L.suBase + i * L.us * 1.45, l, { size: L.us, weight: 500, family: B(), fill: pal.ink, opacity: 0.9 })).join("\n  ")}
   ${svg}
-  ${T(X, footY, label.toUpperCase(), { size: portrait ? 24 : 20, weight: 500, family: BODY, fill: "#FFFFFF", spacing: 5, opacity: 0.95 })}
+  ${T(X, footY, label.toUpperCase(), { size: portrait ? 24 : 20, weight: 500, family: B(), fill: "#FFFFFF", spacing: 5, opacity: 0.95 })}
 </svg>`;
   return { svg: body, warnings: [], fits: L.bottom <= limit, textBottom: L.bottom, limit };
 }
@@ -611,17 +623,25 @@ async function renderExpertCard(params, outPng, canvas = "portrait") {
 // Public API ------------------------------------------------------------------
 // params (opening): { market, kind?, headline, eyebrow?, period:{start,end}, noticeText?, brand?, agent:{name,brokerage}, headshotBuf? }
 // params (closing): { headline:[darkPart, accentPart], support, tagline?, variant?, period, ... same agent/brand }
+// params.layout: "headline_focus" (default) | "editorial_portrait" | "news_brief"; params.side ("left"|"right") places the portrait panel.
+const { LAYOUTS, GEOM } = require("./agentMarketingLayouts")({ sharp, CANVAS, palette, measure, wrap, fitSize, T, dataUri, usableImage, circleHeadshot, noticeBar, needNotice, periodLabel, D, B, esc });
+const LAYOUT_NAMES = ["headline_focus", ...Object.keys(LAYOUTS)];
+function pickLayout(kind, params, cv, base) {
+  const name = params.layout || "headline_focus";
+  if (!LAYOUT_NAMES.includes(name)) throw new Error(`Unknown ${kind} layout "${name}" (known: ${LAYOUT_NAMES.join(", ")})`);
+  return name === "headline_focus" ? base(params, cv) : LAYOUTS[name](kind, params, cv);
+}
 async function renderOpeningCard(params, outPng, canvas = "portrait") {
   const cv = CANVAS[canvas] || CANVAS.portrait;
-  const r = await openingSvg(params, cv);
+  const r = await pickLayout("opening", params, cv, openingSvg);
   await sharp(Buffer.from(r.svg)).png().toFile(outPng);
   return { png: outPng, warnings: r.warnings, fits: r.fits, textBottom: r.textBottom, limit: r.limit };
 }
 async function renderClosingCard(params, outPng, canvas = "portrait") {
   const cv = CANVAS[canvas] || CANVAS.portrait;
-  const r = await closingSvg(params, cv);
+  const r = await pickLayout("closing", params, cv, closingSvg);
   await sharp(Buffer.from(r.svg)).png().toFile(outPng);
   return { png: outPng, warnings: r.warnings, fits: r.fits, textBottom: r.textBottom, limit: r.limit };
 }
 
-module.exports = { renderOpeningCard, renderClosingCard, renderStatCard, renderCompareCard, renderExpertCard, metroListNotice, periodLabel, CAPTION_BAND, PORTRAIT_ZONE, CANVAS };
+module.exports = { renderOpeningCard: withBrandFont(renderOpeningCard), renderClosingCard: withBrandFont(renderClosingCard), renderStatCard: withBrandFont(renderStatCard), renderCompareCard: withBrandFont(renderCompareCard), renderExpertCard: withBrandFont(renderExpertCard), metroListNotice, periodLabel, CAPTION_BAND, PORTRAIT_ZONE, CANVAS, BRAND_FONTS, LAYOUT_NAMES, GEOM };
