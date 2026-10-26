@@ -3,7 +3,7 @@
 const fs = require("fs");
 const path = require("path");
 const sharp = require("sharp");
-const { renderOpeningCard, renderClosingCard, renderStatCard, renderCompareCard, CANVAS } = require("../src/lib/agentMarketingCards");
+const { renderOpeningCard, renderClosingCard, renderStatCard, renderCompareCard, renderExpertCard, CANVAS } = require("../src/lib/agentMarketingCards");
 
 async function plate(cv) {
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${cv.w}" height="${cv.h}"><defs>
@@ -33,7 +33,11 @@ async function plate(cv) {
     const cp = await renderCompareCard({ period: common.period, market: "Natomas", kind: "Market Update",
       left: { lead: "Homes That Closed Sold At", percent: 99.4, caption: "of list price on average", icon: "sold" },
       right: { lead: "But Here in the Active Market,", highlighted: 6, total: 14, caption: "listings have already taken a price reduction.", icon: "reduced" } }, path.join(out, `compare_${canvas}.png`), canvas);
-    for (const [name, r] of [["opening", o], ["closing", c], ["closing_portraitvariant", c2], ["stat", st], ["compare", cp]]) {
+    const ex = await renderExpertCard({ period: common.period, headline: ["Condition +", "Pricing Precision Matter"],
+      statement: "That gap between homes that sold and homes that didn't tells a real story.",
+      support: "New construction sets a baseline\u2014your home has to answer for itself.",
+      points: [{ title: "Condition", caption: "Well-maintained homes stand out.", icon: "condition" }, { title: "Pricing", caption: "Accurate pricing drives results.", icon: "pricing" }] }, path.join(out, `expert_${canvas}.png`), canvas);
+    for (const [name, r] of [["opening", o], ["closing", c], ["closing_portraitvariant", c2], ["stat", st], ["compare", cp], ["expert", ex]]) {
       const f = path.join(out, `${name}_${canvas}.png`);
       await sharp(base).composite([{ input: f }]).png().toFile(path.join(out, `preview_${name}_${canvas}.png`));
       console.log(canvas, name, "fits:", r.fits, "textBottom", Math.round(r.textBottom), "limit", r.limit, r.warnings.join(";"));

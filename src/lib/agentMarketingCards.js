@@ -500,6 +500,114 @@ async function renderCompareCard(params, outPng, canvas = "portrait") {
   return { png: outPng, warnings: r.warnings, fits: r.fits, textBottom: r.textBottom, limit: r.limit };
 }
 
+// Expert-takeaway card --------------------------------------------------------
+// Editorial statement scene: two-tone headline, a statement, a supporting line, and 1-3 icon points
+// ("Condition" / "Pricing" ...). All text is script or planner text and goes through the gate; no figures here.
+// params: { headline:[dark, accent], statement, support?, points:[{ title, caption, icon }], period, brand }
+// icon: "condition" | "pricing" | "timing" | "check"
+function pointIcon(kind, cx, cy, r, pal) {
+  const sw = Math.max(3.5, r * 0.07), g = `fill="none" stroke="${pal.gold}" stroke-width="${sw}" stroke-linecap="round" stroke-linejoin="round"`;
+  let glyph = "";
+  if (kind === "condition") {
+    const s = r * 0.5;
+    glyph = `<path ${g} d="M ${cx - s * 1.05} ${cy + s * 0.1} L ${cx - s * 0.1} ${cy - s * 0.85} L ${cx + s * 0.85} ${cy + s * 0.1} M ${cx - s * 0.75} ${cy - s * 0.05} V ${cy + s * 0.95} H ${cx + s * 0.55} V ${cy - s * 0.05}"/>
+    <path ${g} d="M ${cx + s * 0.8} ${cy - s * 1.05} v ${s * 0.5} M ${cx + s * 0.55} ${cy - s * 0.8} h ${s * 0.5}"/>`;
+  } else if (kind === "pricing") {
+    const s = r * 0.5;
+    glyph = `<path ${g} d="M ${cx - s * 0.2} ${cy - s * 1.0} H ${cx + s * 0.95} V ${cy + s * 0.15} L ${cx - s * 0.1} ${cy + s * 1.0} L ${cx - s * 1.05} ${cy + s * 0.05} Z"/>
+    <circle cx="${cx + s * 0.5}" cy="${cy - s * 0.5}" r="${s * 0.12}" fill="${pal.gold}"/>
+    <text x="${cx - s * 0.1}" y="${cy + s * 0.32}" text-anchor="middle" font-family="${BODY}" font-weight="700" font-size="${s * 0.9}" fill="${pal.gold}">$</text>`;
+  } else if (kind === "timing") {
+    const s = r * 0.52;
+    glyph = `<circle cx="${cx}" cy="${cy}" r="${s}" ${g}/><path ${g} d="M ${cx} ${cy - s * 0.55} V ${cy} L ${cx + s * 0.4} ${cy + s * 0.25}"/>`;
+  } else {
+    const s = r * 0.5;
+    glyph = `<path ${g} d="M ${cx - s * 0.8} ${cy} L ${cx - s * 0.2} ${cy + s * 0.65} L ${cx + s * 0.85} ${cy - s * 0.6}"/>`;
+  }
+  return `<circle cx="${cx}" cy="${cy}" r="${r}" fill="#F0E9D8"/>${glyph}`;
+}
+
+async function expertSvg(p, cv) {
+  const pal = palette(p.brand);
+  const portrait = cv === CANVAS.portrait;
+  const X = cv.marginX;
+  const pts = p.points || [];
+  if (pts.length < 1 || pts.length > 3) throw new Error("renderExpertCard: points must have 1 to 3 items");
+  const dark = (p.headline && p.headline[0]) || "", accent = (p.headline && p.headline[1]) || "";
+  const label = (p.sourceLabel || "MetroList") + (periodLabel(p.period) ? `  ·  ${periodLabel(p.period)}` : "");
+  const colW = portrait ? cv.maxW : 1000;
+  const limit = portrait ? 1540 : 840;
+  let L;
+  for (let scale = 1; scale >= 0.6; scale -= 0.04) {
+    const hs = Math.round((portrait ? 112 : 78) * scale), ss = Math.round((portrait ? 60 : 44) * scale), us = Math.round((portrait ? 36 : 27) * scale);
+    const dl = await wrap(dark, colW, { family: DISPLAY, weight: 800, size: hs });
+    const al = await wrap(accent, colW, { family: DISPLAY, weight: 800, size: hs });
+    const stl = await wrap(p.statement || "", portrait ? 800 : 900, { family: DISPLAY, weight: 500, size: ss });
+    const sul = p.support ? await wrap(p.support, portrait ? 760 : 900, { family: BODY, weight: 500, size: us }) : [];
+    let y = cv.top + 4;
+    const rule1 = y; y += 40;
+    const hBase = y + hs * 0.82; y = hBase + (dl.length + al.length - 1) * hs * 1.14 + 28;
+    const rule2 = y; y += 44;
+    const stBase = y + ss * 0.8; y += stl.length * ss * 1.14 + 16;
+    const suBase = y + us * 0.85; y += sul.length * us * 1.45 + (sul.length ? 20 : 0);
+    // points: stacked rows (9:16) or side-by-side columns (16:9)
+    const ir = portrait ? 56 : 46, rowH = portrait ? 150 : 0;
+    const capS = portrait ? 22 : 19, ttS = portrait ? 44 : 36;
+    const colWp = portrait ? colW : Math.floor((colW + 150 - 40 * (pts.length - 1)) / pts.length);
+    const items = [];
+    for (const q of pts) {
+      const tw = portrait ? colW - ir * 2 - 70 : colWp - ir * 2 - 50;
+      const capL = await wrap(String(q.caption || "").toUpperCase(), tw, { family: BODY, weight: 600, size: capS, spacing: 3 });
+      if (capL.length > 3) throw new Error("renderExpertCard: a point caption is too long (max 3 lines)");
+      items.push({ q, capL, tw });
+    }
+    y += 24;
+    const ptsTop = y;
+    const ptsH = portrait ? pts.length * rowH : ir * 2 + 10;
+    y += ptsH;
+    L = { hs, dl, al, stl, ss, sul, us, rule1, hBase, rule2, stBase, suBase, ir, rowH, capS, ttS, items, ptsTop, colWp, bottom: y };
+    if (y <= limit) break;
+  }
+  let svg = "";
+  L.items.forEach((it, i) => {
+    const q = it.q, ir = L.ir;
+    const x0 = portrait ? X : X + i * (L.colWp + 40);
+    const y0 = portrait ? L.ptsTop + i * L.rowH : L.ptsTop;
+    const cy = y0 + ir + 4;
+    svg += pointIcon(q.icon || "check", x0 + ir, cy, ir, pal);
+    const tx = x0 + ir * 2 + 38;
+    const barH = L.ttS + 14 + it.capL.length * L.capS * 1.45;
+    svg += `<rect x="${tx - 20}" y="${Math.round(cy - barH / 2)}" width="4" height="${Math.round(barH)}" fill="${pal.gold}"/>`;
+    const top = cy - barH / 2;
+    svg += T(tx, top + L.ttS * 0.84, q.title || "", { size: L.ttS, weight: 600, fill: pal.ink });
+    it.capL.forEach((t, k) => { svg += T(tx, top + L.ttS + 10 + L.capS + k * L.capS * 1.45, t, { size: L.capS, weight: 600, family: BODY, fill: pal.ink, spacing: 3, opacity: 0.9 }); });
+  });
+  const footY = portrait ? cv.h - 64 : cv.h - 46;
+  const body = `<svg xmlns="http://www.w3.org/2000/svg" width="${cv.w}" height="${cv.h}">
+  <defs>
+    <linearGradient id="lt" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff" stop-opacity="0.5"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></linearGradient>
+    <linearGradient id="ll" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#fff" stop-opacity="0.5"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></linearGradient>
+    <linearGradient id="lb" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#000" stop-opacity="0"/><stop offset="1" stop-color="#000" stop-opacity="0.45"/></linearGradient>
+  </defs>
+  ${portrait ? `<rect x="0" y="0" width="${cv.w}" height="${Math.round(cv.h * 0.7)}" fill="url(#lt)"/>` : `<rect x="0" y="0" width="${Math.round(cv.w * 0.7)}" height="${cv.h}" fill="url(#ll)"/>`}
+  <rect x="0" y="${cv.h - 260}" width="${cv.w}" height="260" fill="url(#lb)"/>
+  <rect x="${X}" y="${L.rule1}" width="145" height="4" fill="${pal.gold}"/>
+  ${[...L.dl.map((l) => ({ l, c: pal.ink })), ...L.al.map((l) => ({ l, c: pal.gold }))].map((r, i) => T(X - 4, L.hBase + i * L.hs * 1.14, r.l, { size: L.hs, weight: 800, fill: r.c })).join("\n  ")}
+  <rect x="${X}" y="${L.rule2}" width="110" height="3" fill="${pal.ink}"/>
+  ${L.stl.map((l, i) => T(X, L.stBase + i * L.ss * 1.14, l, { size: L.ss, weight: 500, fill: pal.ink })).join("\n  ")}
+  ${L.sul.map((l, i) => T(X, L.suBase + i * L.us * 1.45, l, { size: L.us, weight: 500, family: BODY, fill: pal.ink, opacity: 0.9 })).join("\n  ")}
+  ${svg}
+  ${T(X, footY, label.toUpperCase(), { size: portrait ? 24 : 20, weight: 500, family: BODY, fill: "#FFFFFF", spacing: 5, opacity: 0.95 })}
+</svg>`;
+  return { svg: body, warnings: [], fits: L.bottom <= limit, textBottom: L.bottom, limit };
+}
+async function renderExpertCard(params, outPng, canvas = "portrait") {
+  const cv = CANVAS[canvas] || CANVAS.portrait;
+  const r = await expertSvg(params, cv);
+  await sharp(Buffer.from(r.svg)).png().toFile(outPng);
+  return { png: outPng, warnings: r.warnings, fits: r.fits, textBottom: r.textBottom, limit: r.limit };
+}
+
 // Public API ------------------------------------------------------------------
 // params (opening): { market, kind?, headline, eyebrow?, period:{start,end}, noticeText?, brand?, agent:{name,brokerage}, headshotBuf? }
 // params (closing): { headline:[darkPart, accentPart], support, tagline?, variant?, period, ... same agent/brand }
@@ -516,4 +624,4 @@ async function renderClosingCard(params, outPng, canvas = "portrait") {
   return { png: outPng, warnings: r.warnings, fits: r.fits, textBottom: r.textBottom, limit: r.limit };
 }
 
-module.exports = { renderOpeningCard, renderClosingCard, renderStatCard, renderCompareCard, metroListNotice, periodLabel, CAPTION_BAND, PORTRAIT_ZONE, CANVAS };
+module.exports = { renderOpeningCard, renderClosingCard, renderStatCard, renderCompareCard, renderExpertCard, metroListNotice, periodLabel, CAPTION_BAND, PORTRAIT_ZONE, CANVAS };
