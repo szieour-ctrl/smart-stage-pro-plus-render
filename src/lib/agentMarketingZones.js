@@ -8,11 +8,18 @@
 "use strict";
 
 const sharp = require("sharp");
-const { CANVAS } = require("./agentMarketingCards");
+const { CANVAS, GEOM } = require("./agentMarketingCards");
 
 // Compositions that exist today. Opening and closing carry the agent identity and the full MetroList notice bar;
 // the stat, comparison and expert cards carry content plus a one-line source label in a thin footer strip.
 const KINDS = ["opening", "closing", "stat", "compare", "expert"];
+
+// Composition ids (the names the treatment library uses) -> the card kind and layout that draws them.
+const COMPOSITION_LAYOUT = {
+  opening_headline_focus: ["opening", "headline_focus"], opening_editorial_portrait: ["opening", "editorial_portrait"], opening_news_brief: ["opening", "news_brief"],
+  closing_headline_focus: ["closing", "headline_focus"], closing_editorial_portrait: ["closing", "editorial_portrait"], closing_news_brief: ["closing", "news_brief"],
+  stat_big_number: ["stat", "headline_focus"], compare_two_card: ["compare", "headline_focus"], expert_takeaway: ["expert", "headline_focus"],
+};
 
 // Platform-safe margins (px): where the host app's own buttons or crop can cover a frame.
 const SAFE = {
@@ -26,11 +33,29 @@ const bottom = (r) => r.y + r.h;
 const overlap = (a, b) => a.x < right(b) && b.x < right(a) && a.y < bottom(b) && b.y < bottom(a);
 
 /** The named regions for a composition on a canvas ("portrait" 1080x1920 or "landscape" 1920x1080). */
-function zonesFor(kind, canvas = "portrait") {
-  if (!KINDS.includes(kind)) throw new Error(`Unknown composition "${kind}" (known: ${KINDS.join(", ")})`);
+function zonesFor(kindOrComposition, canvas = "portrait", { side = "left", headshot = true } = {}) {
+  let kind = kindOrComposition, layout = "headline_focus";
+  if (COMPOSITION_LAYOUT[kindOrComposition]) [kind, layout] = COMPOSITION_LAYOUT[kindOrComposition];
+  if (!KINDS.includes(kind)) throw new Error(`Unknown composition "${kindOrComposition}" (known: ${KINDS.join(", ")}, ${Object.keys(COMPOSITION_LAYOUT).join(", ")})`);
   const cv = CANVAS[canvas];
   if (!cv) throw new Error(`Unknown canvas "${canvas}"`);
   const caption = rect(0, cv.captionBand.y, cv.w, cv.captionBand.h);
+  if ((kind === "opening" || kind === "closing") && layout === "editorial_portrait") {
+    const g = GEOM[canvas].ep, disclosure = rect(0, cv.h - cv.notice.h, cv.w, cv.notice.h);
+    if (canvas === "portrait") {
+      return { headline_zone: rect(cv.marginX, cv.top, cv.maxW, g.stackLimit - cv.top), agent_identity_zone: rect(cv.marginX, g.panelTop, cv.maxW, g.panelH), caption_zone: caption, disclosure_zone: disclosure };
+    }
+    const panelX = side === "left" ? cv.marginX : cv.w - cv.marginX - g.panelW;
+    const colX = headshot && side === "left" ? cv.marginX + g.panelW + g.colGap : cv.marginX;
+    const colW = headshot ? cv.w - 2 * cv.marginX - g.panelW - g.colGap : cv.maxW;
+    const z = { headline_zone: rect(colX, cv.top, colW, g.stackLimit - cv.top), agent_name_zone: rect(colX, cv.lockupCy - 70, Math.min(colW, 760), 140), caption_zone: caption, disclosure_zone: disclosure };
+    if (headshot) z.agent_identity_zone = rect(panelX, g.panelTop, g.panelW, g.panelH);
+    return z;
+  }
+  if ((kind === "opening" || kind === "closing") && layout === "news_brief") {
+    const g = GEOM[canvas].nb;
+    return { headline_zone: rect(cv.marginX, g.chipTop, cv.maxW, g.bigLimit - g.chipTop), editorial_content_zone: rect(0, g.bandTop, cv.w, g.bandH), caption_zone: caption, disclosure_zone: rect(0, cv.h - cv.notice.h, cv.w, cv.notice.h) };
+  }
   if (kind === "opening" || kind === "closing") {
     const noticeTop = cv.h - cv.notice.h;
     const hs = cv.hs;
@@ -62,8 +87,8 @@ function checkZones(zones, canvas = "portrait") {
   }
   // Text zones (not the full-width bars) must respect the safe margins.
   for (const n of names) {
-    if (n === "caption_zone" || n === "disclosure_zone") continue;
     const z = zones[n];
+    if (n === "caption_zone" || n === "disclosure_zone" || (z.x === 0 && z.w === cv.w)) continue; // full-width bars
     if (z.x < safe.left || right(z) > cv.w - safe.right || z.y < safe.top) problems.push(`${n} is inside the platform-safe margin`);
   }
   const cap = zones.caption_zone;
@@ -91,12 +116,12 @@ async function inkIn(pngPath, r) {
 }
 
 /** Full check of a rendered card: its zones are clean and it left the caption zone empty. Returns { ok, problems[] }. */
-async function checkCard(kind, canvas, pngPath) {
-  const zones = zonesFor(kind, canvas);
+async function checkCard(kind, canvas, pngPath, opts) {
+  const zones = zonesFor(kind, canvas, opts);
   const problems = checkZones(zones, canvas);
   const ink = await inkIn(pngPath, zones.caption_zone);
   if (ink > 0) problems.push(`the card drew ${ink} pixels inside caption_zone`);
   return { ok: problems.length === 0, problems, zones };
 }
 
-module.exports = { KINDS, SAFE, zonesFor, checkZones, inkIn, checkCard, overlap };
+module.exports = { KINDS, COMPOSITION_LAYOUT, SAFE, zonesFor, checkZones, inkIn, checkCard, overlap };

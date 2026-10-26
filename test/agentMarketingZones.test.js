@@ -50,3 +50,30 @@ test("ink inside a zone is detected", async () => {
   const v = await Z.checkCard("stat", "portrait", f);
   assert.ok(!v.ok && v.problems.some((p) => /inside caption_zone/.test(p)));
 });
+
+test("every composition id the treatment library can name has clean zones", () => {
+  for (const id of Object.keys(Z.COMPOSITION_LAYOUT)) for (const canvas of ["portrait", "landscape"]) for (const side of ["left", "right"]) {
+    assert.deepStrictEqual(Z.checkZones(Z.zonesFor(id, canvas, { side }), canvas), [], `${id} ${canvas} ${side}`);
+  }
+});
+
+test("the new opening and closing layouts keep captions clear and fit their zones", async () => {
+  const fsx = require("fs");
+  const base = { period, agent, market: "Natomas", headline: "New Construction Is Part of Your Competition", eyebrow: "Seller Insight" };
+  const close = { period, agent, headline: ["Want to talk through where", "your home fits in this picture?"], support: "I'm happy to walk you through it.", tagline: "Pricing · Condition · Competition" };
+  for (const canvas of ["portrait", "landscape"]) for (const layout of ["editorial_portrait", "news_brief"]) for (const side of ["left", "right"]) {
+    const o = await R.renderOpeningCard({ ...base, layout, side }, path.join(dir, `no_${layout}_${side}_${canvas}.png`), canvas);
+    const c = await R.renderClosingCard({ ...close, layout, side }, path.join(dir, `nc_${layout}_${side}_${canvas}.png`), canvas);
+    assert.ok(o.fits && c.fits, `${layout} ${canvas} should fit`);
+    for (const [kind, r] of [["opening", o], ["closing", c]]) {
+      const v = await Z.checkCard(`${kind}_${layout}`, canvas, r.png, { side, headshot: false });
+      assert.ok(v.ok, `${kind} ${layout} ${side} ${canvas}: ${v.problems.join("; ")}`);
+    }
+  }
+  assert.ok(fsx.existsSync(path.join(dir, "no_news_brief_left_portrait.png")));
+});
+
+test("an unknown layout name is refused, and a missing period still stops a new layout", async () => {
+  await assert.rejects(() => R.renderOpeningCard({ period, agent, market: "x", headline: "y", layout: "nope" }, path.join(dir, "bad.png")), /Unknown opening layout/);
+  await assert.rejects(() => R.renderOpeningCard({ agent, market: "x", headline: "y", layout: "news_brief" }, path.join(dir, "bad2.png")), /MetroList notice required/);
+});

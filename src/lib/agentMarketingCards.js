@@ -623,17 +623,25 @@ async function renderExpertCard(params, outPng, canvas = "portrait") {
 // Public API ------------------------------------------------------------------
 // params (opening): { market, kind?, headline, eyebrow?, period:{start,end}, noticeText?, brand?, agent:{name,brokerage}, headshotBuf? }
 // params (closing): { headline:[darkPart, accentPart], support, tagline?, variant?, period, ... same agent/brand }
+// params.layout: "headline_focus" (default) | "editorial_portrait" | "news_brief"; params.side ("left"|"right") places the portrait panel.
+const { LAYOUTS, GEOM } = require("./agentMarketingLayouts")({ sharp, CANVAS, palette, measure, wrap, fitSize, T, dataUri, usableImage, circleHeadshot, noticeBar, needNotice, periodLabel, D, B, esc });
+const LAYOUT_NAMES = ["headline_focus", ...Object.keys(LAYOUTS)];
+function pickLayout(kind, params, cv, base) {
+  const name = params.layout || "headline_focus";
+  if (!LAYOUT_NAMES.includes(name)) throw new Error(`Unknown ${kind} layout "${name}" (known: ${LAYOUT_NAMES.join(", ")})`);
+  return name === "headline_focus" ? base(params, cv) : LAYOUTS[name](kind, params, cv);
+}
 async function renderOpeningCard(params, outPng, canvas = "portrait") {
   const cv = CANVAS[canvas] || CANVAS.portrait;
-  const r = await openingSvg(params, cv);
+  const r = await pickLayout("opening", params, cv, openingSvg);
   await sharp(Buffer.from(r.svg)).png().toFile(outPng);
   return { png: outPng, warnings: r.warnings, fits: r.fits, textBottom: r.textBottom, limit: r.limit };
 }
 async function renderClosingCard(params, outPng, canvas = "portrait") {
   const cv = CANVAS[canvas] || CANVAS.portrait;
-  const r = await closingSvg(params, cv);
+  const r = await pickLayout("closing", params, cv, closingSvg);
   await sharp(Buffer.from(r.svg)).png().toFile(outPng);
   return { png: outPng, warnings: r.warnings, fits: r.fits, textBottom: r.textBottom, limit: r.limit };
 }
 
-module.exports = { renderOpeningCard: withBrandFont(renderOpeningCard), renderClosingCard: withBrandFont(renderClosingCard), renderStatCard: withBrandFont(renderStatCard), renderCompareCard: withBrandFont(renderCompareCard), renderExpertCard: withBrandFont(renderExpertCard), metroListNotice, periodLabel, CAPTION_BAND, PORTRAIT_ZONE, CANVAS, BRAND_FONTS };
+module.exports = { renderOpeningCard: withBrandFont(renderOpeningCard), renderClosingCard: withBrandFont(renderClosingCard), renderStatCard: withBrandFont(renderStatCard), renderCompareCard: withBrandFont(renderCompareCard), renderExpertCard: withBrandFont(renderExpertCard), metroListNotice, periodLabel, CAPTION_BAND, PORTRAIT_ZONE, CANVAS, BRAND_FONTS, LAYOUT_NAMES, GEOM };
