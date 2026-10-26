@@ -310,8 +310,9 @@ async function closingSvg(p, cv) {
 // feature on from SVG, so big figures are drawn through pango markup (font_features="lnum") into a
 // trimmed PNG and embedded. Returns the ink-only image plus its size; its bottom edge is the baseline.
 async function liningFigure(text, size, color, weight = 800) {
-  const markup = `<span font_family="${DISPLAY}" font_weight="${weight}" font_features="lnum" foreground="${color}" size="${Math.round(size * 1024)}">${esc(text)}</span>`;
-  const { data, info } = await sharp({ text: { text: markup, rgba: true, dpi: 72 } }).trim().png().toBuffer({ resolveWithObject: true });
+  const parts = Array.isArray(text) ? text : [{ t: text }];
+  const spans = parts.map((q) => `<span font_family="${DISPLAY}" font_weight="${weight}" font_features="lnum" foreground="${color}" size="${Math.round(size * (q.s || 1) * 1024)}">${esc(q.t)}</span>`).join("");
+  const { data, info } = await sharp({ text: { text: spans, rgba: true, dpi: 72 } }).trim().png().toBuffer({ resolveWithObject: true });
   return { buf: data, w: info.width, h: info.height };
 }
 
@@ -386,6 +387,119 @@ async function renderStatCard(params, outPng, canvas = "portrait") {
   return { png: outPng, warnings: r.warnings, fits: r.fits, textBottom: r.textBottom, limit: r.limit };
 }
 
+// Comparison card -------------------------------------------------------------
+// Two cards side by side: LEFT = a percentage (bar drawn from the number), RIGHT = "N of M" (M dots drawn,
+// N highlighted). The pictures and the figures come from the same numbers, so they cannot disagree.
+// params: { market, kind?, left:{ lead, percent, caption, icon? "sold" }, right:{ lead, highlighted, total, caption, icon? "reduced" },
+//           period, brand }
+function houseIcon(cx, cy, s, color, pal, badge) {
+  const sw = Math.max(4, s * 0.075);
+  let out = `<g fill="none" stroke="${color}" stroke-width="${sw}" stroke-linejoin="round" stroke-linecap="round">
+    <path d="M ${cx - s * 0.95} ${cy + s * 0.05} L ${cx} ${cy - s * 0.85} L ${cx + s * 0.95} ${cy + s * 0.05}"/>
+    <path d="M ${cx - s * 0.7} ${cy - s * 0.12} V ${cy + s * 0.85} H ${cx + s * 0.7} V ${cy - s * 0.12}"/></g>`;
+  if (badge === "sold") {
+    out += `<rect x="${cx - s * 0.62}" y="${cy + s * 0.5}" width="${s * 1.24}" height="${s * 0.5}" rx="${s * 0.08}" fill="${pal.gold}"/>
+    <text x="${cx}" y="${cy + s * 0.5 + s * 0.35}" text-anchor="middle" font-family="${BODY}" font-weight="700" font-size="${s * 0.3}" letter-spacing="${s * 0.03}" fill="#FFFFFF">SOLD</text>`;
+  } else if (badge === "reduced") {
+    const bx = cx + s * 0.78, by = cy + s * 0.7, r = s * 0.42;
+    out += `<circle cx="${bx}" cy="${by}" r="${r}" fill="${pal.gold}"/>
+    <path d="M ${bx} ${by - r * 0.5} V ${by + r * 0.45} M ${bx - r * 0.42} ${by + r * 0.05} L ${bx} ${by + r * 0.5} L ${bx + r * 0.42} ${by + r * 0.05}" fill="none" stroke="#FFFFFF" stroke-width="${Math.max(3, r * 0.2)}" stroke-linecap="round" stroke-linejoin="round"/>`;
+  }
+  return out;
+}
+
+async function compareSvg(p, cv) {
+  const pal = palette(p.brand);
+  const portrait = cv === CANVAS.portrait;
+  const X = cv.marginX;
+  const l = p.left || {}, r = p.right || {};
+  const label = (p.sourceLabel || "MetroList") + (periodLabel(p.period) ? `  ·  ${periodLabel(p.period)}` : "");
+  // figures derived from the numbers
+  const pct = Number(l.percent);
+  if (!(pct >= 0 && pct <= 200)) throw new Error("renderCompareCard: left.percent must be a number");
+  const total = Number(r.total), hi = Number(r.highlighted);
+  if (!Number.isInteger(total) || !Number.isInteger(hi) || total < 1 || total > 42 || hi < 0 || hi > total) throw new Error("renderCompareCard: right.highlighted/total must be whole numbers with highlighted <= total <= 42");
+  const leftParts = [{ t: `${Number.isInteger(pct) ? pct : pct.toFixed(1)}%` }];
+  const rightParts = [{ t: String(hi) }, { t: " of ", s: 0.55 }, { t: String(total) }];
+
+  // geometry
+  const gap = portrait ? 50 : 60, cardsX = portrait ? 60 : X;
+  const cardW = Math.floor((cv.w - 2 * cardsX - gap) / 2);
+  const cardTop = portrait ? 840 : 330, cardH = portrait ? 740 : 520;
+  const pad = portrait ? 34 : 40, innerW = cardW - 2 * pad;
+  const titleMax = portrait ? cv.maxW : 1000;
+  const ts = await fitSize(p.market || "", titleMax, portrait ? 130 : 96, 60, { family: DISPLAY, weight: 800 });
+  const ks = await fitSize(p.kind || "Market Update", titleMax, Math.round(ts * 0.68), 40, { family: DISPLAY, weight: 600 });
+  const cards = [{ d: l, x: cardsX, light: true }, { d: r, x: cardsX + cardW + gap, light: false }];
+  let svg = "";
+  for (const c of cards) {
+    const ink = c.light ? pal.ink : "#FFFFFF", fill = c.light ? "#FBF8F1" : pal.ink;
+    const leadS = portrait ? 42 : 40, capS = portrait ? 22 : 20;
+    const leadLines = await wrap(c.d.lead || "", innerW, { family: DISPLAY, weight: 600, size: leadS });
+    const capLines = await wrap(String(c.d.caption || "").toUpperCase(), innerW, { family: BODY, weight: 600, size: capS, spacing: 4 });
+    // Never drop script words silently: too-long text is an error so the planner can shorten and retry.
+    if (leadLines.length > 3 || capLines.length > 4) throw new Error(`renderCompareCard: text too long for the card (lead ${leadLines.length} lines, caption ${capLines.length} lines; max 3 and 4)`);
+    const vs = await fitSize(c.light ? leftParts[0].t : `${hi} of ${total}`, innerW, portrait ? 150 : 128, 70, { family: DISPLAY, weight: 800 });
+    const fig = await liningFigure(c.light ? leftParts : rightParts, vs, pal.gold);
+    const figW = Math.min(fig.w, innerW);
+    const cx = c.x + cardW / 2;
+    let y = cardTop;
+    svg += `<rect x="${c.x}" y="${cardTop}" width="${cardW}" height="${cardH}" rx="26" fill="${fill}" fill-opacity="0.96" stroke="${pal.gold}" stroke-width="4"/>`;
+    const iconS = portrait ? 52 : 40;
+    svg += houseIcon(cx, cardTop + (portrait ? 112 : 84), iconS, ink, pal, c.d.icon || (c.light ? "sold" : "reduced"));
+    y = cardTop + (portrait ? 215 : 150);
+    svg += `<rect x="${cx - 60}" y="${y}" width="120" height="3" fill="${pal.gold}"/>`;
+    y += portrait ? 34 : 24;
+    leadLines.forEach((t, i) => { svg += T(cx, y + leadS * 0.85 + i * leadS * 1.15, t, { size: leadS, weight: 600, fill: ink, anchor: "middle" }); });
+    y += leadLines.length * leadS * 1.15 + (portrait ? 22 : 18);
+    svg += `<image href="${dataUri(fig.buf)}" x="${Math.round(cx - fig.w / 2)}" y="${Math.round(y)}" width="${fig.w}" height="${fig.h}"/>`;
+    y += fig.h + (portrait ? 34 : 26);
+    if (c.light) {
+      // percentage bar: the filled share is the number itself (capped at the track)
+      const bw = innerW - 20, bh = portrait ? 18 : 16, bx = cx - bw / 2;
+      svg += `<rect x="${bx}" y="${y}" width="${bw}" height="${bh}" rx="${bh / 2}" fill="${pal.ink}" fill-opacity="0.14"/>
+  <rect x="${bx}" y="${y}" width="${Math.max(bh, Math.round(bw * Math.min(pct, 100) / 100))}" height="${bh}" rx="${bh / 2}" fill="${pal.gold}"/>`;
+      y += bh + (portrait ? 30 : 24);
+    } else {
+      // dot grid: total dots, first `hi` highlighted; rows fill left to right
+      const cols = total <= 14 ? 7 : Math.min(10, Math.ceil(total / 3)), rows = Math.ceil(total / cols);
+      const dr = portrait ? 12 : 11, step = Math.min(portrait ? 40 : 38, Math.floor((innerW - 10) / cols));
+      const gw = (cols - 1) * step, gx = cx - gw / 2;
+      for (let i = 0; i < total; i++) {
+        const dx = gx + (i % cols) * step, dy = y + dr + Math.floor(i / cols) * step;
+        svg += i < hi
+          ? `<circle cx="${dx}" cy="${dy}" r="${dr}" fill="${pal.gold}"/>`
+          : `<circle cx="${dx}" cy="${dy}" r="${dr - 1.5}" fill="#FFFFFF" fill-opacity="0.12" stroke="#FFFFFF" stroke-opacity="0.55" stroke-width="2"/>`;
+      }
+      y += rows * step + (portrait ? 14 : 10);
+    }
+    capLines.forEach((t, i) => { svg += T(cx, y + capS + i * capS * 1.5, t, { size: capS, weight: 600, family: BODY, fill: ink, anchor: "middle", spacing: 4, opacity: 0.95 }); });
+    c.bottom = y + capS + (capLines.length - 1) * capS * 1.5;
+    c.fits = c.bottom <= cardTop + cardH - 18;
+  }
+  const footY = portrait ? cv.h - 64 : cv.h - 46;
+  const body = `<svg xmlns="http://www.w3.org/2000/svg" width="${cv.w}" height="${cv.h}">
+  <defs>
+    <linearGradient id="lt" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff" stop-opacity="0.5"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></linearGradient>
+    <linearGradient id="lb" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#000" stop-opacity="0"/><stop offset="1" stop-color="#000" stop-opacity="0.45"/></linearGradient>
+  </defs>
+  <rect x="0" y="0" width="${cv.w}" height="${Math.round(cv.h * 0.5)}" fill="url(#lt)"/>
+  <rect x="0" y="${cv.h - 260}" width="${cv.w}" height="260" fill="url(#lb)"/>
+  <rect x="${X}" y="${cv.top + 4}" width="145" height="4" fill="${pal.gold}"/>
+  ${T(X - 4, cv.top + 4 + 40 + ts * 0.8, p.market || "", { size: ts, weight: 800, fill: pal.ink })}
+  ${T(X - 2, cv.top + 4 + 40 + ts * 0.8 + 10 + ks * 0.82, p.kind || "Market Update", { size: ks, weight: 600, fill: pal.gold })}
+  ${svg}
+  ${T(cv.w / 2, footY, label.toUpperCase(), { size: portrait ? 24 : 20, weight: 500, family: BODY, fill: "#FFFFFF", spacing: 5, anchor: "middle", opacity: 0.95 })}
+</svg>`;
+  return { svg: body, warnings: [], fits: cards.every((c) => c.fits), textBottom: Math.max(...cards.map((c) => c.bottom)), limit: cardTop + cardH - 18 };
+}
+async function renderCompareCard(params, outPng, canvas = "portrait") {
+  const cv = CANVAS[canvas] || CANVAS.portrait;
+  const r = await compareSvg(params, cv);
+  await sharp(Buffer.from(r.svg)).png().toFile(outPng);
+  return { png: outPng, warnings: r.warnings, fits: r.fits, textBottom: r.textBottom, limit: r.limit };
+}
+
 // Public API ------------------------------------------------------------------
 // params (opening): { market, kind?, headline, eyebrow?, period:{start,end}, noticeText?, brand?, agent:{name,brokerage}, headshotBuf? }
 // params (closing): { headline:[darkPart, accentPart], support, tagline?, variant?, period, ... same agent/brand }
@@ -402,4 +516,4 @@ async function renderClosingCard(params, outPng, canvas = "portrait") {
   return { png: outPng, warnings: r.warnings, fits: r.fits, textBottom: r.textBottom, limit: r.limit };
 }
 
-module.exports = { renderOpeningCard, renderClosingCard, renderStatCard, metroListNotice, periodLabel, CAPTION_BAND, PORTRAIT_ZONE, CANVAS };
+module.exports = { renderOpeningCard, renderClosingCard, renderStatCard, renderCompareCard, metroListNotice, periodLabel, CAPTION_BAND, PORTRAIT_ZONE, CANVAS };

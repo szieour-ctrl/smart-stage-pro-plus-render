@@ -3,7 +3,7 @@
 const fs = require("fs");
 const path = require("path");
 const sharp = require("sharp");
-const { renderOpeningCard, renderClosingCard, renderStatCard, CANVAS } = require("../src/lib/agentMarketingCards");
+const { renderOpeningCard, renderClosingCard, renderStatCard, renderCompareCard, CANVAS } = require("../src/lib/agentMarketingCards");
 
 async function plate(cv) {
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${cv.w}" height="${cv.h}"><defs>
@@ -30,7 +30,10 @@ async function plate(cv) {
     const c = await renderClosingCard({ ...common, headline: ["Want to talk through where", "your home fits in this picture?"], support: "I'm happy to walk you through it.", tagline: "Pricing · Condition · Competition" }, path.join(out, `closing_${canvas}.png`), canvas);
     const c2 = await renderClosingCard({ ...common, variant: "portrait", headline: ["Want to talk through where", "your home fits in this picture?"], support: "I'm happy to walk you through it.", tagline: "Pricing · Condition · Competition" }, path.join(out, `closing_portraitvariant_${canvas}.png`), canvas);
     const st = await renderStatCard({ period: common.period, lead: "Active Listings Are Sitting a Median of", value: "41", unit: "days", trail: "Before Going Under Contract", icon: "calendar" }, path.join(out, `stat_${canvas}.png`), canvas);
-    for (const [name, r] of [["opening", o], ["closing", c], ["closing_portraitvariant", c2], ["stat", st]]) {
+    const cp = await renderCompareCard({ period: common.period, market: "Natomas", kind: "Market Update",
+      left: { lead: "Homes That Closed Sold At", percent: 99.4, caption: "of list price on average", icon: "sold" },
+      right: { lead: "But Here in the Active Market,", highlighted: 6, total: 14, caption: "listings have already taken a price reduction.", icon: "reduced" } }, path.join(out, `compare_${canvas}.png`), canvas);
+    for (const [name, r] of [["opening", o], ["closing", c], ["closing_portraitvariant", c2], ["stat", st], ["compare", cp]]) {
       const f = path.join(out, `${name}_${canvas}.png`);
       await sharp(base).composite([{ input: f }]).png().toFile(path.join(out, `preview_${name}_${canvas}.png`));
       console.log(canvas, name, "fits:", r.fits, "textBottom", Math.round(r.textBottom), "limit", r.limit, r.warnings.join(";"));
