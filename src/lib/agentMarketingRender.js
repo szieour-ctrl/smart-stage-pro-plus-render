@@ -206,7 +206,8 @@ async function renderAgentMarketing(job, onStep = () => {}, deps = {}) {
         const r = await renderSceneCard(m, sc, canvas, headshotBuf, path.join(dir, `card_${sc.n}.png`), fs.readFileSync(path.join(dir, `plate_${sc.n}`)));
         (checks.style = checks.style || {})[`${format}_${sc.n}`] = { style: r.style, legibility: r.legibility && r.legibility.ratioOfInkPixels };
         r.warnings.forEach((w) => warnings.push(`${format} scene ${sc.n}: ${w}`));
-        const start = sc.window.start + (i === 0 ? 0.2 : 0.15);
+        // a figure card can be told to wait for the moment its number is spoken (card_start_sec); the picture and captions play meanwhile
+        const start = Number.isFinite(sc.card_start_sec) && sc.card_start_sec > sc.window.start && sc.card_start_sec < sc.window.end - 1 ? sc.card_start_sec : sc.window.start + (i === 0 ? 0.2 : 0.15);
         const l = { png: r.png, startSec: start, fadeSec: 0.45 };
         if (!last) { l.endSec = sc.window.end - 0.02; l.fadeOutSec = 0.3; }
         layers.push(l);
