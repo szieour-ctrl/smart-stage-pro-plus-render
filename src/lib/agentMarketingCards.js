@@ -543,7 +543,7 @@ async function renderCompareCard(params, outPng, canvas = "portrait") {
 }
 
 // Expert-takeaway card --------------------------------------------------------
-// Editorial statement scene: two-tone headline, a statement, a supporting line, and 1-3 icon points
+// Editorial statement scene: two-tone headline, a statement, a supporting line, and 0-3 icon points
 // ("Condition" / "Pricing" ...). All text is script or planner text and goes through the gate; no figures here.
 // params: { headline:[dark, accent], statement, support?, points:[{ title, caption, icon }], period, brand }
 // icon: "condition" | "pricing" | "timing" | "check"
@@ -574,7 +574,7 @@ async function expertSvg(p, cv) {
   const portrait = cv === CANVAS.portrait;
   const X = cv.marginX;
   const pts = p.points || [];
-  if (pts.length < 1 || pts.length > 3) throw new Error("renderExpertCard: points must have 1 to 3 items");
+  if (pts.length > 3) throw new Error("renderExpertCard: points must have 0 to 3 items");
   const dark = (p.headline && p.headline[0]) || "", accent = (p.headline && p.headline[1]) || "";
   const label = (p.sourceLabel || "MetroList") + (periodLabel(p.period) ? `  ·  ${periodLabel(p.period)}` : "");
   const colW = portrait ? cv.maxW : 1000;
@@ -603,9 +603,9 @@ async function expertSvg(p, cv) {
       if (capL.length > 3) throw new Error("renderExpertCard: a point caption is too long (max 3 lines)");
       items.push({ q, capL, tw });
     }
-    y += 24;
+    if (pts.length) y += 24;
     const ptsTop = y;
-    const ptsH = portrait ? pts.length * rowH : ir * 2 + 10;
+    const ptsH = !pts.length ? 0 : portrait ? pts.length * rowH : ir * 2 + 10;
     y += ptsH;
     L = { hs, dl, al, stl, ss, sul, us, rule1, hBase, rule2, stBase, suBase, ir, rowH, capS, ttS, items, ptsTop, colWp, bottom: y };
     if (y <= limit) break;

@@ -35,3 +35,12 @@ test("legibility check finds dark text on a dark picture", async () => {
   const ok = await style.checkLegibility(card, await flat("#e8e2d4"), cv, style.DARK, Z[0]);
   assert.ok(bad.ratioOfInkPixels > 0.9); assert.strictEqual(ok.ratioOfInkPixels, 0);
 });
+
+test("a takeaway card draws with no icon rows, in both formats", async () => {
+  const os = require("os"), path = require("path");
+  for (const canvas of ["portrait", "landscape"]) {
+    const out = path.join(os.tmpdir(), `expert_${canvas}.png`);
+    const r = await cards.renderExpertCard({ headline: ["This Means Condition and", "Pricing Precision Matter"], statement: "New construction sets a baseline so your home has to answer for itself.", period: { start: "2026-09-01", end: "2026-09-30" }, brand: {} }, out, canvas);
+    assert.ok(r.fits, canvas);
+  }
+});
