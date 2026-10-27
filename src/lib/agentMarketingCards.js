@@ -188,6 +188,7 @@ async function noticeBar(cv, pal, noticeText) {
   const font = { family: B(), weight: 500, size: n.size };
   const lines = await wrap(noticeText, n.maxW, font);
   const lh = Math.round(n.size * 1.38), block = lines.length * lh;
+  if (block > n.h - 20) throw new Error(`The notice or source line is too long for its bar (${lines.length} lines); shorten it rather than clip it`);
   const y0 = top + Math.round((n.h - block) / 2) + Math.round(n.size * 1.02);
   const svg = `<rect x="0" y="${top}" width="${cv.w}" height="${n.h}" fill="${pal.panel}"/>
   <rect x="0" y="${top}" width="${cv.w}" height="3" fill="${pal.gold}"/>

@@ -79,3 +79,28 @@ test("bad manifests stop before any rendering", async () => {
   const a = await assets();
   await assert.rejects(() => R.renderAgentMarketing({ jobId: "t5", manifest: bad, outDir: path.join(dir, "o5") }, () => {}, { fetchAsset: async (k) => a[k], getMusic: async () => music }), /MetroList notice required/);
 });
+
+test("a web-research manifest draws its source line in the bar, not the MetroList notice, and the render still verifies it", async () => {
+  const a = await assets();
+  const m = manifest(["9x16"]);
+  m.notice_required = false; m.notice = {};
+  m.source_line = { text: "Source: Redfin 95834 Housing Market (redfin.com, Oct 20, 2026). Figures cover ZIP 95834, not all of Natomas.", label: "redfin.com", sources: [], scope_note: "" };
+  const out = path.join(dir, "out_web");
+  const r = await R.renderAgentMarketing({ jobId: "t-web", manifest: m, outDir: out }, () => {}, { fetchAsset: async (k) => a[k], getMusic: async () => music });
+  assert.ok(r.checks["9x16"].noticeOk);
+  assert.strictEqual(r.checks["9x16"].notice.length, 2);
+  // the saved checked frame is the opening: bar region must not be the MetroList sentence (the card differs from a MetroList card)
+  const web = path.join(dir, "web_open.png"), ml = path.join(dir, "ml_open.png");
+  await cards.renderOpeningCard({ noticeText: m.source_line.text, market: "Natomas", headline: "x", agent: { name: "Sam" } }, web, "portrait");
+  await cards.renderOpeningCard({ period, market: "Natomas", headline: "x", agent: { name: "Sam" } }, ml, "portrait");
+  const crop = (f) => sharp(f).extract({ left: 0, top: 1920 - 150, width: 1080, height: 150 }).raw().toBuffer();
+  assert.notDeepStrictEqual(await crop(web), await crop(ml));
+});
+
+test("a web-research manifest with no source line, and a source line too long for its bar, are refused", async () => {
+  const a = await assets();
+  const none = manifest(["9x16"]); none.notice_required = false; none.notice = {};
+  await assert.rejects(R.renderAgentMarketing({ jobId: "t-web2", manifest: none, outDir: path.join(dir, "o3") }, () => {}, { fetchAsset: async (k) => a[k], getMusic: async () => music }), /no source line|required/i);
+  const card = path.join(dir, "toolong.png");
+  await assert.rejects(cards.renderOpeningCard({ noticeText: "Source: " + "very long ".repeat(60), market: "N", headline: "x", agent: { name: "Sam" } }, card, "portrait"), /too long for its bar/);
+});
