@@ -9,7 +9,7 @@
 "use strict";
 
 module.exports = function makeLayouts(h) {
-  const { sharp, CANVAS, palette, measure, wrap, fitSize, T, dataUri, usableImage, circleHeadshot, noticeBar, needNotice, periodLabel, D, B, esc } = h;
+  const { sharp, CANVAS, palette, onColor, measure, wrap, fitSize, T, dataUri, usableImage, circleHeadshot, noticeBar, needNotice, periodLabel, D, B, esc } = h;
 
   // Geometry per canvas. Zones (agentMarketingZones.js) read the same numbers.
   const GEOM = {
@@ -91,7 +91,7 @@ module.exports = function makeLayouts(h) {
 
   // ---------- editorial portrait ----------
   async function editorialPortrait(kind, p, cv) {
-    const pal = palette(p.brand), agent = p.agent || {}, g = GEOM[canvasName(cv)].ep, portrait = cv === CANVAS.portrait;
+    const pal = palette(p.brand, p.style), agent = p.agent || {}, g = GEOM[canvasName(cv)].ep, portrait = cv === CANVAS.portrait;
     const side = p.side === "right" ? "right" : "left";
     const notice = needNotice(p);
     const nb = await noticeBar(cv, pal, notice);
@@ -125,11 +125,11 @@ module.exports = function makeLayouts(h) {
     }
     // Soft scrim under the text column so the headline reads on a busy plate.
     const scrim = portrait
-      ? `<linearGradient id="st" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff" stop-opacity="0.55"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></linearGradient>
+      ? `<linearGradient id="st" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${pal.scrimC}" stop-opacity="${pal.so(0.55)}"/><stop offset="1" stop-color="${pal.scrimC}" stop-opacity="0"/></linearGradient>
   <rect x="0" y="0" width="${cv.w}" height="${Math.round(cv.h * 0.56)}" fill="url(#st)"/>
-  <linearGradient id="sb" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff" stop-opacity="0"/><stop offset="1" stop-color="#fff" stop-opacity="0.45"/></linearGradient>
+  <linearGradient id="sb" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${pal.scrimC}" stop-opacity="0"/><stop offset="1" stop-color="${pal.scrimC}" stop-opacity="${pal.so(0.45)}"/></linearGradient>
   <rect x="0" y="${g.panelTop - 40}" width="${cv.w}" height="${g.panelH + 80}" fill="url(#sb)"/>`
-      : `<linearGradient id="st" x1="${side === "left" && haveHs ? 1 : 0}" y1="0" x2="${side === "left" && haveHs ? 0 : 1}" y2="0"><stop offset="0" stop-color="#fff" stop-opacity="0.55"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></linearGradient>
+      : `<linearGradient id="st" x1="${side === "left" && haveHs ? 1 : 0}" y1="0" x2="${side === "left" && haveHs ? 0 : 1}" y2="0"><stop offset="0" stop-color="${pal.scrimC}" stop-opacity="${pal.so(0.55)}"/><stop offset="1" stop-color="${pal.scrimC}" stop-opacity="0"/></linearGradient>
   <rect x="${side === "left" && haveHs ? Math.round(cv.w * 0.3) : 0}" y="0" width="${Math.round(cv.w * 0.7)}" height="${cv.h}" fill="url(#st)"/>`;
     const lbScrim = `<linearGradient id="lb" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#000" stop-opacity="0"/><stop offset="1" stop-color="#000" stop-opacity="0.6"/></linearGradient>
   <rect x="0" y="${cv.h - cv.notice.h - 260}" width="${cv.w}" height="${cv.notice.h + 260}" fill="url(#lb)"/>`;
@@ -147,7 +147,7 @@ module.exports = function makeLayouts(h) {
 
   // ---------- news brief ----------
   async function newsBrief(kind, p, cv) {
-    const pal = palette(p.brand), agent = p.agent || {}, g = GEOM[canvasName(cv)].nb, portrait = cv === CANVAS.portrait;
+    const pal = palette(p.brand, p.style), agent = p.agent || {}, g = GEOM[canvasName(cv)].nb, portrait = cv === CANVAS.portrait;
     const notice = needNotice(p);
     const nb = await noticeBar(cv, pal, notice);
     const X = cv.marginX;
@@ -159,7 +159,7 @@ module.exports = function makeLayouts(h) {
     const tagSize = portrait ? 28 : 22;
     const tagW = Math.round((await measure(tagText, { family: B(), weight: 700, size: tagSize, spacing: 4 })) + 48);
     const chip = `<rect x="${X}" y="${g.chipTop}" width="${tagW}" height="${g.chipH}" rx="8" fill="${pal.gold}"/>
-  ${T(X + 24, g.chipTop + g.chipH / 2 + tagSize * 0.36, tagText, { size: tagSize, weight: 700, family: B(), fill: pal.ink, spacing: 4 })}`;
+  ${T(X + 24, g.chipTop + g.chipH / 2 + tagSize * 0.36, tagText, { size: tagSize, weight: 700, family: B(), fill: onColor(pal.gold), spacing: 4 })}`;
     const datedLine = kind === "opening" ? [p.eyebrow, periodLabel(p.period)].filter(Boolean).join("  ·  ").toUpperCase() : "";
     const dated = datedLine ? T(X + tagW + 28, g.chipTop + g.chipH / 2 + tagSize * 0.36, datedLine, { size: tagSize - 2, weight: 500, family: B(), fill: pal.ink, spacing: 4, opacity: 0.9 }) : "";
 
@@ -199,11 +199,11 @@ module.exports = function makeLayouts(h) {
   <image href="${dataUri(img)}" x="${cx}" y="${cy}" width="${circleD}" height="${circleD}" clip-path="url(#nbc)" preserveAspectRatio="xMidYMid slice"/>
   <circle cx="${cx + circleD / 2}" cy="${cy + circleD / 2}" r="${circleD / 2}" fill="none" stroke="${pal.gold}" stroke-width="5"/>`;
     } else warnings.push("no headshot: the circle was left out");
-    const scrim = `<linearGradient id="nt" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff" stop-opacity="0.55"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></linearGradient>
+    const scrim = `<linearGradient id="nt" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${pal.scrimC}" stop-opacity="${pal.so(0.55)}"/><stop offset="1" stop-color="${pal.scrimC}" stop-opacity="0"/></linearGradient>
   <rect x="0" y="0" width="${cv.w}" height="${g.bandTop}" fill="url(#nt)"/>
   <linearGradient id="lb" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#000" stop-opacity="0"/><stop offset="1" stop-color="#000" stop-opacity="0.6"/></linearGradient>
   <rect x="0" y="${g.bandTop + g.bandH}" width="${cv.w}" height="${cv.h - g.bandTop - g.bandH}" fill="url(#lb)"/>`;
-    const band = `<rect x="0" y="${g.bandTop}" width="${cv.w}" height="${g.bandH}" fill="${pal.ink}" fill-opacity="0.94"/>
+    const band = `<rect x="0" y="${g.bandTop}" width="${cv.w}" height="${g.bandH}" fill="${pal.panel}" fill-opacity="0.94"/>
   <rect x="0" y="${g.bandTop}" width="${cv.w}" height="5" fill="${pal.gold}"/>
   <rect x="0" y="${g.bandTop}" width="16" height="${g.bandH}" fill="${pal.gold}"/>`;
     const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${cv.w}" height="${cv.h}">
