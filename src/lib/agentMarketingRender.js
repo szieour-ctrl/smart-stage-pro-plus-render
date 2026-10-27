@@ -96,7 +96,11 @@ const imageMode = (m) => !(m.brand && m.brand.text_style === "brand");
 function cardParams(m, scene, headshotBuf, style) {
   const b = m.brand || {};
   const brand = style ? { border: b.border } : { primary: b.primary, secondary: b.secondary, border: b.border, font: b.font };
-  const common = { period: m.notice && m.notice.period, brand, agent: b.agent, headshotBuf, style: style || undefined };
+  // A web-research Reel carries a code-built source line instead of the MetroList notice (notice_required:false); the card's footer
+  // names the publishers, not MetroList.
+  const sl = m.notice_required === false ? m.source_line : null;
+  if (m.notice_required === false && !(sl && sl.text)) throw new Error("This Reel has no source line and no MetroList notice; one of them is required.");
+  const common = { period: sl ? undefined : m.notice && m.notice.period, ...(sl ? { noticeText: sl.text, sourceLabel: sl.label || "Sources" } : {}), brand, agent: b.agent, headshotBuf, style: style || undefined };
   return { ...scene.data, ...common };
 }
 /** Zones where words sit directly on the picture (opaque panels and the notice bar are not part of it). */
