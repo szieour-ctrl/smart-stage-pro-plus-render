@@ -22,7 +22,14 @@ async function plate(format, n) {
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}"><defs><linearGradient id="s" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${hues[n % 5]}"/><stop offset="0.6" stop-color="#f6efe0"/><stop offset="1" stop-color="#8aa05a"/></linearGradient></defs>
   <rect width="100%" height="100%" fill="url(#s)"/><rect y="${h * 0.6}" width="100%" height="${h * 0.4}" fill="#6f8a45" opacity="0.75"/>
   <rect x="${w * (0.12 + 0.1 * n)}" y="${h * 0.38}" width="${w * 0.4}" height="${h * 0.22}" fill="#c9b9a0"/><rect x="${w * (0.4 + 0.08 * n)}" y="${h * 0.44}" width="${w * 0.3}" height="${h * 0.16}" fill="#b6a58d"/></svg>`;
-  return sharp(Buffer.from(svg)).png().toBuffer();
+  let img = sharp(Buffer.from(svg));
+  // PLATE=dark|light|busy changes the stand-in picture so the image-aware text style can be checked on each kind.
+  if (process.env.PLATE === "dark") img = img.modulate({ brightness: 0.28 });
+  else if (process.env.PLATE === "busy") {
+    const stripes = Array.from({ length: 30 }, (_, i) => `<rect x="${i * w / 30}" y="0" width="${w / 60}" height="${h}" fill="${i % 2 ? '#111' : '#fff'}" opacity="0.7"/>`).join("");
+    img = img.composite([{ input: Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}">${stripes}</svg>`) }]);
+  }
+  return img.png().toBuffer();
 }
 
 const WORDS = ("Natomas sellers are competing with brand new homes. Active listings are sitting a median of 41 days before going under contract. " +
@@ -66,5 +73,5 @@ const SCENES = [
     fetchAsset: async (k) => { if (!assets[k]) throw new Error("missing " + k); return assets[k]; },
     getMusic: async () => music,
   });
-  console.log(JSON.stringify({ outputs: res.outputs, durationSec: res.durationSec, checks: Object.fromEntries(Object.entries(res.checks).map(([k, v]) => [k, { durationSec: v.durationSec, noticeOk: v.noticeOk, notice: v.notice.map((n) => ({ sec: n.sec, meanDiff: n.meanDiff, ok: n.ok })) }])), warnings: res.warnings }, null, 2));
+  console.log(JSON.stringify({ outputs: res.outputs, durationSec: res.durationSec, checks: Object.fromEntries(Object.entries(res.checks).filter(([k]) => k !== "style").map(([k, v]) => [k, { durationSec: v.durationSec, noticeOk: v.noticeOk, notice: v.notice.map((n) => ({ sec: n.sec, meanDiff: n.meanDiff, ok: n.ok })) }])), warnings: res.warnings }, null, 2));
 })().catch((e) => { console.error(e); process.exit(1); });
