@@ -53,11 +53,12 @@ const DEFAULT_FONTS = { display: "Playfair Display", body: "Montserrat" };
 const fontCtx = new AsyncLocalStorage();
 const D = () => (fontCtx.getStore() || DEFAULT_FONTS).display;
 const B = () => (fontCtx.getStore() || DEFAULT_FONTS).body;
-function fontsFor(brand) {
+function fontsFor(brand, style) {
+  if (style && style.ink) return DEFAULT_FONTS; // image-aware mode: the editorial pair, never the subscriber font
   const f = brand && BRAND_FONTS.includes(brand.font) ? brand.font : null;
   return f ? { display: f, body: f } : DEFAULT_FONTS;
 }
-const withBrandFont = (fn) => (params, ...rest) => fontCtx.run(fontsFor(params && params.brand), () => fn(params, ...rest));
+const withBrandFont = (fn) => (params, ...rest) => fontCtx.run(fontsFor(params && params.brand, params && params.style), () => fn(params, ...rest));
 
 const typo = (s) => String(s ?? "").replace(/'/g, "\u2019");
 const esc = (s) => typo(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
@@ -156,12 +157,25 @@ async function circleHeadshot(buf, d) {
   return sharp(buf).rotate().resize(d, d, { fit: "cover", position: "attention" }).png().toBuffer();
 }
 
-function palette(brand = {}) {
+// palette(brand, style)
+//   style given  (Agent Marketing, image-aware): the card's ink, accent and scrim come from the picture behind the words; the brand's
+//                colours and font are not used. `panel` is the neutral dark used for solid surfaces (notice bar, dark data card).
+//   no style     (legacy): the subscriber's Brand DNA colours drive everything, as before.
+// scrimC / so(): the colour and opacity of the soft fades cards lay behind text; so(0.5) is the old fixed 0.5 white fade scaled by the
+// amount the picture needs (0 = none).
+function palette(brand = {}, style = null) {
+  if (style && style.ink) {
+    const panel = "#1D2023", dark = lum(style.ink) < 0.5;
+    const k = Number.isFinite(style.scrim) ? Math.max(0, style.scrim) : 1;
+    return { gold: hex(style.accent, "#B08D3F"), ink: hex(style.ink, panel), panel, ring: hex(style.accent, "#B08D3F"), scrimC: dark ? "#fff" : "#000", so: (v) => Math.min(0.92, v * k).toFixed(3), image: true };
+  }
   const gold = hex(brand.primary, "#B08D3F");
   const sec = hex(brand.secondary, "#1D2023");
   const ink = lum(sec) < 0.35 ? sec : "#1D2023";
-  return { gold, ink, ring: hex(brand.border, gold) };
+  return { gold, ink, panel: ink, ring: hex(brand.border, gold), scrimC: "#fff", so: (v) => String(v), image: false };
 }
+// Text colour for a solid colour behind it: white or the neutral dark, whichever contrasts more.
+const onColor = (bg) => (lum(hex(bg, "#B08D3F")) >= 0.5 ? "#1D2023" : "#FFFFFF");
 
 const T = (x, y, text, { size, weight = 400, family = D(), fill, anchor = "start", spacing = 0, opacity = 1 }) =>
   `<text x="${x}" y="${Math.round(y)}" text-anchor="${anchor}" font-family="${family}" font-weight="${weight}" font-size="${size}"${spacing ? ` letter-spacing="${spacing}"` : ""} fill="${fill}"${opacity < 1 ? ` fill-opacity="${opacity}"` : ""}>${esc(text)}</text>`;
@@ -175,7 +189,7 @@ async function noticeBar(cv, pal, noticeText) {
   const lines = await wrap(noticeText, n.maxW, font);
   const lh = Math.round(n.size * 1.38), block = lines.length * lh;
   const y0 = top + Math.round((n.h - block) / 2) + Math.round(n.size * 1.02);
-  const svg = `<rect x="0" y="${top}" width="${cv.w}" height="${n.h}" fill="${pal.ink}"/>
+  const svg = `<rect x="0" y="${top}" width="${cv.w}" height="${n.h}" fill="${pal.panel}"/>
   <rect x="0" y="${top}" width="${cv.w}" height="3" fill="${pal.gold}"/>
   ${lines.map((l, i) => T(cv.w / 2, y0 + i * lh, l, { size: n.size, weight: 500, family: B(), fill: "#FFFFFF", anchor: "middle", opacity: 0.95 })).join("\n  ")}`;
   return { svg, top };
@@ -210,17 +224,17 @@ async function lockup(cv, pal, agent, hsBuf, { cx, cy, align = "left", circle = 
   return out;
 }
 
-const scrims = (cv, lockTop, which) => `<defs>
-    <linearGradient id="lt" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff" stop-opacity="0.5"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></linearGradient>
+const scrims = (cv, lockTop, which, pal) => `<defs>
+    <linearGradient id="lt" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${pal.scrimC}" stop-opacity="${pal.so(0.5)}"/><stop offset="1" stop-color="${pal.scrimC}" stop-opacity="0"/></linearGradient>
     <linearGradient id="lb" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#000" stop-opacity="0"/><stop offset="1" stop-color="#000" stop-opacity="0.6"/></linearGradient>
-    <linearGradient id="ll" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#fff" stop-opacity="0.5"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></linearGradient>
+    <linearGradient id="ll" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="${pal.scrimC}" stop-opacity="${pal.so(0.5)}"/><stop offset="1" stop-color="${pal.scrimC}" stop-opacity="0"/></linearGradient>
   </defs>
   ${cv === CANVAS.portrait || which === "top" ? `<rect x="0" y="0" width="${cv.w}" height="${Math.round(cv.h * 0.58)}" fill="url(#lt)"/>` : `<rect x="0" y="0" width="${Math.round(cv.w * 0.62)}" height="${cv.h}" fill="url(#ll)"/>`}
   <rect x="0" y="${lockTop - 160}" width="${cv.w}" height="${cv.h - lockTop + 160}" fill="url(#lb)"/>`;
 
 // Opening ---------------------------------------------------------------------
 async function openingSvg(p, cv) {
-  const pal = palette(p.brand);
+  const pal = palette(p.brand, p.style);
   const agent = p.agent || {};
   const hs = (await usableImage(p.headshotBuf)) ? await circleHeadshot(p.headshotBuf, cv.hs) : null;
   const notice = needNotice(p);
@@ -262,7 +276,7 @@ async function openingSvg(p, cv) {
   const lockTop = nb.top - (cv === CANVAS.portrait ? 0 : 0);
   const lockCy = cv.lockupCy;
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${cv.w}" height="${cv.h}">
-  ${scrims(cv, lockCy - cv.hs / 2 - 20, "both")}
+  ${scrims(cv, lockCy - cv.hs / 2 - 20, "both", pal)}
   <rect x="${X}" y="${L.rule1}" width="145" height="4" fill="${pal.gold}"/>
   ${L.marketLines.map((l, i) => T(X - 4, L.titleBase + i * L.ts * 1.04, l, { size: L.ts, weight: 800, fill: pal.ink })).join("\n  ")}
   ${T(X - 2, L.kindBase, kind, { size: L.ks, weight: 600, fill: pal.gold })}
@@ -278,7 +292,7 @@ async function openingSvg(p, cv) {
 
 // Closing ---------------------------------------------------------------------
 async function closingSvg(p, cv) {
-  const pal = palette(p.brand);
+  const pal = palette(p.brand, p.style);
   const agent = p.agent || {};
   const variant = p.variant === "portrait" ? "portrait" : "headshot";
   const hs = variant === "headshot" && (await usableImage(p.headshotBuf)) ? await circleHeadshot(p.headshotBuf, cv.hs) : null;
@@ -320,7 +334,7 @@ async function closingSvg(p, cv) {
     else lock = await lockup(cv, pal, agent, null, { cx: X + 26, cy: cv.lockupCy, circle: false });
   }
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${cv.w}" height="${cv.h}">
-  ${scrims(cv, cv.lockupCy - cv.hs / 2 - 20, "both")}
+  ${scrims(cv, cv.lockupCy - cv.hs / 2 - 20, "both", pal)}
   <rect x="${X}" y="${L.rule1}" width="145" height="4" fill="${pal.gold}"/>
   ${headSvg}
   <rect x="${X}" y="${L.rule2}" width="110" height="3" fill="${pal.gold}"/>
@@ -361,7 +375,7 @@ function calendarIcon(cx, cy, r, pal) {
 }
 
 async function statSvg(p, cv) {
-  const pal = palette(p.brand);
+  const pal = palette(p.brand, p.style);
   const portrait = cv === CANVAS.portrait;
   const X = cv.marginX;
   const text = [p.value, p.unit].filter(Boolean).join(" ").toUpperCase();
@@ -390,8 +404,8 @@ async function statSvg(p, cv) {
   const fig = await liningFigure(text, L.vs, pal.gold);
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${cv.w}" height="${cv.h}">
   <defs>
-    <linearGradient id="lt" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff" stop-opacity="0.5"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></linearGradient>
-    <linearGradient id="ll" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#fff" stop-opacity="0.5"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></linearGradient>
+    <linearGradient id="lt" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${pal.scrimC}" stop-opacity="${pal.so(0.5)}"/><stop offset="1" stop-color="${pal.scrimC}" stop-opacity="0"/></linearGradient>
+    <linearGradient id="ll" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="${pal.scrimC}" stop-opacity="${pal.so(0.5)}"/><stop offset="1" stop-color="${pal.scrimC}" stop-opacity="0"/></linearGradient>
     <linearGradient id="lb" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#000" stop-opacity="0"/><stop offset="1" stop-color="#000" stop-opacity="0.45"/></linearGradient>
   </defs>
   ${portrait ? `<rect x="0" y="0" width="${cv.w}" height="${Math.round(cv.h * 0.6)}" fill="url(#lt)"/>` : `<rect x="0" y="0" width="${Math.round(cv.w * 0.66)}" height="${cv.h}" fill="url(#ll)"/>`}
@@ -436,7 +450,7 @@ function houseIcon(cx, cy, s, color, pal, badge) {
 }
 
 async function compareSvg(p, cv) {
-  const pal = palette(p.brand);
+  const pal = palette(p.brand, p.style);
   const portrait = cv === CANVAS.portrait;
   const X = cv.marginX;
   const l = p.left || {}, r = p.right || {};
@@ -460,7 +474,7 @@ async function compareSvg(p, cv) {
   const cards = [{ d: l, x: cardsX, light: true }, { d: r, x: cardsX + cardW + gap, light: false }];
   let svg = "";
   for (const c of cards) {
-    const ink = c.light ? pal.ink : "#FFFFFF", fill = c.light ? "#FBF8F1" : pal.ink;
+    const ink = c.light ? pal.panel : "#FFFFFF", fill = c.light ? "#FBF8F1" : pal.panel;
     const cpal = { ...pal, gold: readableOn(pal.gold, fill, c.light ? 4.5 : 7) }; // brand colour, made readable on this card's own surface
     const leadS = portrait ? 42 : 40, capS = portrait ? 22 : 20;
     const leadLines = await wrap(c.d.lead || "", innerW, { family: D(), weight: 600, size: leadS });
@@ -485,7 +499,7 @@ async function compareSvg(p, cv) {
     if (c.light) {
       // percentage bar: the filled share is the number itself (capped at the track)
       const bw = innerW - 20, bh = portrait ? 18 : 16, bx = cx - bw / 2;
-      svg += `<rect x="${bx}" y="${y}" width="${bw}" height="${bh}" rx="${bh / 2}" fill="${pal.ink}" fill-opacity="0.14"/>
+      svg += `<rect x="${bx}" y="${y}" width="${bw}" height="${bh}" rx="${bh / 2}" fill="${pal.panel}" fill-opacity="0.14"/>
   <rect x="${bx}" y="${y}" width="${Math.max(bh, Math.round(bw * Math.min(pct, 100) / 100))}" height="${bh}" rx="${bh / 2}" fill="${cpal.gold}"/>`;
       y += bh + (portrait ? 30 : 24);
     } else {
@@ -508,7 +522,7 @@ async function compareSvg(p, cv) {
   const footY = portrait ? cv.h - 64 : cv.h - 46;
   const body = `<svg xmlns="http://www.w3.org/2000/svg" width="${cv.w}" height="${cv.h}">
   <defs>
-    <linearGradient id="lt" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff" stop-opacity="0.5"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></linearGradient>
+    <linearGradient id="lt" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${pal.scrimC}" stop-opacity="${pal.so(0.5)}"/><stop offset="1" stop-color="${pal.scrimC}" stop-opacity="0"/></linearGradient>
     <linearGradient id="lb" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#000" stop-opacity="0"/><stop offset="1" stop-color="#000" stop-opacity="0.45"/></linearGradient>
   </defs>
   <rect x="0" y="0" width="${cv.w}" height="${Math.round(cv.h * 0.5)}" fill="url(#lt)"/>
@@ -556,7 +570,7 @@ function pointIcon(kind, cx, cy, r, pal) {
 }
 
 async function expertSvg(p, cv) {
-  const pal = palette(p.brand);
+  const pal = palette(p.brand, p.style);
   const portrait = cv === CANVAS.portrait;
   const X = cv.marginX;
   const pts = p.points || [];
@@ -613,8 +627,8 @@ async function expertSvg(p, cv) {
   const footY = portrait ? cv.h - 64 : cv.h - 46;
   const body = `<svg xmlns="http://www.w3.org/2000/svg" width="${cv.w}" height="${cv.h}">
   <defs>
-    <linearGradient id="lt" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff" stop-opacity="0.5"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></linearGradient>
-    <linearGradient id="ll" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#fff" stop-opacity="0.5"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></linearGradient>
+    <linearGradient id="lt" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${pal.scrimC}" stop-opacity="${pal.so(0.5)}"/><stop offset="1" stop-color="${pal.scrimC}" stop-opacity="0"/></linearGradient>
+    <linearGradient id="ll" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="${pal.scrimC}" stop-opacity="${pal.so(0.5)}"/><stop offset="1" stop-color="${pal.scrimC}" stop-opacity="0"/></linearGradient>
     <linearGradient id="lb" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#000" stop-opacity="0"/><stop offset="1" stop-color="#000" stop-opacity="0.45"/></linearGradient>
   </defs>
   ${portrait ? `<rect x="0" y="0" width="${cv.w}" height="${Math.round(cv.h * 0.7)}" fill="url(#lt)"/>` : `<rect x="0" y="0" width="${Math.round(cv.w * 0.7)}" height="${cv.h}" fill="url(#ll)"/>`}
@@ -640,7 +654,7 @@ async function renderExpertCard(params, outPng, canvas = "portrait") {
 // params (opening): { market, kind?, headline, eyebrow?, period:{start,end}, noticeText?, brand?, agent:{name,brokerage}, headshotBuf? }
 // params (closing): { headline:[darkPart, accentPart], support, tagline?, variant?, period, ... same agent/brand }
 // params.layout: "headline_focus" (default) | "editorial_portrait" | "news_brief"; params.side ("left"|"right") places the portrait panel.
-const { LAYOUTS, GEOM } = require("./agentMarketingLayouts")({ sharp, CANVAS, palette, measure, wrap, fitSize, T, dataUri, usableImage, circleHeadshot, noticeBar, needNotice, periodLabel, D, B, esc });
+const { LAYOUTS, GEOM } = require("./agentMarketingLayouts")({ sharp, CANVAS, palette, onColor, measure, wrap, fitSize, T, dataUri, usableImage, circleHeadshot, noticeBar, needNotice, periodLabel, D, B, esc });
 const LAYOUT_NAMES = ["headline_focus", ...Object.keys(LAYOUTS)];
 function pickLayout(kind, params, cv, base) {
   const name = params.layout || "headline_focus";
@@ -660,4 +674,4 @@ async function renderClosingCard(params, outPng, canvas = "portrait") {
   return { png: outPng, warnings: r.warnings, fits: r.fits, textBottom: r.textBottom, limit: r.limit };
 }
 
-module.exports = { renderOpeningCard: withBrandFont(renderOpeningCard), renderClosingCard: withBrandFont(renderClosingCard), renderStatCard: withBrandFont(renderStatCard), renderCompareCard: withBrandFont(renderCompareCard), renderExpertCard: withBrandFont(renderExpertCard), readableOn, contrast, metroListNotice, periodLabel, CAPTION_BAND, PORTRAIT_ZONE, CANVAS, BRAND_FONTS, LAYOUT_NAMES, GEOM };
+module.exports = { renderOpeningCard: withBrandFont(renderOpeningCard), renderClosingCard: withBrandFont(renderClosingCard), renderStatCard: withBrandFont(renderStatCard), renderCompareCard: withBrandFont(renderCompareCard), renderExpertCard: withBrandFont(renderExpertCard), readableOn, contrast, metroListNotice, periodLabel, palette, onColor, CAPTION_BAND, PORTRAIT_ZONE, CANVAS, BRAND_FONTS, LAYOUT_NAMES, GEOM };

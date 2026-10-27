@@ -17,6 +17,7 @@ const sharp = require("sharp");
 const { execFile } = require("child_process");
 const cards = require("./agentMarketingCards");
 const zones = require("./agentMarketingZones");
+const styleMod = require("./agentMarketingStyle");
 const { compositeLayers, probeDuration } = require("./reelOverlay");
 
 const FPS = 25;
@@ -76,23 +77,47 @@ async function captionLayer(text, canvas, brandFont, outPath) {
 }
 
 // ── cards from the manifest ───────────────────────────────────────────────────────────────────────────────────
-function cardParams(m, scene, headshotBuf) {
+// text_style "image" (default): ink, accent and soft fades follow the picture behind each scene; the brand contributes only the
+// headshot, name and brokerage. "brand" keeps the legacy look (Brand DNA colours + font).
+const imageMode = (m) => !(m.brand && m.brand.text_style === "brand");
+function cardParams(m, scene, headshotBuf, style) {
   const b = m.brand || {};
-  const common = { period: m.notice && m.notice.period, brand: { primary: b.primary, secondary: b.secondary, border: b.border, font: b.font }, agent: b.agent, headshotBuf };
+  const brand = style ? { border: b.border } : { primary: b.primary, secondary: b.secondary, border: b.border, font: b.font };
+  const common = { period: m.notice && m.notice.period, brand, agent: b.agent, headshotBuf, style: style || undefined };
   return { ...scene.data, ...common };
 }
-async function renderSceneCard(m, scene, canvas, headshotBuf, outPng) {
+/** Zones where words sit directly on the picture (opaque panels and the notice bar are not part of it). */
+function textZones(scene, canvas, opts) {
+  const z = zones.zonesFor(scene.composition, canvas, opts);
+  const out = [z.headline_zone || z.editorial_content_zone, z.agent_name_zone, z.agent_identity_zone].filter(Boolean);
+  return out;
+}
+async function renderSceneCard(m, scene, canvas, headshotBuf, outPng, plateBuf) {
   const map = zones.COMPOSITION_LAYOUT[scene.composition];
   if (!map) throw new Error(`Scene ${scene.n}: no renderer for composition "${scene.composition}"`);
   const [kind, layout] = map;
-  const p = cardParams(m, scene, headshotBuf);
+  const cv = cards.CANVAS[canvas];
+  const zopts = { side: (scene.layout_options || {}).side, headshot: !!headshotBuf };
   const lay = layout === "headline_focus" ? {} : { layout };
   const fn = { opening: cards.renderOpeningCard, closing: cards.renderClosingCard, stat: cards.renderStatCard, compare: cards.renderCompareCard, expert: cards.renderExpertCard }[kind];
-  const r = await fn({ ...p, ...lay, ...(scene.layout_options || {}) }, outPng, canvas);
-  if (!r.fits) throw new Error(`Scene ${scene.n} (${scene.composition}) does not fit its zone on ${canvas}`);
-  const verdict = await zones.checkCard(scene.composition, canvas, outPng, { side: (scene.layout_options || {}).side, headshot: !!headshotBuf });
+  const tz = textZones(scene, canvas, zopts);
+  let style = null, legibility = null;
+  if (imageMode(m) && plateBuf) style = await styleMod.styleFor(plateBuf, cv, tz);
+  let r;
+  for (let attempt = 0; ; attempt++) {
+    r = await fn({ ...cardParams(m, scene, headshotBuf, style), ...lay, ...(scene.layout_options || {}) }, outPng, canvas);
+    if (!r.fits) throw new Error(`Scene ${scene.n} (${scene.composition}) does not fit its zone on ${canvas}`);
+    if (!style) break;
+    // Measure what was actually drawn against the picture; if too much of the ink is under the floor, add scrim and draw again.
+    legibility = { share: 0, ...(await styleMod.checkLegibility(outPng, plateBuf, cv, style.ink, tz[0])) };
+    if (legibility.ratioOfInkPixels <= 0.04 || attempt >= 2 || style.scrim >= 1.6) break;
+    style = { ...style, scrim: Math.min(1.6, (style.scrim || 0) + 0.5) };
+  }
+  const verdict = await zones.checkCard(scene.composition, canvas, outPng, zopts);
   if (!verdict.ok) throw new Error(`Scene ${scene.n} (${scene.composition}) layout problem on ${canvas}: ${verdict.problems.join("; ")}`);
-  return { png: outPng, warnings: r.warnings };
+  const warnings = [...(r.warnings || [])];
+  if (legibility && legibility.ratioOfInkPixels > 0.04) warnings.push(`text over the picture is hard to read in ${Math.round(legibility.ratioOfInkPixels * 100)}% of the headline area`);
+  return { png: outPng, warnings, style: style && { ink: style.ink, accent: style.accent, scrim: style.scrim }, legibility };
 }
 
 // ── after-the-fact checks ─────────────────────────────────────────────────────────────────────────────────────
@@ -178,7 +203,8 @@ async function renderAgentMarketing(job, onStep = () => {}, deps = {}) {
       const layers = [], noticeCards = [];
       for (let i = 0; i < m.scenes.length; i++) {
         const sc = m.scenes[i], last = i === m.scenes.length - 1;
-        const r = await renderSceneCard(m, sc, canvas, headshotBuf, path.join(dir, `card_${sc.n}.png`));
+        const r = await renderSceneCard(m, sc, canvas, headshotBuf, path.join(dir, `card_${sc.n}.png`), fs.readFileSync(path.join(dir, `plate_${sc.n}`)));
+        (checks.style = checks.style || {})[`${format}_${sc.n}`] = { style: r.style, legibility: r.legibility && r.legibility.ratioOfInkPixels };
         r.warnings.forEach((w) => warnings.push(`${format} scene ${sc.n}: ${w}`));
         const start = sc.window.start + (i === 0 ? 0.2 : 0.15);
         const l = { png: r.png, startSec: start, fadeSec: 0.45 };
@@ -188,7 +214,7 @@ async function renderAgentMarketing(job, onStep = () => {}, deps = {}) {
       }
       for (let k = 0; k < m.captions.length; k++) {
         const c = m.captions[k];
-        const png = await captionLayer(c.text, canvas, m.brand && m.brand.font, path.join(dir, `cap_${k}.png`));
+        const png = await captionLayer(c.text, canvas, imageMode(m) ? undefined : (m.brand && m.brand.font), path.join(dir, `cap_${k}.png`));
         layers.push({ png, startSec: c.start, endSec: Math.min(total, c.end), fadeSec: 0.12, fadeOutSec: 0.12 });
       }
 
