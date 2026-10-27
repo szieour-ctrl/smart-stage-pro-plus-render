@@ -76,6 +76,19 @@ async function captionLayer(text, canvas, brandFont, outPath) {
   return outPath;
 }
 
+// ── narration voice shaping ──────────────────────────────────────────────────────────────
+// manifest.audio.voice_shape = { semitones: -1.5, bass_db: 3 }: lowers the narration's pitch (a little deeper, bigger voice) and adds
+// low-end warmth. Timing is untouched: the pitch drop is a sample-rate change that atempo cancels, so every word stays where the
+// timestamps say it is. Absent or zero = the voice as ElevenLabs made it.
+function voiceShapeFilter(shape) {
+  const st = Math.max(-4, Math.min(0, Number(shape && shape.semitones) || 0));
+  const bass = Math.max(0, Math.min(8, Number(shape && shape.bass_db) || 0));
+  const parts = [];
+  if (st < 0) { const f = Math.pow(2, st / 12); parts.push(`aresample=44100,asetrate=${(44100 * f).toFixed(2)},aresample=44100,atempo=${(1 / f).toFixed(6)}`); }
+  if (bass > 0) parts.push(`bass=g=${bass}:f=150:w=0.6`);
+  return parts.length ? parts.join(",") + "," : "";
+}
+
 // ── cards from the manifest ───────────────────────────────────────────────────────────────────────────────────
 // text_style "image" (default): ink, accent and soft fades follow the picture behind each scene; the brand contributes only the
 // headshot, name and brokerage. "brand" keeps the legacy look (Brand DNA colours + font).
@@ -194,7 +207,7 @@ async function renderAgentMarketing(job, onStep = () => {}, deps = {}) {
       const music = await getMusic(workDir, total, job.musicStyle);
       const base = path.join(dir, "base.mp4");
       await run("ffmpeg", ["-y", "-i", silent, "-i", narrationPath, "-i", music, "-filter_complex",
-        `[1:a]apad,atrim=0:${total.toFixed(3)},asetpts=PTS-STARTPTS[v];` +
+        `[1:a]${voiceShapeFilter(m.audio && m.audio.voice_shape)}apad,atrim=0:${total.toFixed(3)},asetpts=PTS-STARTPTS[v];` +
         `[2:a]atrim=0:${total.toFixed(3)},asetpts=PTS-STARTPTS,volume=0.13,afade=t=in:st=0:d=0.5,afade=t=out:st=${Math.max(0, total - 1.2).toFixed(2)}:d=1.2[m];` +
         `[v][m]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.95[a]`,
         "-map", "0:v", "-map", "[a]", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", base]);
@@ -248,4 +261,4 @@ async function renderAgentMarketing(job, onStep = () => {}, deps = {}) {
   }
 }
 
-module.exports = { renderAgentMarketing, backgroundClip, captionLayer, verifyNoticeInFrame, motionExpr, FORMAT_CANVAS };
+module.exports = { renderAgentMarketing, backgroundClip, captionLayer, verifyNoticeInFrame, motionExpr, FORMAT_CANVAS, voiceShapeFilter };
