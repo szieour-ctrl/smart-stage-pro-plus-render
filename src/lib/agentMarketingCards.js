@@ -466,11 +466,15 @@ async function compareSvg(p, cv) {
   // geometry
   const gap = portrait ? 50 : 60, cardsX = portrait ? 60 : X;
   const cardW = Math.floor((cv.w - 2 * cardsX - gap) / 2);
-  const cardTop = portrait ? 840 : 330, cardH = portrait ? 740 : 520;
+  let cardTop = portrait ? 840 : 330;
+  const cardH = portrait ? 740 : 520;
   const pad = portrait ? 34 : 40, innerW = cardW - 2 * pad;
   const titleMax = portrait ? cv.maxW : 1000;
-  const ts = await fitSize(p.market || "", titleMax, portrait ? 130 : 96, 60, { family: D(), weight: 800 });
+  const ts = await fitSize(p.market || "", titleMax, portrait ? 150 : 96, 60, { family: D(), weight: 800 });
   const ks = await fitSize(p.kind || "Market Update", titleMax, Math.round(ts * 0.68), 40, { family: D(), weight: 600 });
+  // Portrait: the cards follow the title block instead of sitting at a fixed low position, so the top of the frame is filled the
+  // way the other scenes are and the picture shows below the cards.
+  if (portrait) cardTop = Math.round(Math.max(520, Math.min(840, cv.top + 4 + 40 + ts * 0.8 + 10 + ks * 0.82 + ks * 0.35 + 90)));
   const cards = [{ d: l, x: cardsX, light: true }, { d: r, x: cardsX + cardW + gap, light: false }];
   let svg = "";
   for (const c of cards) {
