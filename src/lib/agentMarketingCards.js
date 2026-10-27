@@ -63,6 +63,21 @@ const withBrandFont = (fn) => (params, ...rest) => fontCtx.run(fontsFor(params &
 const typo = (s) => String(s ?? "").replace(/'/g, "\u2019");
 const esc = (s) => typo(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 const hex = (v, fb) => (/^#[0-9a-fA-F]{6}$/.test(String(v || "")) ? v : fb);
+// WCAG contrast. readableOn(color, bg) keeps the brand colour when it reads on `bg`; otherwise it moves it toward white (on a dark
+// surface) or black (on a light one) just far enough to reach 4.5:1, so a navy brand never disappears into a navy card.
+const rgbOf = (h) => { const n = parseInt(h.slice(1), 16); return [(n >> 16) & 255, (n >> 8) & 255, n & 255]; };
+const relLum = (h) => { const [r, g, b] = rgbOf(h).map((v) => { v /= 255; return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); }); return 0.2126 * r + 0.7152 * g + 0.0722 * b; };
+const contrast = (a, b) => { const x = relLum(a), y = relLum(b); return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05); };
+const toHex = (c) => "#" + c.map((v) => Math.round(v).toString(16).padStart(2, "0")).join("");
+function readableOn(color, bg, min = 4.5) {
+  if (contrast(color, bg) >= min) return color;
+  const target = relLum(bg) < 0.4 ? [255, 255, 255] : [0, 0, 0], base = rgbOf(color);
+  for (let t = 0.1; t <= 1.0001; t += 0.05) {
+    const c = toHex(base.map((v, i) => v + (target[i] - v) * t));
+    if (contrast(c, bg) >= min) return c;
+  }
+  return toHex(target);
+}
 const lum = (h) => { const n = parseInt(h.slice(1), 16); return (0.2126 * ((n >> 16) & 255) + 0.7152 * ((n >> 8) & 255) + 0.0722 * (n & 255)) / 255; };
 
 // ---------- MetroList notice + period (code-built; never typed) ----------
@@ -460,21 +475,22 @@ async function compareSvg(p, cv) {
   let svg = "";
   for (const c of cards) {
     const ink = c.light ? pal.panel : "#FFFFFF", fill = c.light ? "#FBF8F1" : pal.panel;
+    const cpal = { ...pal, gold: readableOn(pal.gold, fill, c.light ? 4.5 : 7) }; // brand colour, made readable on this card's own surface
     const leadS = portrait ? 42 : 40, capS = portrait ? 22 : 20;
     const leadLines = await wrap(c.d.lead || "", innerW, { family: D(), weight: 600, size: leadS });
     const capLines = await wrap(String(c.d.caption || "").toUpperCase(), innerW, { family: B(), weight: 600, size: capS, spacing: 4 });
     // Never drop script words silently: too-long text is an error so the planner can shorten and retry.
     if (leadLines.length > 3 || capLines.length > 4) throw new Error(`renderCompareCard: text too long for the card (lead ${leadLines.length} lines, caption ${capLines.length} lines; max 3 and 4)`);
     const vs = await fitSize(c.light ? leftParts[0].t : `${hi} of ${total}`, innerW, portrait ? 150 : 128, 70, { family: D(), weight: 800 });
-    const fig = await liningFigure(c.light ? leftParts : rightParts, vs, pal.gold);
+    const fig = await liningFigure(c.light ? leftParts : rightParts, vs, cpal.gold);
     const figW = Math.min(fig.w, innerW);
     const cx = c.x + cardW / 2;
     let y = cardTop;
-    svg += `<rect x="${c.x}" y="${cardTop}" width="${cardW}" height="${cardH}" rx="26" fill="${fill}" fill-opacity="0.96" stroke="${pal.gold}" stroke-width="4"/>`;
+    svg += `<rect x="${c.x}" y="${cardTop}" width="${cardW}" height="${cardH}" rx="26" fill="${fill}" fill-opacity="0.96" stroke="${cpal.gold}" stroke-width="4"/>`;
     const iconS = portrait ? 52 : 40;
-    svg += houseIcon(cx, cardTop + (portrait ? 112 : 84), iconS, ink, pal, c.d.icon || (c.light ? "sold" : "reduced"));
+    svg += houseIcon(cx, cardTop + (portrait ? 112 : 84), iconS, ink, cpal, c.d.icon || (c.light ? "sold" : "reduced"));
     y = cardTop + (portrait ? 215 : 150);
-    svg += `<rect x="${cx - 60}" y="${y}" width="120" height="3" fill="${pal.gold}"/>`;
+    svg += `<rect x="${cx - 60}" y="${y}" width="120" height="3" fill="${cpal.gold}"/>`;
     y += portrait ? 34 : 24;
     leadLines.forEach((t, i) => { svg += T(cx, y + leadS * 0.85 + i * leadS * 1.15, t, { size: leadS, weight: 600, fill: ink, anchor: "middle" }); });
     y += leadLines.length * leadS * 1.15 + (portrait ? 22 : 18);
@@ -484,7 +500,7 @@ async function compareSvg(p, cv) {
       // percentage bar: the filled share is the number itself (capped at the track)
       const bw = innerW - 20, bh = portrait ? 18 : 16, bx = cx - bw / 2;
       svg += `<rect x="${bx}" y="${y}" width="${bw}" height="${bh}" rx="${bh / 2}" fill="${pal.panel}" fill-opacity="0.14"/>
-  <rect x="${bx}" y="${y}" width="${Math.max(bh, Math.round(bw * Math.min(pct, 100) / 100))}" height="${bh}" rx="${bh / 2}" fill="${pal.gold}"/>`;
+  <rect x="${bx}" y="${y}" width="${Math.max(bh, Math.round(bw * Math.min(pct, 100) / 100))}" height="${bh}" rx="${bh / 2}" fill="${cpal.gold}"/>`;
       y += bh + (portrait ? 30 : 24);
     } else {
       // dot grid: total dots, first `hi` highlighted; rows fill left to right
@@ -494,7 +510,7 @@ async function compareSvg(p, cv) {
       for (let i = 0; i < total; i++) {
         const dx = gx + (i % cols) * step, dy = y + dr + Math.floor(i / cols) * step;
         svg += i < hi
-          ? `<circle cx="${dx}" cy="${dy}" r="${dr}" fill="${pal.gold}"/>`
+          ? `<circle cx="${dx}" cy="${dy}" r="${dr}" fill="${cpal.gold}"/>`
           : `<circle cx="${dx}" cy="${dy}" r="${dr - 1.5}" fill="#FFFFFF" fill-opacity="0.12" stroke="#FFFFFF" stroke-opacity="0.55" stroke-width="2"/>`;
       }
       y += rows * step + (portrait ? 14 : 10);
@@ -658,4 +674,4 @@ async function renderClosingCard(params, outPng, canvas = "portrait") {
   return { png: outPng, warnings: r.warnings, fits: r.fits, textBottom: r.textBottom, limit: r.limit };
 }
 
-module.exports = { renderOpeningCard: withBrandFont(renderOpeningCard), renderClosingCard: withBrandFont(renderClosingCard), renderStatCard: withBrandFont(renderStatCard), renderCompareCard: withBrandFont(renderCompareCard), renderExpertCard: withBrandFont(renderExpertCard), metroListNotice, periodLabel, palette, onColor, CAPTION_BAND, PORTRAIT_ZONE, CANVAS, BRAND_FONTS, LAYOUT_NAMES, GEOM };
+module.exports = { renderOpeningCard: withBrandFont(renderOpeningCard), renderClosingCard: withBrandFont(renderClosingCard), renderStatCard: withBrandFont(renderStatCard), renderCompareCard: withBrandFont(renderCompareCard), renderExpertCard: withBrandFont(renderExpertCard), readableOn, contrast, metroListNotice, periodLabel, palette, onColor, CAPTION_BAND, PORTRAIT_ZONE, CANVAS, BRAND_FONTS, LAYOUT_NAMES, GEOM };
