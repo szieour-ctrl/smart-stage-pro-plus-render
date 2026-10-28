@@ -104,3 +104,14 @@ test("a web-research manifest with no source line, and a source line too long fo
   const card = path.join(dir, "toolong.png");
   await assert.rejects(cards.renderOpeningCard({ noticeText: "Source: " + "very long ".repeat(60), market: "N", headline: "x", agent: { name: "Sam" } }, card, "portrait"), /too long for its bar/);
 });
+
+test("a MetroList Market Summary Reel (no date range) draws the report's printed publication line as its notice and the render verifies it", async () => {
+  const a = await assets();
+  const m = manifest(["9x16"]);
+  const line = "All reports are published October 2026, based on data available at the end of September 2026";
+  m.notice = { disclosure: line, text: `Based on information from MetroList Services, Inc. ${line}.` };
+  const out = path.join(dir, "out_disclosure");
+  const r = await R.renderAgentMarketing({ jobId: "t-disclosure", manifest: m, outDir: out }, () => {}, { fetchAsset: async (k) => a[k], getMusic: async () => music });
+  assert.ok(r.checks["9x16"].noticeOk, "the drawn notice is found in the finished video");
+  assert.strictEqual(r.checks["9x16"].notice.length, 2);
+});

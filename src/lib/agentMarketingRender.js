@@ -100,7 +100,9 @@ function cardParams(m, scene, headshotBuf, style) {
   // names the publishers, not MetroList.
   const sl = m.notice_required === false ? m.source_line : null;
   if (m.notice_required === false && !(sl && sl.text)) throw new Error("This Reel has no source line and no MetroList notice; one of them is required.");
-  const common = { period: sl ? undefined : m.notice && m.notice.period, ...(sl ? { noticeText: sl.text, sourceLabel: sl.label || "Sources" } : {}), brand, agent: b.agent, headshotBuf, style: style || undefined };
+  // A MetroList Market Summary has no date range, only its printed publication line; the Netlify-built notice text carries that line word for word.
+  const printed = !sl && m.notice && m.notice.disclosure && m.notice.text ? m.notice.text : null;
+  const common = { period: sl || printed ? undefined : m.notice && m.notice.period, ...(printed ? { noticeText: printed } : {}), ...(sl ? { noticeText: sl.text, sourceLabel: sl.label || "Sources" } : {}), brand, agent: b.agent, headshotBuf, style: style || undefined };
   return { ...scene.data, ...common };
 }
 /** Zones where words sit directly on the picture (opaque panels and the notice bar are not part of it). */
