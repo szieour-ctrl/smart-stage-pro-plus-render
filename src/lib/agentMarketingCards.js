@@ -362,7 +362,7 @@ async function liningFigure(text, size, color, weight = 800) {
 // Middle scene: lead-in line, one huge figure, trailing line, optional icon, and a short code-built
 // source line ("METROLIST · SEPTEMBER 2026") at the bottom. Subtle branding: palette and type only
 // (no headshot, no notice bar; the full notice lives on the opening and closing cards).
-// params: { lead, value, unit?, trail?, icon?: "calendar"|"none", sourceLabel?, period, brand }
+// params: { lead, value, unit?, prefix? ("$"), trail?, icon?: "calendar"|"none", sourceLabel?, period, brand }
 // value MUST come from the verified data, never typed by the planner; lead/trail are script text.
 function calendarIcon(cx, cy, r, pal) {
   const a = r * 0.46; // half-size of the calendar glyph
@@ -375,11 +375,21 @@ function calendarIcon(cx, cy, r, pal) {
   <g fill="${pal.gold}">${[-0.55, 0, 0.55].flatMap((dx) => [0.25, 0.7].map((dy) => `<circle cx="${cx + a * dx}" cy="${cy + a * dy}" r="${Math.max(3, r * 0.05)}"/>`)).join("")}</g>`;
 }
 
+// How a verified value reads on the big-number card: "482000" -> "$482,000" (prefix "$"), "99" + "%" -> "99%" (no gap), "45" + "days" -> "45 DAYS".
+function statText(p) {
+  let v = String(p.value == null ? "" : p.value).trim();
+  const m = /^(-?)(\d+)(\.\d+)?$/.exec(v);
+  if (m) v = m[1] + m[2].replace(/\B(?=(\d{3})+(?!\d))/g, ",") + (m[3] || "");
+  const unit = p.unit ? String(p.unit).trim() : "";
+  const pre = p.prefix ? String(p.prefix).trim() : "";
+  return (pre + v + (unit === "%" ? "%" : unit ? ` ${unit}` : "")).toUpperCase();
+}
+
 async function statSvg(p, cv) {
   const pal = palette(p.brand, p.style);
   const portrait = cv === CANVAS.portrait;
   const X = cv.marginX;
-  const text = [p.value, p.unit].filter(Boolean).join(" ").toUpperCase();
+  const text = statText(p);
   const label = (p.sourceLabel || "MetroList") + (periodLabel(p.period) ? `  ·  ${periodLabel(p.period)}` : "");
   const colW = portrait ? cv.maxW : 1000;
   const iconR = p.icon === "none" ? 0 : (portrait ? 70 : 64);
@@ -688,4 +698,4 @@ async function renderClosingCard(params, outPng, canvas = "portrait") {
   return { png: outPng, warnings: r.warnings, fits: r.fits, textBottom: r.textBottom, limit: r.limit };
 }
 
-module.exports = { renderOpeningCard: withBrandFont(renderOpeningCard), renderClosingCard: withBrandFont(renderClosingCard), renderStatCard: withBrandFont(renderStatCard), renderCompareCard: withBrandFont(renderCompareCard), renderExpertCard: withBrandFont(renderExpertCard), readableOn, contrast, metroListNotice, periodLabel, palette, onColor, CAPTION_BAND, PORTRAIT_ZONE, CANVAS, BRAND_FONTS, LAYOUT_NAMES, GEOM };
+module.exports = { statText, renderOpeningCard: withBrandFont(renderOpeningCard), renderClosingCard: withBrandFont(renderClosingCard), renderStatCard: withBrandFont(renderStatCard), renderCompareCard: withBrandFont(renderCompareCard), renderExpertCard: withBrandFont(renderExpertCard), readableOn, contrast, metroListNotice, periodLabel, palette, onColor, CAPTION_BAND, PORTRAIT_ZONE, CANVAS, BRAND_FONTS, LAYOUT_NAMES, GEOM };
