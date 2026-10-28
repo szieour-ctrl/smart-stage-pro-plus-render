@@ -460,7 +460,8 @@ async function compareSvg(p, cv) {
   const pct = Number(l.percent);
   if (!(pct >= 0 && pct <= 200)) throw new Error("renderCompareCard: left.percent must be a number");
   const total = Number(r.total), hi = Number(r.highlighted);
-  if (!Number.isInteger(total) || !Number.isInteger(hi) || total < 1 || total > 42 || hi < 0 || hi > total) throw new Error("renderCompareCard: right.highlighted/total must be whole numbers with highlighted <= total <= 42");
+  // The dot grid draws one dot per listing, so a bigger market (e.g. 56 active listings) shows the same share as a bar (see DOT_GRID_MAX).
+  if (!Number.isInteger(total) || !Number.isInteger(hi) || total < 1 || total > 100000 || hi < 0 || hi > total) throw new Error("renderCompareCard: right.highlighted/total must be whole numbers with highlighted <= total");
   const leftParts = [{ t: `${Number.isInteger(pct) ? pct : pct.toFixed(1)}%` }];
   const rightParts = [{ t: String(hi) }, { t: " of ", s: 0.55 }, { t: String(total) }];
 
@@ -507,6 +508,12 @@ async function compareSvg(p, cv) {
       svg += `<rect x="${bx}" y="${y}" width="${bw}" height="${bh}" rx="${bh / 2}" fill="${pal.panel}" fill-opacity="0.14"/>
   <rect x="${bx}" y="${y}" width="${Math.max(bh, Math.round(bw * Math.min(pct, 100) / 100))}" height="${bh}" rx="${bh / 2}" fill="${cpal.gold}"/>`;
       y += bh + (portrait ? 30 : 24);
+    } else if (total > (portrait ? DOT_GRID_MAX.portrait : DOT_GRID_MAX.landscape)) {
+      // too many listings for one dot each: the highlighted share of the total as a bar, same look as the left card
+      const bw = innerW - 20, bh = portrait ? 18 : 16, bx = cx - bw / 2, share = hi / total;
+      svg += `<rect x="${bx}" y="${y}" width="${bw}" height="${bh}" rx="${bh / 2}" fill="#FFFFFF" fill-opacity="0.12" stroke="#FFFFFF" stroke-opacity="0.55" stroke-width="2"/>`;
+      if (hi > 0) svg += `<rect x="${bx}" y="${y}" width="${Math.max(bh, Math.round(bw * share))}" height="${bh}" rx="${bh / 2}" fill="${cpal.gold}"/>`;
+      y += bh + (portrait ? 30 : 24);
     } else {
       // dot grid: total dots, first `hi` highlighted; rows fill left to right
       const cols = total <= 14 ? 7 : Math.min(10, Math.ceil(total / 3)), rows = Math.ceil(total / cols);
@@ -540,6 +547,8 @@ async function compareSvg(p, cv) {
 </svg>`;
   return { svg: body, warnings: [], fits: cards.every((c) => c.fits), textBottom: Math.max(...cards.map((c) => c.bottom)), limit: cardTop + cardH - 18 };
 }
+// One dot per listing only fits up to these totals (measured: 9:16 holds 30, 16:9 holds 14); a bigger market shows the same share as a bar.
+const DOT_GRID_MAX = { portrait: 30, landscape: 14 };
 async function renderCompareCard(params, outPng, canvas = "portrait") {
   const cv = CANVAS[canvas] || CANVAS.portrait;
   const r = await compareSvg(params, cv);
