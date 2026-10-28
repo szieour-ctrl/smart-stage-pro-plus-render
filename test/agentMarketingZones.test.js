@@ -77,3 +77,15 @@ test("an unknown layout name is refused, and a missing period still stops a new 
   await assert.rejects(() => R.renderOpeningCard({ period, agent, market: "x", headline: "y", layout: "nope" }, path.join(dir, "bad.png")), /Unknown opening layout/);
   await assert.rejects(() => R.renderOpeningCard({ agent, market: "x", headline: "y", layout: "news_brief" }, path.join(dir, "bad2.png")), /MetroList notice required/);
 });
+
+test("a closing headline too long for landscape drops its tagline and support instead of failing", async () => {
+  const render = require("../src/lib/agentMarketingRender");
+  const m = { brand: { agent }, notice_required: false, source_line: { text: "Sources: Zillow, Freddie Mac.", label: "Sources" } };
+  const long = ["If you're wondering how all of this fits your own plans, I'd", "love a quick conversation—no pressure, just numbers that actually cover your neighborhood."];
+  const scene = { n: 5, composition: "closing_headline_focus", data: { headline: long, support: "Curious how September's numbers affect your plans? Let's talk.", tagline: "Pricing · Condition · Competition" } };
+  const r = await render.renderSceneCard(m, scene, "landscape", null, path.join(dir, "long_close_landscape.png"), null);
+  assert.ok(r.warnings.some((w) => /left off to fit/.test(w)), "the dropped lines are reported as a warning");
+  // A card that fits keeps everything and reports nothing.
+  const ok = await render.renderSceneCard(m, { ...scene, data: { ...scene.data, headline: ["Want to talk through where", "your home fits in this picture?"] } }, "landscape", null, path.join(dir, "short_close_landscape.png"), null);
+  assert.ok(!ok.warnings.some((w) => /left off to fit/.test(w)));
+});

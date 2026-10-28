@@ -122,9 +122,23 @@ async function renderSceneCard(m, scene, canvas, headshotBuf, outPng, plateBuf) 
   const tz = textZones(scene, canvas, zopts);
   let style = null, legibility = null;
   if (imageMode(m) && plateBuf) style = await styleMod.styleFor(plateBuf, cv, tz);
+  // A headline that still runs past its zone at the smallest size must not fail the Reel: the opening and closing cards give up their
+  // secondary lines first (closing: tagline, then support; opening: eyebrow), and only a headline that cannot fit alone is an error.
+  const droppable = { closing: ["tagline", "support"], opening: ["eyebrow"] }[kind] || [];
+  const dropped = [];
+  const draw = async () => {
+    for (;;) {
+      const params = { ...cardParams(m, scene, headshotBuf, style), ...lay, ...(scene.layout_options || {}) };
+      dropped.forEach((k) => { params[k] = ""; });
+      const out = await fn(params, outPng, canvas);
+      const next = out.fits ? null : droppable.find((k) => !dropped.includes(k));
+      if (!next) return out;
+      dropped.push(next);
+    }
+  };
   let r;
   for (let attempt = 0; ; attempt++) {
-    r = await fn({ ...cardParams(m, scene, headshotBuf, style), ...lay, ...(scene.layout_options || {}) }, outPng, canvas);
+    r = await draw();
     if (!r.fits) throw new Error(`Scene ${scene.n} (${scene.composition}) does not fit its zone on ${canvas}`);
     if (!style) break;
     // Measure what was actually drawn against the picture; if too much of the ink is under the floor, add scrim and draw again.
@@ -135,6 +149,7 @@ async function renderSceneCard(m, scene, canvas, headshotBuf, outPng, plateBuf) 
   const verdict = await zones.checkCard(scene.composition, canvas, outPng, zopts);
   if (!verdict.ok) throw new Error(`Scene ${scene.n} (${scene.composition}) layout problem on ${canvas}: ${verdict.problems.join("; ")}`);
   const warnings = [...(r.warnings || [])];
+  if (dropped.length) warnings.push(`scene ${scene.n}: the ${dropped.join(" and ")} line${dropped.length > 1 ? "s were" : " was"} left off to fit the ${canvas} frame`);
   if (legibility && legibility.ratioOfInkPixels > 0.04) warnings.push(`text over the picture is hard to read in ${Math.round(legibility.ratioOfInkPixels * 100)}% of the headline area`);
   return { png: outPng, warnings, style: style && { ink: style.ink, accent: style.accent, scrim: style.scrim }, legibility };
 }
@@ -267,4 +282,4 @@ async function renderAgentMarketing(job, onStep = () => {}, deps = {}) {
   }
 }
 
-module.exports = { renderAgentMarketing, backgroundClip, captionLayer, verifyNoticeInFrame, motionExpr, FORMAT_CANVAS, voiceShapeFilter };
+module.exports = { renderAgentMarketing, renderSceneCard, backgroundClip, captionLayer, verifyNoticeInFrame, motionExpr, FORMAT_CANVAS, voiceShapeFilter };
