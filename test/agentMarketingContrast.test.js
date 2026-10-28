@@ -27,3 +27,16 @@ test("navy brand: the '6 of 14' figure is visible on the navy card", async () =>
   let light = 0; for (let i = 0; i < raw.length; i += 3) if (raw[i] > 120 && raw[i + 1] > 120) light++;
   assert.ok(light > 800, `figure pixels visible: ${light}`);
 });
+
+test("a market of more than 42 listings (28 of 56) draws a share bar instead of failing; small markets keep the dot grid", async () => {
+  const dir = require("fs").mkdtempSync(require("path").join(require("os").tmpdir(), "amc-"));
+  const mk = (hi, total) => ({ market: "Antelope", period: { start: "2026-08-27", end: "2026-10-27" }, brand: { primary: "#012169", secondary: "#012169", border: "#FFFFFF", font: "Roboto" }, agent: { name: "A" },
+    left: { lead: "Homes That Closed Sold At", percent: 99.8, caption: "of list price on average" }, right: { lead: "But Here in the Active Market,", highlighted: hi, total, caption: "listings have already taken a price reduction." } });
+  for (const canvas of ["portrait", "landscape"]) {
+    for (const [hi, total] of [[28, 56], [15, 30], [16, 31], [7, 14], [8, 15]]) {
+      const r = await cards.renderCompareCard(mk(hi, total), `${dir}/c_${canvas}_${total}.png`, canvas);
+      assert.ok(r.fits, `${hi} of ${total} fits on the ${canvas} card`);
+    }
+  }
+  await assert.rejects(() => cards.renderCompareCard(mk(30, 28), `${dir}/bad.png`, "portrait"), /highlighted <= total/);
+});
