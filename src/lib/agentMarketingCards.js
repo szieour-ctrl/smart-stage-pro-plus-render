@@ -17,6 +17,7 @@
 // The MetroList notice and the period are built HERE from the report's date window (never typed
 // by the planner or the model). Caption band: captions go in CAPTION_BAND[canvas], above the
 // notice bar; no card puts anything inside it.
+const fs = require("fs");
 const sharp = require("sharp");
 
 const CANVAS = {
@@ -58,7 +59,9 @@ function fontsFor(brand, style) {
   const f = brand && BRAND_FONTS.includes(brand.font) ? brand.font : null;
   return f ? { display: f, body: f } : DEFAULT_FONTS;
 }
-const withBrandFont = (fn) => (params, ...rest) => fontCtx.run(fontsFor(params && params.brand, params && params.style), () => fn(params, ...rest));
+// params.disclosure (the approved AI-image disclosure, from the manifest) rides along in the same per-render context, so noticeBar() can draw it
+// in the bottom source bar of the opening and closing cards without every layout having to pass it through.
+const withBrandFont = (fn) => (params, ...rest) => fontCtx.run({ ...fontsFor(params && params.brand, params && params.style), disclosure: (params && params.disclosure) || "" }, () => fn(params, ...rest));
 
 const typo = (s) => String(s ?? "").replace(/'/g, "\u2019");
 const esc = (s) => typo(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
@@ -182,18 +185,57 @@ const T = (x, y, text, { size, weight = 400, family = D(), fill, anchor = "start
 const dataUri = (b) => `data:image/png;base64,${b.toString("base64")}`;
 
 // Shared pieces ---------------------------------------------------------------
+// The bottom bar carries the source notice (MetroList notice or the web source line) and, when the picture behind the card is AI-generated, the
+// AI-image disclosure on its own last line (Sam, Oct 29, 2026). With a disclosure the notice may shrink (never below 20 px) to make room; without
+// one the bar is exactly what it was.
 async function noticeBar(cv, pal, noticeText) {
   const n = cv.notice, top = cv.h - n.h;
-  if (!noticeText) return { svg: "", top: cv.h };
-  const font = { family: B(), weight: 500, size: n.size };
-  const lines = await wrap(noticeText, n.maxW, font);
-  const lh = Math.round(n.size * 1.38), block = lines.length * lh;
-  if (block > n.h - 20) throw new Error(`The notice or source line is too long for its bar (${lines.length} lines); shorten it rather than clip it`);
-  const y0 = top + Math.round((n.h - block) / 2) + Math.round(n.size * 1.02);
+  const dis = String((fontCtx.getStore() || {}).disclosure || "").trim();
+  if (!noticeText && !dis) return { svg: "", top: cv.h };
+  let disSize = Math.round(n.size * 0.74);
+  while (dis && disSize > 14 && (await measure(dis, { family: B(), weight: 500, size: disSize })) > n.maxW) disSize -= 1;
+  const disH = dis ? Math.round(disSize * 1.7) : 0;
+  let size = n.size, lines = [], lh = 0, block = 0;
+  if (noticeText) {
+    const floor = dis ? 20 : n.size;
+    for (;;) {
+      lines = await wrap(noticeText, n.maxW, { family: B(), weight: 500, size });
+      lh = Math.round(size * 1.38); block = lines.length * lh;
+      if (block <= n.h - disH - 20 || size <= floor) break;
+      size -= 1;
+    }
+    if (block > n.h - disH - 20) throw new Error(`The notice or source line is too long for its bar (${lines.length} lines); shorten it rather than clip it`);
+  }
+  const y0 = top + Math.round((n.h - disH - block) / 2) + Math.round(size * 1.02);
   const svg = `<rect x="0" y="${top}" width="${cv.w}" height="${n.h}" fill="${pal.panel}"/>
   <rect x="0" y="${top}" width="${cv.w}" height="3" fill="${pal.gold}"/>
-  ${lines.map((l, i) => T(cv.w / 2, y0 + i * lh, l, { size: n.size, weight: 500, family: B(), fill: "#FFFFFF", anchor: "middle", opacity: 0.95 })).join("\n  ")}`;
+  ${lines.map((l, i) => T(cv.w / 2, y0 + i * lh, l, { size, weight: 500, family: B(), fill: "#FFFFFF", anchor: "middle", opacity: 0.95 })).join("\n  ")}
+  ${dis ? T(cv.w / 2, top + n.h - Math.round(disH * 0.32), dis, { size: disSize, weight: 500, family: B(), fill: "#FFFFFF", anchor: "middle", opacity: 0.9 }) : ""}`;
   return { svg, top };
+}
+
+/**
+ * The AI-image disclosure on a middle card (stat, comparison, statement): a soft dark fade and one centred line in the bottom edge, below the
+ * card's own source footer and clear of the caption band. Drawn onto the finished card PNG after its layout has been checked.
+ */
+async function applyDisclosure(pngPath, canvas, text, params) {
+  const cv = CANVAS[canvas] || CANVAS.portrait, portrait = cv === CANVAS.portrait;
+  const dis = String(text || "").trim();
+  if (!dis) return pngPath;
+  return fontCtx.run({ ...fontsFor(params && params.brand, params && params.style), disclosure: "" }, async () => {
+    let size = portrait ? 21 : 18;
+    while (size > 14 && (await measure(dis, { family: B(), weight: 500, size })) > cv.w - 2 * cv.marginX) size -= 1;
+    const fade = portrait ? 150 : 110, base = cv.h - (portrait ? 24 : 18);
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${cv.w}" height="${cv.h}">
+  <defs><linearGradient id="dz" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#000" stop-opacity="0"/><stop offset="1" stop-color="#000" stop-opacity="0.55"/></linearGradient></defs>
+  <rect x="0" y="${cv.h - fade}" width="${cv.w}" height="${fade}" fill="url(#dz)"/>
+  ${T(cv.w / 2, base, dis, { size, weight: 500, family: B(), fill: "#FFFFFF", anchor: "middle", opacity: 0.92 })}
+</svg>`;
+    const buf = await sharp(pngPath).composite([{ input: Buffer.from(svg), top: 0, left: 0 }]).png().toBuffer();
+    await sharp(buf).toFile(pngPath + ".tmp.png");
+    fs.renameSync(pngPath + ".tmp.png", pngPath);
+    return pngPath;
+  });
 }
 
 async function lockup(cv, pal, agent, hsBuf, { cx, cy, align = "left", circle = true }) {
@@ -698,4 +740,4 @@ async function renderClosingCard(params, outPng, canvas = "portrait") {
   return { png: outPng, warnings: r.warnings, fits: r.fits, textBottom: r.textBottom, limit: r.limit };
 }
 
-module.exports = { statText, renderOpeningCard: withBrandFont(renderOpeningCard), renderClosingCard: withBrandFont(renderClosingCard), renderStatCard: withBrandFont(renderStatCard), renderCompareCard: withBrandFont(renderCompareCard), renderExpertCard: withBrandFont(renderExpertCard), readableOn, contrast, metroListNotice, periodLabel, palette, onColor, CAPTION_BAND, PORTRAIT_ZONE, CANVAS, BRAND_FONTS, LAYOUT_NAMES, GEOM };
+module.exports = { applyDisclosure, statText, renderOpeningCard: withBrandFont(renderOpeningCard), renderClosingCard: withBrandFont(renderClosingCard), renderStatCard: withBrandFont(renderStatCard), renderCompareCard: withBrandFont(renderCompareCard), renderExpertCard: withBrandFont(renderExpertCard), readableOn, contrast, metroListNotice, periodLabel, palette, onColor, CAPTION_BAND, PORTRAIT_ZONE, CANVAS, BRAND_FONTS, LAYOUT_NAMES, GEOM };

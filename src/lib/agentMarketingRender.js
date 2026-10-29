@@ -93,7 +93,15 @@ function voiceShapeFilter(shape) {
 // text_style "image" (default): ink, accent and soft fades follow the picture behind each scene; the brand contributes only the
 // headshot, name and brokerage. "brand" keeps the legacy look (Brand DNA colours + font).
 const imageMode = (m) => !(m.brand && m.brand.text_style === "brand");
-function cardParams(m, scene, headshotBuf, style) {
+// AI-image disclosure (Sam, Oct 29, 2026): a scene shows it in a format when the manifest records that scene's picture as AI-generated for that
+// format. The wording comes only from the manifest (built by Netlify); a manifest without it (older jobs) draws nothing.
+const FORMAT_OF_CANVAS = { portrait: "9x16", landscape: "16x9" };
+function disclosureFor(m, scene, canvas) {
+  const text = m && m.disclosure && typeof m.disclosure.text === "string" ? m.disclosure.text.trim() : "";
+  const prov = scene && scene.visual && scene.visual.image_provenance;
+  return text && prov && prov[FORMAT_OF_CANVAS[canvas]] === "ai" ? text : "";
+}
+function cardParams(m, scene, headshotBuf, style, canvas) {
   const b = m.brand || {};
   const brand = style ? { border: b.border } : { primary: b.primary, secondary: b.secondary, border: b.border, font: b.font };
   // A web-research Reel carries a code-built source line instead of the MetroList notice (notice_required:false); the card's footer
@@ -103,7 +111,7 @@ function cardParams(m, scene, headshotBuf, style) {
   // A MetroList Market Summary has no date range, only its printed publication line; the Netlify-built notice text carries that line word for word.
   const printed = !sl && m.notice && m.notice.disclosure && m.notice.text ? m.notice.text : null;
   const common = { period: sl || printed ? undefined : m.notice && m.notice.period, ...(printed ? { noticeText: printed } : {}), ...(sl ? { noticeText: sl.text, sourceLabel: sl.label || "Sources" } : {}), brand, agent: b.agent, headshotBuf, style: style || undefined };
-  return { ...scene.data, ...common };
+  return { ...scene.data, ...common, disclosure: disclosureFor(m, scene, canvas) };
 }
 /** Zones where words sit directly on the picture (opaque panels and the notice bar are not part of it). */
 function textZones(scene, canvas, opts) {
@@ -128,7 +136,7 @@ async function renderSceneCard(m, scene, canvas, headshotBuf, outPng, plateBuf) 
   const dropped = [];
   const draw = async () => {
     for (;;) {
-      const params = { ...cardParams(m, scene, headshotBuf, style), ...lay, ...(scene.layout_options || {}) };
+      const params = { ...cardParams(m, scene, headshotBuf, style, canvas), ...lay, ...(scene.layout_options || {}) };
       dropped.forEach((k) => { params[k] = ""; });
       const out = await fn(params, outPng, canvas);
       const next = out.fits ? null : droppable.find((k) => !dropped.includes(k));
@@ -148,10 +156,14 @@ async function renderSceneCard(m, scene, canvas, headshotBuf, outPng, plateBuf) 
   }
   const verdict = await zones.checkCard(scene.composition, canvas, outPng, zopts);
   if (!verdict.ok) throw new Error(`Scene ${scene.n} (${scene.composition}) layout problem on ${canvas}: ${verdict.problems.join("; ")}`);
+  // Opening and closing cards carry the disclosure inside their bottom source bar (drawn with the card); a middle card gets it as a footer line now,
+  // after its layout has been checked, so the check keeps judging only the card's own text.
+  const disclosure = disclosureFor(m, scene, canvas);
+  if (disclosure && kind !== "opening" && kind !== "closing") await cards.applyDisclosure(outPng, canvas, disclosure, cardParams(m, scene, headshotBuf, style, canvas));
   const warnings = [...(r.warnings || [])];
   if (dropped.length) warnings.push(`scene ${scene.n}: the ${dropped.join(" and ")} line${dropped.length > 1 ? "s were" : " was"} left off to fit the ${canvas} frame`);
   if (legibility && legibility.ratioOfInkPixels > 0.04) warnings.push(`text over the picture is hard to read in ${Math.round(legibility.ratioOfInkPixels * 100)}% of the headline area`);
-  return { png: outPng, warnings, style: style && { ink: style.ink, accent: style.accent, scrim: style.scrim }, legibility };
+  return { png: outPng, disclosure: !!disclosure, warnings, style: style && { ink: style.ink, accent: style.accent, scrim: style.scrim }, legibility };
 }
 
 // ── after-the-fact checks ─────────────────────────────────────────────────────────────────────────────────────
@@ -173,6 +185,26 @@ async function verifyNoticeInFrame(video, sec, cardPng, canvas, outDir, label) {
   for (let i = 0; i < a.length; i++) sum += Math.abs(a[i] - b[i]);
   const meanDiff = sum / a.length;
   return { ok: meanDiff < 12, meanDiff: Math.round(meanDiff * 100) / 100, frame: framePng, sec: Math.round(sec * 100) / 100, region: zone };
+}
+
+/**
+ * Confirm the disclosure line is really in a finished frame. The card PNG tells exactly which pixels are the line (bright, opaque pixels in the
+ * bottom band; a soft fade is never opaque), so the same pixels in the finished video frame must be bright too, whatever the picture behind them.
+ */
+async function verifyDisclosureInFrame(video, cardPng, sec, canvas, outDir, label) {
+  const cv = cards.CANVAS[canvas], band = { left: Math.round(cv.w * 0.1), top: cv.h - (canvas === "portrait" ? 42 : 34), width: Math.round(cv.w * 0.8), height: canvas === "portrait" ? 36 : 30 }; // the line sits here on opening/closing bars and on middle-card footers
+  const framePng = await frameAt(video, sec, path.join(outDir, `${label}.png`));
+  const frame = await sharp(framePng).removeAlpha().extract(band).raw().toBuffer();
+  const { data: card, info } = await sharp(cardPng).ensureAlpha().extract(band).raw().toBuffer({ resolveWithObject: true });
+  let mask = 0, hit = 0;
+  for (let i = 0; i < band.width * band.height; i++) {
+    const c = i * info.channels, f = i * 3;
+    if (card[c + 3] >= 200 && Math.min(card[c], card[c + 1], card[c + 2]) >= 170) {
+      mask++;
+      if (Math.min(frame[f], frame[f + 1], frame[f + 2]) >= 150) hit++;
+    }
+  }
+  return { ok: mask >= 120 && hit / mask >= 0.8, linePixels: mask, shownInFrame: mask ? Math.round((100 * hit) / mask) / 100 : 0, frame: framePng, sec: Math.round(sec * 100) / 100 };
 }
 
 // ── the render ────────────────────────────────────────────────────────────────────────────────────────────────
@@ -234,7 +266,7 @@ async function renderAgentMarketing(job, onStep = () => {}, deps = {}) {
         "-map", "0:v", "-map", "[a]", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", base]);
 
       onStep(`Drawing the ${format} cards and captions`);
-      const layers = [], noticeCards = [];
+      const layers = [], noticeCards = [], disclosureCards = [];
       for (let i = 0; i < m.scenes.length; i++) {
         const sc = m.scenes[i], last = i === m.scenes.length - 1;
         const r = await renderSceneCard(m, sc, canvas, headshotBuf, path.join(dir, `card_${sc.n}.png`), fs.readFileSync(path.join(dir, `plate_${sc.n}`)));
@@ -245,6 +277,7 @@ async function renderAgentMarketing(job, onStep = () => {}, deps = {}) {
         const l = { png: r.png, startSec: start, fadeSec: 0.45 };
         if (!last) { l.endSec = sc.window.end - 0.02; l.fadeOutSec = 0.3; }
         layers.push(l);
+        if (r.disclosure) disclosureCards.push({ n: sc.n, png: r.png, mid: Math.max(start + 0.6, Math.min(sc.window.end - 0.4, start + 1.6)) < sc.window.end - 0.35 ? Math.max(start + 0.6, Math.min(sc.window.end - 0.4, start + 1.6)) : (start + sc.window.end) / 2, label: `disclosure_scene${sc.n}` });
         if (/^(opening|closing)_/.test(sc.composition)) noticeCards.push({ png: r.png, mid: last ? Math.max(start + 0.55, Math.min(total - 0.6, start + 1.6)) : Math.min(start + 1.6, (start + 0.5 + sc.window.end - 0.32) / 2), label: `notice_scene${sc.n}` });
       }
       for (let k = 0; k < m.captions.length; k++) {
@@ -263,7 +296,10 @@ async function renderAgentMarketing(job, onStep = () => {}, deps = {}) {
       fs.mkdirSync(checkDir, { recursive: true });
       const notices = [];
       for (const nc of noticeCards) notices.push(await verifyNoticeInFrame(outMp4, nc.mid, nc.png, canvas, checkDir, nc.label));
-      checks[format] = { durationSec: Math.round(dur * 100) / 100, notice: notices, noticeOk: notices.length > 0 && notices.every((n) => n.ok) };
+      const disclosures = [];
+      for (const dc of disclosureCards) disclosures.push({ scene: dc.n, ...(await verifyDisclosureInFrame(outMp4, dc.png, dc.mid, canvas, checkDir, dc.label)) });
+      checks[format] = { durationSec: Math.round(dur * 100) / 100, notice: notices, noticeOk: notices.length > 0 && notices.every((n) => n.ok), disclosure: { expectedScenes: disclosureCards.map((d) => d.n), checked: disclosures, ok: disclosures.every((d) => d.ok) } };
+      if (!checks[format].disclosure.ok) throw new Error(`The AI image disclosure could not be confirmed on every applicable scene of the finished ${format} video (scenes ${disclosures.filter((d) => !d.ok).map((d) => d.scene).join(", ")})`);
       if (!checks[format].noticeOk) throw new Error(`The MetroList notice could not be confirmed in the finished ${format} video`);
 
       if (job.outDir) {
@@ -282,4 +318,4 @@ async function renderAgentMarketing(job, onStep = () => {}, deps = {}) {
   }
 }
 
-module.exports = { renderAgentMarketing, renderSceneCard, backgroundClip, captionLayer, verifyNoticeInFrame, motionExpr, FORMAT_CANVAS, voiceShapeFilter };
+module.exports = { disclosureFor, verifyDisclosureInFrame, renderAgentMarketing, renderSceneCard, backgroundClip, captionLayer, verifyNoticeInFrame, motionExpr, FORMAT_CANVAS, voiceShapeFilter };
