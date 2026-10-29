@@ -210,7 +210,7 @@ async function noticeBar(cv, pal, noticeText) {
   const svg = `<rect x="0" y="${top}" width="${cv.w}" height="${n.h}" fill="${pal.panel}"/>
   <rect x="0" y="${top}" width="${cv.w}" height="3" fill="${pal.gold}"/>
   ${lines.map((l, i) => T(cv.w / 2, y0 + i * lh, l, { size, weight: 500, family: B(), fill: "#FFFFFF", anchor: "middle", opacity: 0.95 })).join("\n  ")}
-  ${dis ? T(cv.w / 2, top + n.h - Math.round(disH * 0.32), dis, { size: disSize, weight: 500, family: B(), fill: "#FFFFFF", anchor: "middle", opacity: 0.9 }) : ""}`;
+  ${dis ? T(cv.w / 2, top + n.h - Math.round(disSize * 0.75), dis, { size: disSize, weight: 500, family: B(), fill: "#FFFFFF", anchor: "middle", opacity: 0.9 }) : ""}`;
   return { svg, top };
 }
 
