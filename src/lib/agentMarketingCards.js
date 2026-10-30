@@ -434,12 +434,14 @@ async function statSvg(p, cv) {
   const text = statText(p);
   const label = (p.sourceLabel || "MetroList") + (periodLabel(p.period) ? `  ·  ${periodLabel(p.period)}` : "");
   const colW = portrait ? cv.maxW : 1000;
+  const dir = p.direction === "down" || p.direction === "up" ? p.direction : null;
   const iconR = p.icon === "none" ? 0 : (portrait ? 70 : 64);
   let scale = 1, L;
   for (; scale >= 0.62; scale -= 0.04) {
     const ls = Math.round(cv.sub * scale);
     const leadLines = await wrap(p.lead || "", colW, { family: D(), weight: 500, size: ls });
-    const vs = await fitSize(text, colW, Math.round((portrait ? 270 : 250) * scale), 90, { family: D(), weight: 800 });
+    const arrowRoom = dir ? Math.round(Math.round((portrait ? 270 : 250) * scale) * 0.4) + 26 : 0;
+    const vs = await fitSize(text, colW - arrowRoom, Math.round((portrait ? 270 : 250) * scale), 90, { family: D(), weight: 800 });
     const trailMax = iconR ? colW - iconR * 2 - 50 : colW;
     const trailLines = await wrap(p.trail || "", trailMax, { family: D(), weight: 500, size: ls });
     let y = cv.top + 4;
@@ -455,6 +457,16 @@ async function statSvg(p, cv) {
   const iconCy = portrait ? L.trailTop + (L.trailLines.length * L.ls * 1.14) / 2 : L.valBase - L.vs * 0.36;
   const footY = portrait ? cv.h - 64 : cv.h - 46;
   const fig = await liningFigure(text, L.vs, pal.gold);
+  let arrow = "";
+  if (dir) {
+    const aw = Math.round(fig.h * 0.62), ah = Math.round(fig.h * 0.9);
+    const ax = X - 2 + fig.w + 26, ay = Math.round(L.valBase - fig.h + (fig.h - ah) / 2);
+    const sw = Math.round(aw * 0.36), cx = ax + aw / 2, hh = Math.round(ah * 0.5);
+    const d = dir === "down"
+      ? `M${cx - sw / 2} ${ay} H${cx + sw / 2} V${ay + ah - hh} H${ax + aw} L${cx} ${ay + ah} L${ax} ${ay + ah - hh} H${cx - sw / 2} Z`
+      : `M${cx - sw / 2} ${ay + ah} H${cx + sw / 2} V${ay + hh} H${ax + aw} L${cx} ${ay} L${ax} ${ay + hh} H${cx - sw / 2} Z`;
+    arrow = `<path d="${d}" fill="${pal.gold}"/>`;
+  }
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${cv.w}" height="${cv.h}">
   <defs>
     <linearGradient id="lt" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${pal.scrimC}" stop-opacity="${pal.so(0.5)}"/><stop offset="1" stop-color="${pal.scrimC}" stop-opacity="0"/></linearGradient>
@@ -466,6 +478,7 @@ async function statSvg(p, cv) {
   <rect x="${X}" y="${L.rule1}" width="145" height="4" fill="${pal.gold}"/>
   ${L.leadLines.map((l, i) => T(X, L.leadBase + i * L.ls * 1.14, l, { size: L.ls, weight: 500, fill: pal.ink })).join("\n  ")}
   <image href="${dataUri(fig.buf)}" x="${X - 2}" y="${Math.round(L.valBase - fig.h)}" width="${fig.w}" height="${fig.h}"/>
+  ${arrow}
   ${L.trailLines.map((l, i) => T(X, L.trailBase + i * L.ls * 1.14, l, { size: L.ls, weight: 500, fill: pal.ink })).join("\n  ")}
   ${iconR ? calendarIcon(iconCx, iconCy, iconR, pal) : ""}
   <rect x="${X}" y="${L.rule2}" width="145" height="3" fill="${pal.gold}"/>
