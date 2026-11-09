@@ -7,6 +7,7 @@
 //                       headshot circle and the name block
 // Built as a factory so it can use the card helpers without a circular require.
 "use strict";
+const { logoPlate } = require("./agentMarketingLogo");
 
 module.exports = function makeLayouts(h) {
   const { sharp, CANVAS, palette, onColor, measure, wrap, fitSize, T, dataUri, usableImage, circleHeadshot, noticeBar, needNotice, periodLabel, D, B, esc } = h;
@@ -82,7 +83,10 @@ module.exports = function makeLayouts(h) {
     let svg = bar ? `<rect x="${x - 22}" y="${Math.round(top)}" width="4" height="${Math.round(hgt)}" fill="${pal.gold}"/>` : "";
     nameLines.forEach((l, i) => { svg += T(x, top + ns * 0.86 + i * nLH, l, { size: ns, weight: 600, fill: color }); });
     brkLines.forEach((l, i) => { svg += T(x, top + nameLines.length * nLH + 14 + brkSize + i * bLH, l, { size: brkSize, weight: 500, family: B(), fill: color, spacing: 5, opacity: 0.95 }); });
-    return { svg, height: hgt, top };
+    let textW = 0;
+    for (const l of nameLines) textW = Math.max(textW, await measure(l, { family: D(), weight: 600, size: ns }));
+    for (const l of brkLines) textW = Math.max(textW, await measure(l, brkFont));
+    return { svg, height: hgt, top, right: x + textW };
   }
 
   async function panelImage(buf, w, hgt) {
@@ -118,9 +122,16 @@ module.exports = function makeLayouts(h) {
         const nw = haveHs ? cv.maxW - g.panelW - g.nameGap - 22 : cv.maxW - 22;
         const nbk = await nameBlock(cv, pal, agent, { x: nx, cy: g.panelTop + g.panelH - 120, maxW: nw, color: pal.ink, nameSize: 58, brkSize: 22 });
         identity = nbk.svg;
+        // The column beside the 9:16 panel is narrow, so the logo stacks above the name block, left-aligned with it.
+        const x1 = side === "left" || !haveHs ? cv.w - cv.marginX : panelX - 24;
+        const logoMaxH = 120;
+        const lp = await logoPlate(p.logoBuf, { x0: nx, x1, cy: nbk.top - 28 - logoMaxH / 2, maxH: logoMaxH, align: "left" });
+        identity += lp.svg; if (lp.warning) warnings.push("logo: " + lp.warning);
       } else {
         const nbk = await nameBlock(cv, pal, agent, { x: X + 26, cy: cv.lockupCy, maxW: Math.min(maxW, 760), color: pal.ink, nameSize: 52, brkSize: 20 });
         identity = nbk.svg;
+        const lp = await logoPlate(p.logoBuf, { x0: nbk.right + 48, x1: X + maxW, cy: cv.lockupCy, maxH: Math.round(nbk.height + 30) });
+        identity += lp.svg; if (lp.warning) warnings.push("logo: " + lp.warning);
       }
     }
     // Soft scrim under the text column so the headline reads on a busy plate.
@@ -190,6 +201,10 @@ module.exports = function makeLayouts(h) {
     if (agent.name) {
       const nbk = await nameBlock(cv, pal, agent, { x: X + 22, cy: g.bandTop + g.bandH - (portrait ? 88 : 62), maxW: Math.min(textW, 720), color: "#FFFFFF", nameSize: portrait ? 46 : 38, brkSize: portrait ? 20 : 17 });
       identity = nbk.svg;
+      // Logo: beside the name block, right-aligned, kept below the headshot circle that sits at the band's upper right.
+      const nameCy = g.bandTop + g.bandH - (portrait ? 88 : 62);
+      const lp = await logoPlate(p.logoBuf, { x0: nbk.right + 48, x1: cv.w - X, cy: nameCy, maxH: Math.round(nbk.height + 30), minTop: haveHs ? g.bandTop + (portrait ? 70 : 40) + circleD + 18 : undefined });
+      identity += lp.svg; if (lp.warning) warnings.push("logo: " + lp.warning);
     }
     let circle = "";
     if (haveHs) {

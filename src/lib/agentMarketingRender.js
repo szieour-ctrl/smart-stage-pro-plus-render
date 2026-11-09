@@ -101,7 +101,7 @@ function disclosureFor(m, scene, canvas) {
   const prov = scene && scene.visual && scene.visual.image_provenance;
   return text && prov && prov[FORMAT_OF_CANVAS[canvas]] === "ai" ? text : "";
 }
-function cardParams(m, scene, headshotBuf, style, canvas) {
+function cardParams(m, scene, headshotBuf, style, canvas, logoBuf) {
   const b = m.brand || {};
   const brand = style ? { border: b.border } : { primary: b.primary, secondary: b.secondary, border: b.border, font: b.font };
   // A web-research Reel carries a code-built source line instead of the MetroList notice (notice_required:false); the card's footer
@@ -110,7 +110,7 @@ function cardParams(m, scene, headshotBuf, style, canvas) {
   if (m.notice_required === false && !(sl && sl.text)) throw new Error("This Reel has no source line and no MetroList notice; one of them is required.");
   // A MetroList Market Summary has no date range, only its printed publication line; the Netlify-built notice text carries that line word for word.
   const printed = !sl && m.notice && m.notice.disclosure && m.notice.text ? m.notice.text : null;
-  const common = { period: sl || printed ? undefined : m.notice && m.notice.period, ...(printed ? { noticeText: printed } : {}), ...(sl ? { noticeText: sl.text, sourceLabel: sl.label || "Sources" } : {}), brand, agent: b.agent, headshotBuf, style: style || undefined };
+  const common = { period: sl || printed ? undefined : m.notice && m.notice.period, ...(printed ? { noticeText: printed } : {}), ...(sl ? { noticeText: sl.text, sourceLabel: sl.label || "Sources" } : {}), brand, agent: b.agent, headshotBuf, ...(logoBuf ? { logoBuf } : {}), style: style || undefined };
   return { ...scene.data, ...common, disclosure: disclosureFor(m, scene, canvas) };
 }
 /** Zones where words sit directly on the picture (opaque panels and the notice bar are not part of it). */
@@ -119,7 +119,7 @@ function textZones(scene, canvas, opts) {
   const out = [z.headline_zone || z.editorial_content_zone, z.agent_name_zone, z.agent_identity_zone].filter(Boolean);
   return out;
 }
-async function renderSceneCard(m, scene, canvas, headshotBuf, outPng, plateBuf) {
+async function renderSceneCard(m, scene, canvas, headshotBuf, outPng, plateBuf, logoBuf) {
   const map = zones.COMPOSITION_LAYOUT[scene.composition];
   if (!map) throw new Error(`Scene ${scene.n}: no renderer for composition "${scene.composition}"`);
   const [kind, layout] = map;
@@ -136,7 +136,7 @@ async function renderSceneCard(m, scene, canvas, headshotBuf, outPng, plateBuf) 
   const dropped = [];
   const draw = async () => {
     for (;;) {
-      const params = { ...cardParams(m, scene, headshotBuf, style, canvas), ...lay, ...(scene.layout_options || {}) };
+      const params = { ...cardParams(m, scene, headshotBuf, style, canvas, logoBuf), ...lay, ...(scene.layout_options || {}) };
       dropped.forEach((k) => { params[k] = ""; });
       const out = await fn(params, outPng, canvas);
       const next = out.fits ? null : droppable.find((k) => !dropped.includes(k));
@@ -234,6 +234,11 @@ async function renderAgentMarketing(job, onStep = () => {}, deps = {}) {
   try {
     onStep("Fetching the prepared assets");
     const headshotBuf = m.brand && m.brand.headshot_key ? await fetchAsset(m.brand.headshot_key) : null;
+    // The subscriber's logo is optional: a missing or unreachable one only adds a warning; the Reel is made without it.
+    let logoBuf = null;
+    if (m.brand && m.brand.logo_key) {
+      try { logoBuf = await fetchAsset(m.brand.logo_key); } catch (e) { warnings.push("The logo could not be downloaded, so the Reel was made without it."); }
+    }
     const narrationPath = path.join(workDir, "narration.mp3");
     fs.writeFileSync(narrationPath, await fetchAsset(m.audio.narration_key));
     const total = m.scenes[m.scenes.length - 1].window.end;
@@ -269,7 +274,7 @@ async function renderAgentMarketing(job, onStep = () => {}, deps = {}) {
       const layers = [], noticeCards = [], disclosureCards = [];
       for (let i = 0; i < m.scenes.length; i++) {
         const sc = m.scenes[i], last = i === m.scenes.length - 1;
-        const r = await renderSceneCard(m, sc, canvas, headshotBuf, path.join(dir, `card_${sc.n}.png`), fs.readFileSync(path.join(dir, `plate_${sc.n}`)));
+        const r = await renderSceneCard(m, sc, canvas, headshotBuf, path.join(dir, `card_${sc.n}.png`), fs.readFileSync(path.join(dir, `plate_${sc.n}`)), logoBuf);
         (checks.style = checks.style || {})[`${format}_${sc.n}`] = { style: r.style, legibility: r.legibility && r.legibility.ratioOfInkPixels };
         r.warnings.forEach((w) => warnings.push(`${format} scene ${sc.n}: ${w}`));
         // a figure card can be told to wait for the moment its number is spoken (card_start_sec); the picture and captions play meanwhile

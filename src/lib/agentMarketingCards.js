@@ -19,6 +19,7 @@
 // notice bar; no card puts anything inside it.
 const fs = require("fs");
 const sharp = require("sharp");
+const { logoPlate } = require("./agentMarketingLogo");
 
 const CANVAS = {
   portrait: {
@@ -238,7 +239,7 @@ async function applyDisclosure(pngPath, canvas, text, params) {
   });
 }
 
-async function lockup(cv, pal, agent, hsBuf, { cx, cy, align = "left", circle = true }) {
+async function lockup(cv, pal, agent, hsBuf, { cx, cy, align = "left", circle = true, logo }) {
   const name = agent.name || "";
   const brokerage = String(agent.brokerage || "").toUpperCase();
   const r = cv.hs / 2;
@@ -264,6 +265,12 @@ async function lockup(cv, pal, agent, hsBuf, { cx, cy, align = "left", circle = 
   out += `<rect x="${x - 26}" y="${Math.round(barTop)}" width="4" height="${Math.round(barH)}" fill="${pal.gold}"/>`;
   out += T(x, barTop + nameSize * 0.86, name, { size: nameSize, weight: 600, fill: "#FFFFFF" });
   brkLines.forEach((l, i) => { out += T(x, barTop + nameSize + brkSize + 22 + i * brkLH, l, { size: brkSize, weight: 500, family: B(), fill: "#FFFFFF", spacing: brkSpacing, opacity: 0.95 }); });
+  // The subscriber's logo, to the right of the name block in the same row (only beside the headshot lockup; see agentMarketingLogo.js).
+  if (logo && logo.buf && circle && hsBuf && align === "left") {
+    const lp = await logoPlate(logo.buf, { x0: x + textW + 48, x1: logo.x1, cy, maxH: Math.round(cv.hs * 0.6) });
+    out += lp.svg;
+    if (lp.warning && logo.warnings) logo.warnings.push(lp.warning);
+  }
   return out;
 }
 
@@ -316,6 +323,7 @@ async function openingSvg(p, cv) {
     if (y <= cv.bottomLimit) break;
   }
   const L = layout;
+  const logoWarnings = [];
   const lockTop = nb.top - (cv === CANVAS.portrait ? 0 : 0);
   const lockCy = cv.lockupCy;
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${cv.w}" height="${cv.h}">
@@ -327,10 +335,10 @@ async function openingSvg(p, cv) {
   ${L.subLines.map((l, i) => T(X, L.subBase + i * L.ss * 1.14, l, { size: L.ss, weight: 500, fill: pal.ink })).join("\n  ")}
   ${L.eyeLines.map((l, i) => T(X, L.eyeBase + i * L.es * 1.5, l, { size: L.es, weight: 500, family: B(), fill: pal.ink, spacing: 5 })).join("\n  ")}
   <rect x="${X}" y="${L.rule3}" width="90" height="3" fill="${pal.gold}"/>
-  ${agent.name ? await lockup(cv, pal, agent, hs, { cx: X, cy: lockCy, circle: true }) : ""}
+  ${agent.name ? await lockup(cv, pal, agent, hs, { cx: X, cy: lockCy, circle: true, logo: { buf: p.logoBuf, x1: cv.w - X, warnings: logoWarnings } }) : ""}
   ${nb.svg}
 </svg>`;
-  return { svg, warnings: notice ? [] : ["no MetroList notice (noNotice was set)"], textBottom: L.bottom, limit: cv.bottomLimit, fits: L.bottom <= cv.bottomLimit };
+  return { svg, warnings: [...(notice ? [] : ["no MetroList notice (noNotice was set)"]), ...logoWarnings.map((w) => "logo: " + w)], textBottom: L.bottom, limit: cv.bottomLimit, fits: L.bottom <= cv.bottomLimit };
 }
 
 // Closing ---------------------------------------------------------------------
@@ -369,10 +377,11 @@ async function closingSvg(p, cv) {
   // Lockup: headshot variant sits bottom-left like the opening; portrait variant leaves the portrait zone clear
   // and puts the name block bottom-right.
   let lock = "";
+  const logoWarnings = [];
   if (agent.name) {
     // 9:16: portrait zone is bottom-left, so the name block goes bottom-right. 16:9: portrait zone is the
     // right half, so the name block stays bottom-left (no circle).
-    if (variant !== "portrait") lock = await lockup(cv, pal, agent, hs, { cx: X, cy: cv.lockupCy, circle: true });
+    if (variant !== "portrait") lock = await lockup(cv, pal, agent, hs, { cx: X, cy: cv.lockupCy, circle: true, logo: { buf: p.logoBuf, x1: cv.w - X, warnings: logoWarnings } });
     else if (cv === CANVAS.portrait) lock = await lockup(cv, pal, agent, null, { cx: cv.w - cv.marginX, cy: 1480, align: "right", circle: false });
     else lock = await lockup(cv, pal, agent, null, { cx: X + 26, cy: cv.lockupCy, circle: false });
   }
@@ -387,7 +396,7 @@ async function closingSvg(p, cv) {
   ${lock}
   ${nb.svg}
 </svg>`;
-  return { svg, warnings: notice ? [] : ["no MetroList notice (noNotice was set)"], textBottom: L.bottom, limit: cv.bottomLimit, fits: L.bottom <= cv.bottomLimit };
+  return { svg, warnings: [...(notice ? [] : ["no MetroList notice (noNotice was set)"]), ...logoWarnings.map((w) => "logo: " + w)], textBottom: L.bottom, limit: cv.bottomLimit, fits: L.bottom <= cv.bottomLimit };
 }
 
 // Playfair's default figures are old-style (a "4" drops below the line). librsvg can't switch the font
