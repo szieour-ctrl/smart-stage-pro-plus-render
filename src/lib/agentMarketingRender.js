@@ -101,6 +101,14 @@ function disclosureFor(m, scene, canvas) {
   const prov = scene && scene.visual && scene.visual.image_provenance;
   return text && prov && prov[FORMAT_OF_CANVAS[canvas]] === "ai" ? text : "";
 }
+// Article credit (Nov 12, 2026): a Reel that carries the MetroList notice credits the approved article on the scene(s) the manifest names. The text comes only from
+// the manifest (built and checked by Netlify). That scene draws on the article, not the MetroList report, so its footer drops the MetroList label.
+function creditFor(m, scene) {
+  const c = m && m.notice_required !== false ? m.source_credit : null;
+  const text = c && typeof c.text === "string" ? c.text.trim() : "";
+  const isMiddle = scene && !/^(opening|closing)_/.test(scene.composition || "");
+  return text && isMiddle && Array.isArray(c.scenes) && c.scenes.includes(scene.n) && scene.source_role === "article" ? text : "";
+}
 function cardParams(m, scene, headshotBuf, style, canvas) {
   const b = m.brand || {};
   const brand = style ? { border: b.border } : { primary: b.primary, secondary: b.secondary, border: b.border, font: b.font };
@@ -111,7 +119,7 @@ function cardParams(m, scene, headshotBuf, style, canvas) {
   // A MetroList Market Summary has no date range, only its printed publication line; the Netlify-built notice text carries that line word for word.
   const printed = !sl && m.notice && m.notice.disclosure && m.notice.text ? m.notice.text : null;
   const common = { period: sl || printed ? undefined : m.notice && m.notice.period, ...(printed ? { noticeText: printed } : {}), ...(sl ? { noticeText: sl.text, sourceLabel: sl.label || "Sources" } : {}), brand, agent: b.agent, headshotBuf, style: style || undefined };
-  return { ...scene.data, ...common, disclosure: disclosureFor(m, scene, canvas) };
+  return { ...scene.data, ...common, disclosure: disclosureFor(m, scene, canvas), ...(creditFor(m, scene) ? { hideFooter: true } : {}) };
 }
 /** Zones where words sit directly on the picture (opaque panels and the notice bar are not part of it). */
 function textZones(scene, canvas, opts) {
@@ -160,10 +168,13 @@ async function renderSceneCard(m, scene, canvas, headshotBuf, outPng, plateBuf) 
   // after its layout has been checked, so the check keeps judging only the card's own text.
   const disclosure = disclosureFor(m, scene, canvas);
   if (disclosure && kind !== "opening" && kind !== "closing") await cards.applyDisclosure(outPng, canvas, disclosure, cardParams(m, scene, headshotBuf, style, canvas));
+  // the article credit goes on after the disclosure, above it; the disclosure's fade (when there is one) already darkens the strip
+  const creditText = creditFor(m, scene);
+  const credit = creditText ? await cards.applySourceCredit(outPng, canvas, creditText, cardParams(m, scene, headshotBuf, style, canvas), { withFade: !disclosure }) : null;
   const warnings = [...(r.warnings || [])];
   if (dropped.length) warnings.push(`scene ${scene.n}: the ${dropped.join(" and ")} line${dropped.length > 1 ? "s were" : " was"} left off to fit the ${canvas} frame`);
   if (legibility && legibility.ratioOfInkPixels > 0.04) warnings.push(`text over the picture is hard to read in ${Math.round(legibility.ratioOfInkPixels * 100)}% of the headline area`);
-  return { png: outPng, disclosure: !!disclosure, warnings, style: style && { ink: style.ink, accent: style.accent, scrim: style.scrim }, legibility };
+  return { png: outPng, disclosure: !!disclosure, credit: credit ? { text: creditText, size: credit.size, lines: credit.lines.length, band: credit.band } : null, warnings, style: style && { ink: style.ink, accent: style.accent, scrim: style.scrim }, legibility };
 }
 
 // ── after-the-fact checks ─────────────────────────────────────────────────────────────────────────────────────
@@ -205,6 +216,25 @@ async function verifyDisclosureInFrame(video, cardPng, sec, canvas, outDir, labe
     }
   }
   return { ok: mask >= 120 && hit / mask >= 0.8, linePixels: mask, shownInFrame: mask ? Math.round((100 * hit) / mask) / 100 : 0, frame: framePng, sec: Math.round(sec * 100) / 100 };
+}
+
+/**
+ * Confirm the article credit is really in a finished frame: the card PNG's bright, opaque pixels in the credit's band are the credit's letters, so the same
+ * pixels in the video frame must be bright too. The band sits above the disclosure line and below the caption band, so nothing else is in it.
+ */
+async function verifyCreditInFrame(video, cardPng, sec, band, outDir, label) {
+  const framePng = await frameAt(video, sec, path.join(outDir, `${label}.png`));
+  const frame = await sharp(framePng).removeAlpha().extract(band).raw().toBuffer();
+  const { data: card, info } = await sharp(cardPng).ensureAlpha().extract(band).raw().toBuffer({ resolveWithObject: true });
+  let mask = 0, hit = 0;
+  for (let i = 0; i < band.width * band.height; i++) {
+    const c = i * info.channels, f = i * 3;
+    if (card[c + 3] >= 200 && Math.min(card[c], card[c + 1], card[c + 2]) >= 170) {
+      mask++;
+      if (Math.min(frame[f], frame[f + 1], frame[f + 2]) >= 150) hit++;
+    }
+  }
+  return { ok: mask >= 300 && hit / mask >= 0.8, linePixels: mask, shownInFrame: mask ? Math.round((100 * hit) / mask) / 100 : 0, frame: framePng, sec: Math.round(sec * 100) / 100 };
 }
 
 // ── the render ────────────────────────────────────────────────────────────────────────────────────────────────
@@ -266,7 +296,7 @@ async function renderAgentMarketing(job, onStep = () => {}, deps = {}) {
         "-map", "0:v", "-map", "[a]", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", base]);
 
       onStep(`Drawing the ${format} cards and captions`);
-      const layers = [], noticeCards = [], disclosureCards = [];
+      const layers = [], noticeCards = [], disclosureCards = [], creditCards = [];
       for (let i = 0; i < m.scenes.length; i++) {
         const sc = m.scenes[i], last = i === m.scenes.length - 1;
         const r = await renderSceneCard(m, sc, canvas, headshotBuf, path.join(dir, `card_${sc.n}.png`), fs.readFileSync(path.join(dir, `plate_${sc.n}`)));
@@ -278,6 +308,7 @@ async function renderAgentMarketing(job, onStep = () => {}, deps = {}) {
         if (!last) { l.endSec = sc.window.end - 0.02; l.fadeOutSec = 0.3; }
         layers.push(l);
         if (r.disclosure) disclosureCards.push({ n: sc.n, png: r.png, mid: Math.max(start + 0.6, Math.min(sc.window.end - 0.4, start + 1.6)) < sc.window.end - 0.35 ? Math.max(start + 0.6, Math.min(sc.window.end - 0.4, start + 1.6)) : (start + sc.window.end) / 2, label: `disclosure_scene${sc.n}` });
+        if (r.credit) creditCards.push({ n: sc.n, png: r.png, band: r.credit.band, lines: r.credit.lines, mid: Math.max(start + 0.6, Math.min(sc.window.end - 0.4, start + 1.6)) < sc.window.end - 0.35 ? Math.max(start + 0.6, Math.min(sc.window.end - 0.4, start + 1.6)) : (start + sc.window.end) / 2, label: `credit_scene${sc.n}` });
         if (/^(opening|closing)_/.test(sc.composition)) noticeCards.push({ png: r.png, mid: last ? Math.max(start + 0.55, Math.min(total - 0.6, start + 1.6)) : Math.min(start + 1.6, (start + 0.5 + sc.window.end - 0.32) / 2), label: `notice_scene${sc.n}` });
       }
       for (let k = 0; k < m.captions.length; k++) {
@@ -298,8 +329,12 @@ async function renderAgentMarketing(job, onStep = () => {}, deps = {}) {
       for (const nc of noticeCards) notices.push(await verifyNoticeInFrame(outMp4, nc.mid, nc.png, canvas, checkDir, nc.label));
       const disclosures = [];
       for (const dc of disclosureCards) disclosures.push({ scene: dc.n, ...(await verifyDisclosureInFrame(outMp4, dc.png, dc.mid, canvas, checkDir, dc.label)) });
-      checks[format] = { durationSec: Math.round(dur * 100) / 100, notice: notices, noticeOk: notices.length > 0 && notices.every((n) => n.ok), disclosure: { expectedScenes: disclosureCards.map((d) => d.n), checked: disclosures, ok: disclosures.every((d) => d.ok) } };
+      const credits = [];
+      for (const cc of creditCards) credits.push({ scene: cc.n, lines: cc.lines, ...(await verifyCreditInFrame(outMp4, cc.png, cc.mid, cc.band, checkDir, cc.label)) });
+      const expectedCredit = m.notice_required !== false && m.source_credit && Array.isArray(m.source_credit.scenes) ? m.scenes.filter((x) => creditFor(m, x)).map((x) => x.n) : [];
+      checks[format] = { durationSec: Math.round(dur * 100) / 100, notice: notices, noticeOk: notices.length > 0 && notices.every((n) => n.ok), disclosure: { expectedScenes: disclosureCards.map((d) => d.n), checked: disclosures, ok: disclosures.every((d) => d.ok) }, credit: { expectedScenes: expectedCredit, checked: credits, ok: credits.length === expectedCredit.length && credits.every((c) => c.ok) } };
       if (!checks[format].disclosure.ok) throw new Error(`The AI image disclosure could not be confirmed on every applicable scene of the finished ${format} video (scenes ${disclosures.filter((d) => !d.ok).map((d) => d.scene).join(", ")})`);
+      if (!checks[format].credit.ok) throw new Error(`The article source credit could not be confirmed on every credited scene of the finished ${format} video (scenes ${expectedCredit.filter((n) => !credits.some((c) => c.scene === n && c.ok)).join(", ")})`);
       if (!checks[format].noticeOk) throw new Error(`The MetroList notice could not be confirmed in the finished ${format} video`);
 
       if (job.outDir) {
@@ -318,4 +353,4 @@ async function renderAgentMarketing(job, onStep = () => {}, deps = {}) {
   }
 }
 
-module.exports = { disclosureFor, verifyDisclosureInFrame, renderAgentMarketing, renderSceneCard, backgroundClip, captionLayer, verifyNoticeInFrame, motionExpr, FORMAT_CANVAS, voiceShapeFilter };
+module.exports = { disclosureFor, creditFor, verifyDisclosureInFrame, verifyCreditInFrame, renderAgentMarketing, renderSceneCard, backgroundClip, captionLayer, verifyNoticeInFrame, motionExpr, FORMAT_CANVAS, voiceShapeFilter };

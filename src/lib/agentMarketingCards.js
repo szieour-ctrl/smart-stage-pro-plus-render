@@ -238,6 +238,44 @@ async function applyDisclosure(pngPath, canvas, text, params) {
   });
 }
 
+/**
+ * Where the article credit sits on a middle card, per canvas (Nov 12, 2026): in the bottom strip, above the AI-image disclosure line and well below the caption band.
+ * Portrait takes up to two lines, landscape one. Baselines are measured up from the bottom edge so they never reach the disclosure's baseline.
+ */
+function creditGeometry(canvas) {
+  const cv = CANVAS[canvas] || CANVAS.portrait, portrait = cv === CANVAS.portrait;
+  return { cv, portrait, maxW: cv.w - 2 * cv.marginX, maxLines: portrait ? 2 : 1, startSize: portrait ? 21 : 19, lastBaseline: cv.h - (portrait ? 60 : 46), fade: portrait ? 150 : 110,
+    band: { left: Math.round(cv.w * 0.1), top: cv.h - (portrait ? 108 : 74), width: Math.round(cv.w * 0.8), height: portrait ? 62 : 40 } };
+}
+/**
+ * The article's source credit on a middle card: one or two centred lines, drawn onto the finished card PNG after its layout has been checked (like the AI
+ * disclosure). It is never narrated and never part of the captions. withFade: false when the disclosure's own fade is already on the card.
+ * Throws (rather than clipping) if the credit cannot fit its lines at 15 px or more.
+ */
+async function applySourceCredit(pngPath, canvas, text, params, { withFade = true } = {}) {
+  const credit = String(text || "").trim();
+  if (!credit) return null;
+  const g = creditGeometry(canvas), cv = g.cv;
+  return fontCtx.run({ ...fontsFor(params && params.brand, params && params.style), disclosure: "" }, async () => {
+    let size = g.startSize, lines;
+    for (;; size--) {
+      lines = await wrap(credit, g.maxW, { family: B(), weight: 500, size });
+      if (lines.length <= g.maxLines || size <= 15) break;
+    }
+    if (lines.length > g.maxLines) throw new Error(`The article credit is too long for its line (${lines.length} lines); shorten it rather than clip it`);
+    const lh = Math.round(size * 1.3), first = g.lastBaseline - (lines.length - 1) * lh;
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${cv.w}" height="${cv.h}">
+  <defs><linearGradient id="cz" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#000" stop-opacity="0"/><stop offset="1" stop-color="#000" stop-opacity="0.55"/></linearGradient></defs>
+  ${withFade ? `<rect x="0" y="${cv.h - g.fade}" width="${cv.w}" height="${g.fade}" fill="url(#cz)"/>` : ""}
+  ${lines.map((l, i) => T(cv.w / 2, first + i * lh, l, { size, weight: 500, family: B(), fill: "#FFFFFF", anchor: "middle", opacity: 0.92 })).join("\n  ")}
+</svg>`;
+    const buf = await sharp(pngPath).composite([{ input: Buffer.from(svg), top: 0, left: 0 }]).png().toBuffer();
+    await sharp(buf).toFile(pngPath + ".tmp.png");
+    fs.renameSync(pngPath + ".tmp.png", pngPath);
+    return { size, lines, band: g.band };
+  });
+}
+
 async function lockup(cv, pal, agent, hsBuf, { cx, cy, align = "left", circle = true }) {
   const name = agent.name || "";
   const brokerage = String(agent.brokerage || "").toUpperCase();
@@ -482,7 +520,7 @@ async function statSvg(p, cv) {
   ${L.trailLines.map((l, i) => T(X, L.trailBase + i * L.ls * 1.14, l, { size: L.ls, weight: 500, fill: pal.ink })).join("\n  ")}
   ${iconR ? calendarIcon(iconCx, iconCy, iconR, pal) : ""}
   <rect x="${X}" y="${L.rule2}" width="145" height="3" fill="${pal.gold}"/>
-  ${T(X, footY, label.toUpperCase(), { size: portrait ? 24 : 20, weight: 500, family: B(), fill: "#FFFFFF", spacing: 5, opacity: 0.95 })}
+  ${p.hideFooter ? "" : T(X, footY, label.toUpperCase(), { size: portrait ? 24 : 20, weight: 500, family: B(), fill: "#FFFFFF", spacing: 5, opacity: 0.95 })}
 </svg>`;
   return { svg, warnings: [], textBottom: L.bottom, limit: cv.bottomLimit + (portrait ? 250 : 120), fits: L.bottom <= cv.bottomLimit + (portrait ? 250 : 120) };
 }
@@ -608,7 +646,7 @@ async function compareSvg(p, cv) {
   ${T(X - 4, cv.top + 4 + 40 + ts * 0.8, p.market || "", { size: ts, weight: 800, fill: pal.ink })}
   ${T(X - 2, cv.top + 4 + 40 + ts * 0.8 + 10 + ks * 0.82, p.kind || "Market Update", { size: ks, weight: 600, fill: pal.gold })}
   ${svg}
-  ${T(cv.w / 2, footY, label.toUpperCase(), { size: portrait ? 24 : 20, weight: 500, family: B(), fill: "#FFFFFF", spacing: 5, anchor: "middle", opacity: 0.95 })}
+  ${p.hideFooter ? "" : T(cv.w / 2, footY, label.toUpperCase(), { size: portrait ? 24 : 20, weight: 500, family: B(), fill: "#FFFFFF", spacing: 5, anchor: "middle", opacity: 0.95 })}
 </svg>`;
   return { svg: body, warnings: [], fits: cards.every((c) => c.fits), textBottom: Math.max(...cards.map((c) => c.bottom)), limit: cardTop + cardH - 18 };
 }
@@ -718,7 +756,7 @@ async function expertSvg(p, cv) {
   ${L.stl.map((l, i) => T(X, L.stBase + i * L.ss * 1.14, l, { size: L.ss, weight: 500, fill: pal.ink })).join("\n  ")}
   ${L.sul.map((l, i) => T(X, L.suBase + i * L.us * 1.45, l, { size: L.us, weight: 500, family: B(), fill: pal.ink, opacity: 0.9 })).join("\n  ")}
   ${svg}
-  ${T(X, footY, label.toUpperCase(), { size: portrait ? 24 : 20, weight: 500, family: B(), fill: "#FFFFFF", spacing: 5, opacity: 0.95 })}
+  ${p.hideFooter ? "" : T(X, footY, label.toUpperCase(), { size: portrait ? 24 : 20, weight: 500, family: B(), fill: "#FFFFFF", spacing: 5, opacity: 0.95 })}
 </svg>`;
   return { svg: body, warnings: [], fits: L.bottom <= limit, textBottom: L.bottom, limit };
 }
@@ -753,4 +791,4 @@ async function renderClosingCard(params, outPng, canvas = "portrait") {
   return { png: outPng, warnings: r.warnings, fits: r.fits, textBottom: r.textBottom, limit: r.limit };
 }
 
-module.exports = { applyDisclosure, statText, renderOpeningCard: withBrandFont(renderOpeningCard), renderClosingCard: withBrandFont(renderClosingCard), renderStatCard: withBrandFont(renderStatCard), renderCompareCard: withBrandFont(renderCompareCard), renderExpertCard: withBrandFont(renderExpertCard), readableOn, contrast, metroListNotice, periodLabel, palette, onColor, CAPTION_BAND, PORTRAIT_ZONE, CANVAS, BRAND_FONTS, LAYOUT_NAMES, GEOM };
+module.exports = { applyDisclosure, applySourceCredit, creditGeometry, statText, renderOpeningCard: withBrandFont(renderOpeningCard), renderClosingCard: withBrandFont(renderClosingCard), renderStatCard: withBrandFont(renderStatCard), renderCompareCard: withBrandFont(renderCompareCard), renderExpertCard: withBrandFont(renderExpertCard), readableOn, contrast, metroListNotice, periodLabel, palette, onColor, CAPTION_BAND, PORTRAIT_ZONE, CANVAS, BRAND_FONTS, LAYOUT_NAMES, GEOM };
