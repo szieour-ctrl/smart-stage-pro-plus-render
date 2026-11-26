@@ -368,7 +368,7 @@ async function openingSvg(p, cv) {
   ${agent.name ? await lockup(cv, pal, agent, hs, { cx: X, cy: lockCy, circle: true }) : ""}
   ${nb.svg}
 </svg>`;
-  return { svg, warnings: notice ? [] : ["no MetroList notice (noNotice was set)"], textBottom: L.bottom, limit: cv.bottomLimit, fits: L.bottom <= cv.bottomLimit };
+  return { svg, warnings: notice ? [] : ["no MetroList notice (noNotice was set)"], textBottom: L.bottom, limit: cv.bottomLimit, fits: L.bottom <= cv.bottomLimit, headshot: hs && agent.name ? { x: X, y: lockCy - cv.hs / 2, w: cv.hs, h: cv.hs, shape: "circle" } : null };
 }
 
 // Closing ---------------------------------------------------------------------
@@ -425,7 +425,7 @@ async function closingSvg(p, cv) {
   ${lock}
   ${nb.svg}
 </svg>`;
-  return { svg, warnings: notice ? [] : ["no MetroList notice (noNotice was set)"], textBottom: L.bottom, limit: cv.bottomLimit, fits: L.bottom <= cv.bottomLimit };
+  return { svg, warnings: notice ? [] : ["no MetroList notice (noNotice was set)"], textBottom: L.bottom, limit: cv.bottomLimit, fits: L.bottom <= cv.bottomLimit, headshot: hs && agent.name && variant !== "portrait" ? { x: X, y: cv.lockupCy - cv.hs / 2, w: cv.hs, h: cv.hs, shape: "circle" } : null };
 }
 
 // Playfair's default figures are old-style (a "4" drops below the line). librsvg can't switch the font
@@ -782,13 +782,13 @@ async function renderOpeningCard(params, outPng, canvas = "portrait") {
   const cv = CANVAS[canvas] || CANVAS.portrait;
   const r = await pickLayout("opening", params, cv, openingSvg);
   await sharp(Buffer.from(r.svg)).png().toFile(outPng);
-  return { png: outPng, warnings: r.warnings, fits: r.fits, textBottom: r.textBottom, limit: r.limit };
+  return { png: outPng, warnings: r.warnings, fits: r.fits, textBottom: r.textBottom, limit: r.limit, headshot: r.headshot || null };
 }
 async function renderClosingCard(params, outPng, canvas = "portrait") {
   const cv = CANVAS[canvas] || CANVAS.portrait;
   const r = await pickLayout("closing", params, cv, closingSvg);
   await sharp(Buffer.from(r.svg)).png().toFile(outPng);
-  return { png: outPng, warnings: r.warnings, fits: r.fits, textBottom: r.textBottom, limit: r.limit };
+  return { png: outPng, warnings: r.warnings, fits: r.fits, textBottom: r.textBottom, limit: r.limit, headshot: r.headshot || null };
 }
 
 module.exports = { applyDisclosure, applySourceCredit, creditGeometry, statText, renderOpeningCard: withBrandFont(renderOpeningCard), renderClosingCard: withBrandFont(renderClosingCard), renderStatCard: withBrandFont(renderStatCard), renderCompareCard: withBrandFont(renderCompareCard), renderExpertCard: withBrandFont(renderExpertCard), readableOn, contrast, metroListNotice, periodLabel, palette, onColor, CAPTION_BAND, PORTRAIT_ZONE, CANVAS, BRAND_FONTS, LAYOUT_NAMES, GEOM };
