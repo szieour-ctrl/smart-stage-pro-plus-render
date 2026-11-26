@@ -42,6 +42,14 @@ const CANVAS = {
     portraitZone: { x: 1060, y: 120, w: 760, h: 820 },
   },
 };
+const isPortrait = (cv) => cv.w < cv.h;
+// Lip-sync scenes draw a larger headshot (the talking clip fills it, so a small circle is hard to watch). The circle is centred on the same line,
+// so its top edge rises by half the growth; the text above stops that much higher, and the text sizes itself to fit as usual.
+const HEADSHOT_GROWTH = 1.4;
+function withBigHeadshot(cv) {
+  const hs = Math.round(cv.hs * HEADSHOT_GROWTH);
+  return { ...cv, hs, bottomLimit: cv.bottomLimit - Math.round((hs - cv.hs) / 2) };
+}
 const CAPTION_BAND = { portrait: CANVAS.portrait.captionBand, landscape: CANVAS.landscape.captionBand };
 const PORTRAIT_ZONE = { portrait: CANVAS.portrait.portraitZone, landscape: CANVAS.landscape.portraitZone };
 
@@ -219,7 +227,7 @@ async function noticeBar(cv, pal, noticeText) {
  * card's own source footer and clear of the caption band. Drawn onto the finished card PNG after its layout has been checked.
  */
 async function applyDisclosure(pngPath, canvas, text, params) {
-  const cv = CANVAS[canvas] || CANVAS.portrait, portrait = cv === CANVAS.portrait;
+  const cv = CANVAS[canvas] || CANVAS.portrait, portrait = isPortrait(cv);
   const dis = String(text || "").trim();
   if (!dis) return pngPath;
   return fontCtx.run({ ...fontsFor(params && params.brand, params && params.style), disclosure: "" }, async () => {
@@ -243,7 +251,7 @@ async function applyDisclosure(pngPath, canvas, text, params) {
  * Portrait takes up to two lines, landscape one. Baselines are measured up from the bottom edge so they never reach the disclosure's baseline.
  */
 function creditGeometry(canvas) {
-  const cv = CANVAS[canvas] || CANVAS.portrait, portrait = cv === CANVAS.portrait;
+  const cv = CANVAS[canvas] || CANVAS.portrait, portrait = isPortrait(cv);
   return { cv, portrait, maxW: cv.w - 2 * cv.marginX, maxLines: portrait ? 2 : 1, startSize: portrait ? 21 : 19, lastBaseline: cv.h - (portrait ? 60 : 46), fade: portrait ? 150 : 110,
     band: { left: Math.round(cv.w * 0.1), top: cv.h - (portrait ? 108 : 74), width: Math.round(cv.w * 0.8), height: portrait ? 62 : 40 } };
 }
@@ -281,8 +289,8 @@ async function lockup(cv, pal, agent, hsBuf, { cx, cy, align = "left", circle = 
   const brokerage = String(agent.brokerage || "").toUpperCase();
   const r = cv.hs / 2;
   const textMaxW = align === "right" ? 560 : cv.maxW - (circle ? cv.hs + 40 : 0);
-  const nameSize = await fitSize(name, textMaxW, cv === CANVAS.portrait ? 64 : 52, 34, { family: D(), weight: 600 });
-  const brkSize = cv === CANVAS.portrait ? 24 : 20, brkSpacing = 5;
+  const nameSize = await fitSize(name, textMaxW, isPortrait(cv) ? 64 : 52, 34, { family: D(), weight: 600 });
+  const brkSize = isPortrait(cv) ? 24 : 20, brkSpacing = 5;
   const brkFont = { family: B(), weight: 500, size: brkSize, spacing: brkSpacing };
   const brkLines = brokerage ? (await wrap(brokerage, textMaxW, brkFont)).slice(0, 2) : [];
   const nameW = await measure(name, { family: D(), weight: 600, size: nameSize });
@@ -310,11 +318,12 @@ const scrims = (cv, lockTop, which, pal) => `<defs>
     <linearGradient id="lb" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#000" stop-opacity="0"/><stop offset="1" stop-color="#000" stop-opacity="0.6"/></linearGradient>
     <linearGradient id="ll" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="${pal.scrimC}" stop-opacity="${pal.so(0.5)}"/><stop offset="1" stop-color="${pal.scrimC}" stop-opacity="0"/></linearGradient>
   </defs>
-  ${cv === CANVAS.portrait || which === "top" ? `<rect x="0" y="0" width="${cv.w}" height="${Math.round(cv.h * 0.58)}" fill="url(#lt)"/>` : `<rect x="0" y="0" width="${Math.round(cv.w * 0.62)}" height="${cv.h}" fill="url(#ll)"/>`}
+  ${isPortrait(cv) || which === "top" ? `<rect x="0" y="0" width="${cv.w}" height="${Math.round(cv.h * 0.58)}" fill="url(#lt)"/>` : `<rect x="0" y="0" width="${Math.round(cv.w * 0.62)}" height="${cv.h}" fill="url(#ll)"/>`}
   <rect x="0" y="${lockTop - 160}" width="${cv.w}" height="${cv.h - lockTop + 160}" fill="url(#lb)"/>`;
 
 // Opening ---------------------------------------------------------------------
 async function openingSvg(p, cv) {
+  if (p.bigHeadshot) cv = withBigHeadshot(cv);
   const pal = palette(p.brand, p.style);
   const agent = p.agent || {};
   const hs = (await usableImage(p.headshotBuf)) ? await circleHeadshot(p.headshotBuf, cv.hs) : null;
@@ -354,7 +363,7 @@ async function openingSvg(p, cv) {
     if (y <= cv.bottomLimit) break;
   }
   const L = layout;
-  const lockTop = nb.top - (cv === CANVAS.portrait ? 0 : 0);
+  const lockTop = nb.top - (isPortrait(cv) ? 0 : 0);
   const lockCy = cv.lockupCy;
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${cv.w}" height="${cv.h}">
   ${scrims(cv, lockCy - cv.hs / 2 - 20, "both", pal)}
@@ -373,6 +382,7 @@ async function openingSvg(p, cv) {
 
 // Closing ---------------------------------------------------------------------
 async function closingSvg(p, cv) {
+  if (p.bigHeadshot) cv = withBigHeadshot(cv);
   const pal = palette(p.brand, p.style);
   const agent = p.agent || {};
   const variant = p.variant === "portrait" ? "portrait" : "headshot";
@@ -411,7 +421,7 @@ async function closingSvg(p, cv) {
     // 9:16: portrait zone is bottom-left, so the name block goes bottom-right. 16:9: portrait zone is the
     // right half, so the name block stays bottom-left (no circle).
     if (variant !== "portrait") lock = await lockup(cv, pal, agent, hs, { cx: X, cy: cv.lockupCy, circle: true });
-    else if (cv === CANVAS.portrait) lock = await lockup(cv, pal, agent, null, { cx: cv.w - cv.marginX, cy: 1480, align: "right", circle: false });
+    else if (isPortrait(cv)) lock = await lockup(cv, pal, agent, null, { cx: cv.w - cv.marginX, cy: 1480, align: "right", circle: false });
     else lock = await lockup(cv, pal, agent, null, { cx: X + 26, cy: cv.lockupCy, circle: false });
   }
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${cv.w}" height="${cv.h}">
@@ -467,7 +477,7 @@ function statText(p) {
 
 async function statSvg(p, cv) {
   const pal = palette(p.brand, p.style);
-  const portrait = cv === CANVAS.portrait;
+  const portrait = isPortrait(cv);
   const X = cv.marginX;
   const text = statText(p);
   const label = (p.sourceLabel || "MetroList") + (periodLabel(p.period) ? `  ·  ${periodLabel(p.period)}` : "");
@@ -555,7 +565,7 @@ function houseIcon(cx, cy, s, color, pal, badge) {
 
 async function compareSvg(p, cv) {
   const pal = palette(p.brand, p.style);
-  const portrait = cv === CANVAS.portrait;
+  const portrait = isPortrait(cv);
   const X = cv.marginX;
   const l = p.left || {}, r = p.right || {};
   const label = (p.sourceLabel || "MetroList") + (periodLabel(p.period) ? `  ·  ${periodLabel(p.period)}` : "");
@@ -688,7 +698,7 @@ function pointIcon(kind, cx, cy, r, pal) {
 
 async function expertSvg(p, cv) {
   const pal = palette(p.brand, p.style);
-  const portrait = cv === CANVAS.portrait;
+  const portrait = isPortrait(cv);
   const X = cv.marginX;
   const pts = p.points || [];
   if (pts.length > 3) throw new Error("renderExpertCard: points must have 0 to 3 items");
@@ -791,4 +801,5 @@ async function renderClosingCard(params, outPng, canvas = "portrait") {
   return { png: outPng, warnings: r.warnings, fits: r.fits, textBottom: r.textBottom, limit: r.limit, headshot: r.headshot || null };
 }
 
-module.exports = { applyDisclosure, applySourceCredit, creditGeometry, statText, renderOpeningCard: withBrandFont(renderOpeningCard), renderClosingCard: withBrandFont(renderClosingCard), renderStatCard: withBrandFont(renderStatCard), renderCompareCard: withBrandFont(renderCompareCard), renderExpertCard: withBrandFont(renderExpertCard), readableOn, contrast, metroListNotice, periodLabel, palette, onColor, CAPTION_BAND, PORTRAIT_ZONE, CANVAS, BRAND_FONTS, LAYOUT_NAMES, GEOM };
+module.exports = {
+  withBigHeadshot, HEADSHOT_GROWTH, applyDisclosure, applySourceCredit, creditGeometry, statText, renderOpeningCard: withBrandFont(renderOpeningCard), renderClosingCard: withBrandFont(renderClosingCard), renderStatCard: withBrandFont(renderStatCard), renderCompareCard: withBrandFont(renderCompareCard), renderExpertCard: withBrandFont(renderExpertCard), readableOn, contrast, metroListNotice, periodLabel, palette, onColor, CAPTION_BAND, PORTRAIT_ZONE, CANVAS, BRAND_FONTS, LAYOUT_NAMES, GEOM };

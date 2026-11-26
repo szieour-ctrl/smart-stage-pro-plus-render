@@ -128,7 +128,7 @@ function textZones(scene, canvas, opts) {
   const out = [z.headline_zone || z.editorial_content_zone, z.agent_name_zone, z.agent_identity_zone].filter(Boolean);
   return out;
 }
-async function renderSceneCard(m, scene, canvas, headshotBuf, outPng, plateBuf) {
+async function renderSceneCard(m, scene, canvas, headshotBuf, outPng, plateBuf, opts = {}) {
   const map = zones.COMPOSITION_LAYOUT[scene.composition];
   if (!map) throw new Error(`Scene ${scene.n}: no renderer for composition "${scene.composition}"`);
   const [kind, layout] = map;
@@ -146,6 +146,7 @@ async function renderSceneCard(m, scene, canvas, headshotBuf, outPng, plateBuf) 
   const draw = async () => {
     for (;;) {
       const params = { ...cardParams(m, scene, headshotBuf, style, canvas), ...lay, ...(scene.layout_options || {}) };
+      if (opts.bigHeadshot) params.bigHeadshot = true;
       dropped.forEach((k) => { params[k] = ""; });
       const out = await fn(params, outPng, canvas);
       const next = out.fits ? null : droppable.find((k) => !dropped.includes(k));
@@ -301,24 +302,30 @@ async function renderAgentMarketing(job, onStep = () => {}, deps = {}) {
       const lipItems = [];
       for (let i = 0; i < m.scenes.length; i++) {
         const sc = m.scenes[i], last = i === m.scenes.length - 1;
-        const r = await renderSceneCard(m, sc, canvas, headshotBuf, path.join(dir, `card_${sc.n}.png`), fs.readFileSync(path.join(dir, `plate_${sc.n}`)));
+        // Optional lip-sync clip for this scene (opening/closing): fetched first, so the card can draw the larger headshot only when a clip will use it.
+        const lreq = lipSync.requestFor(sc);
+        let clipPath = null, clipDur = 0, clipFail = null;
+        if (lreq) {
+          try {
+            clipPath = path.join(dir, `lip_${sc.n}.mp4`);
+            fs.writeFileSync(clipPath, await fetchAsset(lreq.clipKey));
+            clipDur = await probeDuration(clipPath);
+            if (!(clipDur > 0.5)) throw new Error("the clip has no usable video");
+          } catch (e) { clipFail = String(e.message).slice(0, 120); clipPath = null; }
+        }
+        const r = await renderSceneCard(m, sc, canvas, headshotBuf, path.join(dir, `card_${sc.n}.png`), fs.readFileSync(path.join(dir, `plate_${sc.n}`)), { bigHeadshot: !!clipPath });
         (checks.style = checks.style || {})[`${format}_${sc.n}`] = { style: r.style, legibility: r.legibility && r.legibility.ratioOfInkPixels };
         r.warnings.forEach((w) => warnings.push(`${format} scene ${sc.n}: ${w}`));
-        // Optional lip-sync clip for this scene (opening/closing). Anything that stops it from being used leaves the still headshot and is reported.
-        const lreq = lipSync.requestFor(sc);
+        // Anything that stops the clip from being used leaves the still headshot and is reported.
         if (lreq) {
           const note = (status, reason) => (lipsyncReport[format] = lipsyncReport[format] || []).push({ scene: sc.n, status, ...(reason ? { reason } : {}) });
-          const place = lipSync.placement(r.headshot);
-          if (!place) { warnings.push(`${format} scene ${sc.n}: no lip sync (this layout has no headshot area); the still headshot is shown`); note("fallback", "no headshot area in this layout"); }
+          const place = clipPath ? lipSync.placement(r.headshot) : null;
+          if (clipFail) { warnings.push(`${format} scene ${sc.n}: no lip sync (${clipFail}); the still headshot is shown`); note("fallback", clipFail); }
+          else if (!place) { warnings.push(`${format} scene ${sc.n}: no lip sync (this layout has no headshot area); the still headshot is shown`); note("fallback", "no headshot area in this layout"); }
           else {
-            try {
-              const clipPath = path.join(dir, `lip_${sc.n}.mp4`);
-              fs.writeFileSync(clipPath, await fetchAsset(lreq.clipKey));
-              const cd = await probeDuration(clipPath);
-              if (!(cd > 0.5)) throw new Error("the clip has no usable video");
-              lipItems.push({ n: sc.n, clip: clipPath, start: sc.window.start, end: sc.window.end, place, clipSec: cd });
-              note("used");
-            } catch (e) { warnings.push(`${format} scene ${sc.n}: no lip sync (${String(e.message).slice(0, 120)}); the still headshot is shown`); note("fallback", String(e.message).slice(0, 120)); }
+            // HeyGen's mouth runs about two frames ahead of its own audio (measured on the pilot clips), so the clip starts that much later.
+            lipItems.push({ n: sc.n, clip: clipPath, start: sc.window.start + lipSync.delayFor(sc), end: sc.window.end, place, clipSec: clipDur });
+            note("used");
           }
         }
         // a figure card can be told to wait for the moment its number is spoken (card_start_sec); the picture and captions play meanwhile

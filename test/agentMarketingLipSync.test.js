@@ -101,3 +101,41 @@ test("retry after a render failure: the same manifest renders again with the sam
   const b = await go("retry2", { open: "clipA", close: "clipB" });
   assert.deepStrictEqual(b.r.lipsync["9x16"].map((x) => x.status), ["used", "used"]);
 });
+
+test("delay: the clip starts two frames after its scene by default, can be overridden (0 to 0.3 s), and lands on the exact frame", async () => {
+  assert.strictEqual(L.delayFor({}), 0.08);
+  assert.strictEqual(L.delayFor({ lipsync: { clip_key: "k" } }), 0.08);
+  assert.strictEqual(L.delayFor({ lipsync: { clip_key: "k", delay_sec: 0.12 } }), 0.12);
+  assert.strictEqual(L.delayFor({ lipsync: { clip_key: "k", delay_sec: 5 } }), 0.3);
+  assert.strictEqual(L.delayFor({ lipsync: { clip_key: "k", delay_sec: -1 } }), 0);
+  // a clip whose picture flashes white at 1.0 s, placed on a scene starting at 2.0 s with the default delay: the flash must show at 3.08 s
+  const flash = path.join(dir, "flash.mp4"), base = path.join(dir, "flashbase.mp4"), out = path.join(dir, "flashout.mp4");
+  execFileSync("ffmpeg", ["-y", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=640x640:r=30:d=4,drawbox=x=0:y=0:w=640:h=640:color=white:t=fill:enable='between(t,1,1.2)'", "-c:v", "libx264", "-pix_fmt", "yuv420p", flash]);
+  execFileSync("ffmpeg", ["-y", "-v", "error", "-f", "lavfi", "-i", "color=c=gray:s=1080x1920:r=25:d=7", "-c:v", "libx264", "-pix_fmt", "yuv420p", base]);
+  await L.overlayClips(base, [{ n: 1, clip: flash, start: 2 + L.delayFor({}), end: 5, place: L.placement({ x: 100, y: 200, w: 400, h: 400, shape: "rect", rx: 0 }) }], out, dir);
+  const raw = execFileSync("ffmpeg", ["-v", "error", "-i", out, "-vf", "crop=100:100:250:350,scale=1:1,format=gray", "-f", "rawvideo", "-pix_fmt", "gray", "-"], { maxBuffer: 1 << 24 });
+  const first = [...raw].findIndex((b) => b > 200) / 25;
+  assert.ok(Math.abs(first - 3.08) < 0.001, `flash at ${first}`);
+});
+
+test("bigger headshot: 40% larger circle only when a clip will use it; the text still fits above it; the still headshot is unchanged otherwise", async () => {
+  const a = await assets();
+  for (const canvas of ["portrait", "landscape"]) {
+    for (const [scene, base] of [[manifest().scenes[0], "opening_headline_focus"], [manifest().scenes[2], "closing_headline_focus"]]) {
+      const sc = { ...scene, composition: base, lipsync: undefined };
+      const m = manifest();
+      const plate = a.p9;
+      const small = await R.renderSceneCard(m, sc, canvas, a.hs, path.join(dir, `s_${canvas}_${base}.png`), plate);
+      const big = await R.renderSceneCard(m, sc, canvas, a.hs, path.join(dir, `b_${canvas}_${base}.png`), plate, { bigHeadshot: true });
+      // renderSceneCard throws when the text does not fit its zone, so reaching here means it fit
+      assert.strictEqual(big.headshot.w, Math.round(small.headshot.w * 1.4));
+      assert.strictEqual(big.headshot.shape, "circle");
+      assert.ok(big.headshot.y + big.headshot.h / 2 === small.headshot.y + small.headshot.h / 2, "same centre line");
+    }
+  }
+});
+
+test("a clip that cannot be used leaves the normal-size still headshot", async () => {
+  const { r } = await go("smallfallback", { open: "bad", close: "bad" });
+  assert.deepStrictEqual(r.lipsync["9x16"].map((x) => x.status), ["fallback", "fallback"]);
+});
