@@ -629,6 +629,17 @@ app.get("/reel-status/:jobId", requireSecret, (req, res) => {
 const amJobs = new Map();
 setInterval(() => { const cut = Date.now() - 2 * 3600 * 1000; for (const [id, j] of amJobs) if (j.updatedAt < cut) amJobs.delete(id); }, 15 * 60 * 1000).unref();
 
+// POST /agent-marketing-excerpt  { url (presigned narration link), start, end }  ->  audio/mpeg
+// The exact seconds of SSP's narration for one scene, for the optional lip-sync clips. Cuts only; makes no outside call but the download.
+app.post("/agent-marketing-excerpt", requireSecret, async (req, res) => {
+  try {
+    const mp3 = await require("./lib/agentMarketingExcerpt").cutExcerpt(req.body || {});
+    res.set("Content-Type", "audio/mpeg").send(mp3);
+  } catch (e) {
+    res.status(e.status || 500).json({ error: String(e.message).slice(0, 200) });
+  }
+});
+
 app.post("/render-agent-marketing", requireSecret, (req, res) => {
   const job = req.body || {};
   if (!job.jobId || !job.manifest || job.manifest.version !== "am-manifest-2") {

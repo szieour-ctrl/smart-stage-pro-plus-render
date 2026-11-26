@@ -142,7 +142,7 @@ module.exports = function makeLayouts(h) {
   ${identity}
   ${nb.svg}
 </svg>`;
-    return { svg, warnings, textBottom: st.bottom, limit: g.stackLimit, fits: st.fits };
+    return { svg, warnings, textBottom: st.bottom, limit: g.stackLimit, fits: st.fits, headshot: haveHs ? { x: panelX, y: g.panelTop, w: g.panelW, h: g.panelH, shape: "rect", rx: 30 } : null };
   }
 
   // ---------- news brief ----------
@@ -218,7 +218,7 @@ module.exports = function makeLayouts(h) {
   ${nb.svg}
 </svg>`;
     const fits = bigBottom <= g.bigLimit && subBottom <= g.bandTop + g.bandH - (portrait ? 150 : 120);
-    return { svg, warnings, textBottom: Math.round(bigBottom), limit: g.bigLimit, fits };
+    return { svg, warnings, textBottom: Math.round(bigBottom), limit: g.bigLimit, fits, headshot: haveHs ? { x: cv.w - X - circleD, y: g.bandTop + (portrait ? 70 : 40), w: circleD, h: circleD, shape: "circle" } : null };
   }
 
   const LAYOUTS = { editorial_portrait: editorialPortrait, news_brief: newsBrief };

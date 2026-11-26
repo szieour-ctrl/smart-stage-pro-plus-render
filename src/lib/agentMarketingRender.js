@@ -18,6 +18,7 @@ const { execFile } = require("child_process");
 const cards = require("./agentMarketingCards");
 const zones = require("./agentMarketingZones");
 const styleMod = require("./agentMarketingStyle");
+const lipSync = require("./agentMarketingLipSync");
 const { compositeLayers, probeDuration } = require("./reelOverlay");
 
 const FPS = 25;
@@ -174,7 +175,7 @@ async function renderSceneCard(m, scene, canvas, headshotBuf, outPng, plateBuf) 
   const warnings = [...(r.warnings || [])];
   if (dropped.length) warnings.push(`scene ${scene.n}: the ${dropped.join(" and ")} line${dropped.length > 1 ? "s were" : " was"} left off to fit the ${canvas} frame`);
   if (legibility && legibility.ratioOfInkPixels > 0.04) warnings.push(`text over the picture is hard to read in ${Math.round(legibility.ratioOfInkPixels * 100)}% of the headline area`);
-  return { png: outPng, disclosure: !!disclosure, credit: credit ? { text: creditText, size: credit.size, lines: credit.lines.length, band: credit.band } : null, warnings, style: style && { ink: style.ink, accent: style.accent, scrim: style.scrim }, legibility };
+  return { png: outPng, headshot: r.headshot || null, disclosure: !!disclosure, credit: credit ? { text: creditText, size: credit.size, lines: credit.lines.length, band: credit.band } : null, warnings, style: style && { ink: style.ink, accent: style.accent, scrim: style.scrim }, legibility };
 }
 
 // ── after-the-fact checks ─────────────────────────────────────────────────────────────────────────────────────
@@ -260,7 +261,7 @@ async function renderAgentMarketing(job, onStep = () => {}, deps = {}) {
   const upload = deps.upload || (async (p, key) => require("./s3Upload").uploadReelDraft(p, key));
 
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), `am-${job.jobId}-`));
-  const warnings = [], outputs = {}, checks = {};
+  const warnings = [], outputs = {}, checks = {}, lipsyncReport = {};
   try {
     onStep("Fetching the prepared assets");
     const headshotBuf = m.brand && m.brand.headshot_key ? await fetchAsset(m.brand.headshot_key) : null;
@@ -297,11 +298,29 @@ async function renderAgentMarketing(job, onStep = () => {}, deps = {}) {
 
       onStep(`Drawing the ${format} cards and captions`);
       const layers = [], noticeCards = [], disclosureCards = [], creditCards = [];
+      const lipItems = [];
       for (let i = 0; i < m.scenes.length; i++) {
         const sc = m.scenes[i], last = i === m.scenes.length - 1;
         const r = await renderSceneCard(m, sc, canvas, headshotBuf, path.join(dir, `card_${sc.n}.png`), fs.readFileSync(path.join(dir, `plate_${sc.n}`)));
         (checks.style = checks.style || {})[`${format}_${sc.n}`] = { style: r.style, legibility: r.legibility && r.legibility.ratioOfInkPixels };
         r.warnings.forEach((w) => warnings.push(`${format} scene ${sc.n}: ${w}`));
+        // Optional lip-sync clip for this scene (opening/closing). Anything that stops it from being used leaves the still headshot and is reported.
+        const lreq = lipSync.requestFor(sc);
+        if (lreq) {
+          const note = (status, reason) => (lipsyncReport[format] = lipsyncReport[format] || []).push({ scene: sc.n, status, ...(reason ? { reason } : {}) });
+          const place = lipSync.placement(r.headshot);
+          if (!place) { warnings.push(`${format} scene ${sc.n}: no lip sync (this layout has no headshot area); the still headshot is shown`); note("fallback", "no headshot area in this layout"); }
+          else {
+            try {
+              const clipPath = path.join(dir, `lip_${sc.n}.mp4`);
+              fs.writeFileSync(clipPath, await fetchAsset(lreq.clipKey));
+              const cd = await probeDuration(clipPath);
+              if (!(cd > 0.5)) throw new Error("the clip has no usable video");
+              lipItems.push({ n: sc.n, clip: clipPath, start: sc.window.start, end: sc.window.end, place, clipSec: cd });
+              note("used");
+            } catch (e) { warnings.push(`${format} scene ${sc.n}: no lip sync (${String(e.message).slice(0, 120)}); the still headshot is shown`); note("fallback", String(e.message).slice(0, 120)); }
+          }
+        }
         // a figure card can be told to wait for the moment its number is spoken (card_start_sec); the picture and captions play meanwhile
         const start = Number.isFinite(sc.card_start_sec) && sc.card_start_sec > sc.window.start && sc.card_start_sec < sc.window.end - 1 ? sc.card_start_sec : sc.window.start + (i === 0 ? 0.2 : 0.15);
         const l = { png: r.png, startSec: start, fadeSec: 0.45 };
@@ -320,17 +339,27 @@ async function renderAgentMarketing(job, onStep = () => {}, deps = {}) {
       onStep(`Finishing the ${format} video`);
       const outMp4 = path.join(dir, `agent_marketing_${format}.mp4`);
       await compositeLayers(base, layers, outMp4);
-      const dur = await probeDuration(outMp4);
+      let finalMp4 = outMp4;
+      if (lipItems.length) {
+        onStep(`Adding the ${format} lip-sync clips`);
+        try { finalMp4 = await lipSync.overlayClips(outMp4, lipItems, path.join(dir, `agent_marketing_${format}_lip.mp4`), dir); }
+        catch (e) {
+          warnings.push(`${format}: the lip-sync clips could not be added (${String(e.message).slice(0, 120)}); the still headshots are shown`);
+          (lipsyncReport[format] || []).forEach((x) => { if (x.status === "used") { x.status = "fallback"; x.reason = "the clip could not be composited"; } });
+          finalMp4 = outMp4;
+        }
+      }
+      const dur = await probeDuration(finalMp4);
 
       onStep(`Checking the ${format} video`);
       const checkDir = job.outDir ? path.join(job.outDir, "checks", format) : path.join(dir, "checks");
       fs.mkdirSync(checkDir, { recursive: true });
       const notices = [];
-      for (const nc of noticeCards) notices.push(await verifyNoticeInFrame(outMp4, nc.mid, nc.png, canvas, checkDir, nc.label));
+      for (const nc of noticeCards) notices.push(await verifyNoticeInFrame(finalMp4, nc.mid, nc.png, canvas, checkDir, nc.label));
       const disclosures = [];
-      for (const dc of disclosureCards) disclosures.push({ scene: dc.n, ...(await verifyDisclosureInFrame(outMp4, dc.png, dc.mid, canvas, checkDir, dc.label)) });
+      for (const dc of disclosureCards) disclosures.push({ scene: dc.n, ...(await verifyDisclosureInFrame(finalMp4, dc.png, dc.mid, canvas, checkDir, dc.label)) });
       const credits = [];
-      for (const cc of creditCards) credits.push({ scene: cc.n, lines: cc.lines, ...(await verifyCreditInFrame(outMp4, cc.png, cc.mid, cc.band, checkDir, cc.label)) });
+      for (const cc of creditCards) credits.push({ scene: cc.n, lines: cc.lines, ...(await verifyCreditInFrame(finalMp4, cc.png, cc.mid, cc.band, checkDir, cc.label)) });
       const expectedCredit = m.notice_required !== false && m.source_credit && Array.isArray(m.source_credit.scenes) ? m.scenes.filter((x) => creditFor(m, x)).map((x) => x.n) : [];
       checks[format] = { durationSec: Math.round(dur * 100) / 100, notice: notices, noticeOk: notices.length > 0 && notices.every((n) => n.ok), disclosure: { expectedScenes: disclosureCards.map((d) => d.n), checked: disclosures, ok: disclosures.every((d) => d.ok) }, credit: { expectedScenes: expectedCredit, checked: credits, ok: credits.length === expectedCredit.length && credits.every((c) => c.ok) } };
       if (!checks[format].disclosure.ok) throw new Error(`The AI image disclosure could not be confirmed on every applicable scene of the finished ${format} video (scenes ${disclosures.filter((d) => !d.ok).map((d) => d.scene).join(", ")})`);
@@ -340,14 +369,14 @@ async function renderAgentMarketing(job, onStep = () => {}, deps = {}) {
       if (job.outDir) {
         const dest = path.join(job.outDir, `agent_marketing_${format}.mp4`);
         fs.mkdirSync(job.outDir, { recursive: true });
-        fs.copyFileSync(outMp4, dest);
+        fs.copyFileSync(finalMp4, dest);
         outputs[format] = { path: dest };
       } else {
-        outputs[format] = { key: await upload(outMp4, `smart-stage-reel-drafts/agent-marketing/${job.jobId}/${format}_${Date.now()}.mp4`) };
+        outputs[format] = { key: await upload(finalMp4, `smart-stage-reel-drafts/agent-marketing/${job.jobId}/${format}_${Date.now()}.mp4`) };
       }
     }
     const keys = {}; for (const f of Object.keys(outputs)) if (outputs[f].key) keys[f] = outputs[f].key;
-    return { outputs, keys, checks, warnings, durationSec: total };
+    return { outputs, keys, checks, warnings, durationSec: total, ...(Object.keys(lipsyncReport).length ? { lipsync: lipsyncReport } : {}) };
   } finally {
     fs.rm(workDir, { recursive: true, force: true }, () => {});
   }
