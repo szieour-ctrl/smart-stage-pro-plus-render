@@ -16,6 +16,8 @@ const { execFile } = require("child_process");
 
 const FPS = 25;
 const INSET = 3;       // pixels kept clear so the card's gold ring shows around the clip
+// HeyGen's frame has a thin strip of the source photo's bottom edge; a 6% zoom anchored near the top crops it away (the face stays put).
+const ZOOM = 1.06;
 const FADE_IN = 0.15;  // seconds; the card is fading in under it
 const run = (cmd, args) => new Promise((resolve, reject) => execFile(cmd, args, { maxBuffer: 1 << 26 }, (e, so, se) => (e ? reject(new Error(`${cmd} failed: ${String(se).slice(-500)}`)) : resolve(so))));
 
@@ -23,6 +25,14 @@ const run = (cmd, args) => new Promise((resolve, reject) => execFile(cmd, args, 
 function requestFor(scene) {
   const k = scene && scene.lipsync && typeof scene.lipsync.clip_key === "string" ? scene.lipsync.clip_key.trim() : "";
   return k ? { clipKey: k } : null;
+}
+
+// The clip starts a little after the scene does: HeyGen's mouth moves about two frames (80 ms) ahead of the audio it was given (measured on the
+// pilot clips: 75-95 ms on both). scene.lipsync.delay_sec can override it (0 to 0.3).
+const DEFAULT_DELAY_SEC = 0.08;
+function delayFor(scene) {
+  const d = scene && scene.lipsync && Number(scene.lipsync.delay_sec);
+  return Number.isFinite(d) && scene.lipsync.delay_sec !== null ? Math.max(0, Math.min(0.3, d)) : DEFAULT_DELAY_SEC;
 }
 
 /** Where the clip goes: the card's headshot box, inset. Returns { x, y, w, h, shape, rx } in whole pixels, or null. */
@@ -59,7 +69,7 @@ async function overlayClips(baseVideo, items, outVideo, workDir) {
     const ci = 1 + i * 2, mi = ci + 1;
     parts.push(
       `[${ci}:v]fps=${FPS},tpad=stop_mode=clone:stop_duration=2,trim=end_frame=${frames},setpts=PTS-STARTPTS,` +
-      `scale=${pl.w}:${pl.h}:force_original_aspect_ratio=increase,crop=${pl.w}:${pl.h}:(iw-${pl.w})/2:(ih-${pl.h})*0.15,format=yuva420p[c${i}]`,
+      `scale=${Math.round(pl.w * ZOOM)}:${Math.round(pl.h * ZOOM)}:force_original_aspect_ratio=increase,crop=${pl.w}:${pl.h}:(iw-${pl.w})/2:(ih-${pl.h})*0.15,format=yuva420p[c${i}]`,
       `[${mi}:v]format=gray,trim=end_frame=${frames},setpts=PTS-STARTPTS[m${i}]`,
       `[c${i}][m${i}]alphamerge,fade=t=in:st=0:d=${FADE_IN}:alpha=1,setpts=PTS+${it.start.toFixed(3)}/TB[o${i}]`,
       `[${prev}][o${i}]overlay=${pl.x}:${pl.y}:format=auto:eof_action=pass[v${i}]`,
@@ -71,4 +81,4 @@ async function overlayClips(baseVideo, items, outVideo, workDir) {
   return outVideo;
 }
 
-module.exports = { requestFor, placement, overlayClips, maskPng, INSET, FPS };
+module.exports = { requestFor, delayFor, DEFAULT_DELAY_SEC, placement, overlayClips, maskPng, INSET, FPS };
