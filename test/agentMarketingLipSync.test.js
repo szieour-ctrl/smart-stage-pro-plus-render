@@ -102,11 +102,11 @@ test("retry after a render failure: the same manifest renders again with the sam
   assert.deepStrictEqual(b.r.lipsync["9x16"].map((x) => x.status), ["used", "used"]);
 });
 
-test("delay: the clip starts two frames after its scene by default, can be overridden (0 to 0.3 s), and lands on the exact frame", async () => {
-  assert.strictEqual(L.delayFor({}), 0.08);
-  assert.strictEqual(L.delayFor({ lipsync: { clip_key: "k" } }), 0.08);
+test("delay: the clip starts two frames after its scene by default, can be overridden (0 to 0.5 s), and lands on the exact frame", async () => {
+  assert.strictEqual(L.delayFor({}), 0.2);
+  assert.strictEqual(L.delayFor({ lipsync: { clip_key: "k" } }), 0.2);
   assert.strictEqual(L.delayFor({ lipsync: { clip_key: "k", delay_sec: 0.12 } }), 0.12);
-  assert.strictEqual(L.delayFor({ lipsync: { clip_key: "k", delay_sec: 5 } }), 0.3);
+  assert.strictEqual(L.delayFor({ lipsync: { clip_key: "k", delay_sec: 5 } }), 0.5);
   assert.strictEqual(L.delayFor({ lipsync: { clip_key: "k", delay_sec: -1 } }), 0);
   // a clip whose picture flashes white at 1.0 s, placed on a scene starting at 2.0 s with the default delay: the flash must show at 3.08 s
   const flash = path.join(dir, "flash.mp4"), base = path.join(dir, "flashbase.mp4"), out = path.join(dir, "flashout.mp4");
@@ -115,7 +115,7 @@ test("delay: the clip starts two frames after its scene by default, can be overr
   await L.overlayClips(base, [{ n: 1, clip: flash, start: 2 + L.delayFor({}), end: 5, place: L.placement({ x: 100, y: 200, w: 400, h: 400, shape: "rect", rx: 0 }) }], out, dir);
   const raw = execFileSync("ffmpeg", ["-v", "error", "-i", out, "-vf", "crop=100:100:250:350,scale=1:1,format=gray", "-f", "rawvideo", "-pix_fmt", "gray", "-"], { maxBuffer: 1 << 24 });
   const first = [...raw].findIndex((b) => b > 200) / 25;
-  assert.ok(Math.abs(first - 3.08) < 0.001, `flash at ${first}`);
+  assert.ok(Math.abs(first - 3.2) < 0.001, `flash at ${first}`);
 });
 
 test("bigger headshot: 40% larger circle only when a clip will use it; the text still fits above it; the still headshot is unchanged otherwise", async () => {
@@ -140,13 +140,13 @@ test("a clip that cannot be used leaves the normal-size still headshot", async (
   assert.deepStrictEqual(r.lipsync["9x16"].map((x) => x.status), ["fallback", "fallback"]);
 });
 
-test("chooseDelay: a manifest value wins; a trusted measurement is used (0 to 300 ms); otherwise the 80 ms default", () => {
+test("chooseDelay: a manifest value wins; a trusted measurement is used (0 to 500 ms); otherwise the 200 ms default", () => {
   const L = require("../src/lib/agentMarketingLipSync");
   assert.deepStrictEqual(L.chooseDelay({ lipsync: { delay_sec: 0.2 } }, { leadSec: 0.05, corr: 0.9 }), { delaySec: 0.2, source: "manifest" });
   assert.deepStrictEqual(L.chooseDelay({ lipsync: {} }, { leadSec: 0.12, corr: 0.7 }), { delaySec: 0.12, source: "measured" });
-  assert.deepStrictEqual(L.chooseDelay({ lipsync: {} }, { leadSec: 0.9, corr: 0.7 }), { delaySec: 0.3, source: "measured" });
+  assert.deepStrictEqual(L.chooseDelay({ lipsync: {} }, { leadSec: 0.9, corr: 0.7 }), { delaySec: 0.5, source: "measured" });
   assert.deepStrictEqual(L.chooseDelay({ lipsync: {} }, { leadSec: -0.05, corr: 0.7 }), { delaySec: 0, source: "measured" });
-  assert.deepStrictEqual(L.chooseDelay({ lipsync: {} }, { leadSec: 0.12, corr: 0.2 }), { delaySec: 0.08, source: "default" });
-  assert.deepStrictEqual(L.chooseDelay({ lipsync: { delay_sec: null } }, null), { delaySec: 0.08, source: "default" });
-  assert.deepStrictEqual(L.chooseDelay({}, null), { delaySec: 0.08, source: "default" });
+  assert.deepStrictEqual(L.chooseDelay({ lipsync: {} }, { leadSec: 0.12, corr: 0.4 }), { delaySec: 0.2, source: "default" });
+  assert.deepStrictEqual(L.chooseDelay({ lipsync: { delay_sec: null } }, null), { delaySec: 0.2, source: "default" });
+  assert.deepStrictEqual(L.chooseDelay({}, null), { delaySec: 0.2, source: "default" });
 });

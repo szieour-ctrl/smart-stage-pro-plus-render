@@ -27,22 +27,23 @@ function requestFor(scene) {
   return k ? { clipKey: k } : null;
 }
 
-// The clip starts a little after the scene does: HeyGen's mouth moves about two frames (80 ms) ahead of the audio it was given (measured on the
-// pilot clips: 75-95 ms on both). scene.lipsync.delay_sec can override it (0 to 0.3).
-const DEFAULT_DELAY_SEC = 0.08;
+// The clip starts a little after the scene does. 80 ms (the pilot-clip measurement) still left the mouth ahead of the narration on Sam's Nov 27 reels (both clips),
+// and the in-render measurement is weak on real clips, so the default is 200 ms and a measurement is trusted only at a 0.5 match or better.
+// pilot clips: 75-95 ms on both). scene.lipsync.delay_sec can override it (0 to 0.5).
+const DEFAULT_DELAY_SEC = 0.2;
 function delayFor(scene) {
   const d = scene && scene.lipsync && Number(scene.lipsync.delay_sec);
-  return Number.isFinite(d) && scene.lipsync.delay_sec !== null ? Math.max(0, Math.min(0.3, d)) : DEFAULT_DELAY_SEC;
+  return Number.isFinite(d) && scene.lipsync.delay_sec !== null ? Math.max(0, Math.min(0.5, d)) : DEFAULT_DELAY_SEC;
 }
 
 /**
  * chooseDelay(scene, measured) → { delaySec, source }. An explicit scene.lipsync.delay_sec always wins. Otherwise a trusted measurement of this clip
- * (agentMarketingLipAlign: how far its mouth runs ahead of its own audio) is used, kept between 0 and 0.3 s; with none, the 80 ms default.
+ * (agentMarketingLipAlign: how far its mouth runs ahead of its own audio) is used, kept between 0 and 0.5 s; with none, the 200 ms default.
  */
 function chooseDelay(scene, measured) {
   const d = scene && scene.lipsync && scene.lipsync.delay_sec;
   if (d !== null && d !== undefined && Number.isFinite(Number(d))) return { delaySec: delayFor(scene), source: "manifest" };
-  if (measured && Number.isFinite(measured.leadSec) && measured.corr >= 0.3) return { delaySec: Math.max(0, Math.min(0.3, measured.leadSec)), source: "measured" };
+  if (measured && Number.isFinite(measured.leadSec) && measured.corr >= 0.5) return { delaySec: Math.max(0, Math.min(0.5, measured.leadSec)), source: "measured" };
   return { delaySec: DEFAULT_DELAY_SEC, source: "default" };
 }
 
