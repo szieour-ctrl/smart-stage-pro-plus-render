@@ -19,6 +19,7 @@ const cards = require("./agentMarketingCards");
 const zones = require("./agentMarketingZones");
 const styleMod = require("./agentMarketingStyle");
 const lipSync = require("./agentMarketingLipSync");
+const lipAlign = require("./agentMarketingLipAlign");
 const { compositeLayers, probeDuration } = require("./reelOverlay");
 
 const FPS = 25;
@@ -318,14 +319,18 @@ async function renderAgentMarketing(job, onStep = () => {}, deps = {}) {
         r.warnings.forEach((w) => warnings.push(`${format} scene ${sc.n}: ${w}`));
         // Anything that stops the clip from being used leaves the still headshot and is reported.
         if (lreq) {
-          const note = (status, reason) => (lipsyncReport[format] = lipsyncReport[format] || []).push({ scene: sc.n, status, ...(reason ? { reason } : {}) });
+          const note = (status, reason, extra) => (lipsyncReport[format] = lipsyncReport[format] || []).push({ scene: sc.n, status, ...(reason ? { reason } : {}), ...(extra || {}) });
           const place = clipPath ? lipSync.placement(r.headshot) : null;
           if (clipFail) { warnings.push(`${format} scene ${sc.n}: no lip sync (${clipFail}); the still headshot is shown`); note("fallback", clipFail); }
           else if (!place) { warnings.push(`${format} scene ${sc.n}: no lip sync (this layout has no headshot area); the still headshot is shown`); note("fallback", "no headshot area in this layout"); }
           else {
-            // HeyGen's mouth runs about two frames ahead of its own audio (measured on the pilot clips), so the clip starts that much later.
-            lipItems.push({ n: sc.n, clip: clipPath, start: sc.window.start + lipSync.delayFor(sc), end: sc.window.end, place, clipSec: clipDur });
-            note("used");
+            // HeyGen's mouth runs ahead of its own audio by a small, clip-by-clip amount (75-95 ms on the pilot clips), so each clip is measured and started
+            // that much later. A failed measurement keeps the 80 ms default; it never stops the Reel.
+            let measured = null;
+            try { measured = await lipAlign.measureLead(clipPath); } catch (e) { console.error("[lipsync] measurement failed:", String(e.message).slice(0, 160)); }
+            const dl = lipSync.chooseDelay(sc, measured);
+            lipItems.push({ n: sc.n, clip: clipPath, start: sc.window.start + dl.delaySec, end: sc.window.end, place, clipSec: clipDur });
+            note("used", null, { delay_ms: Math.round(dl.delaySec * 1000), delay_source: dl.source, ...(measured ? { measured_lead_ms: Math.round(measured.leadSec * 1000), match: measured.corr } : {}) });
           }
         }
         // a figure card can be told to wait for the moment its number is spoken (card_start_sec); the picture and captions play meanwhile

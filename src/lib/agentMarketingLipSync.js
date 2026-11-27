@@ -35,6 +35,17 @@ function delayFor(scene) {
   return Number.isFinite(d) && scene.lipsync.delay_sec !== null ? Math.max(0, Math.min(0.3, d)) : DEFAULT_DELAY_SEC;
 }
 
+/**
+ * chooseDelay(scene, measured) → { delaySec, source }. An explicit scene.lipsync.delay_sec always wins. Otherwise a trusted measurement of this clip
+ * (agentMarketingLipAlign: how far its mouth runs ahead of its own audio) is used, kept between 0 and 0.3 s; with none, the 80 ms default.
+ */
+function chooseDelay(scene, measured) {
+  const d = scene && scene.lipsync && scene.lipsync.delay_sec;
+  if (d !== null && d !== undefined && Number.isFinite(Number(d))) return { delaySec: delayFor(scene), source: "manifest" };
+  if (measured && Number.isFinite(measured.leadSec) && measured.corr >= 0.3) return { delaySec: Math.max(0, Math.min(0.3, measured.leadSec)), source: "measured" };
+  return { delaySec: DEFAULT_DELAY_SEC, source: "default" };
+}
+
 /** Where the clip goes: the card's headshot box, inset. Returns { x, y, w, h, shape, rx } in whole pixels, or null. */
 function placement(headshot) {
   if (!headshot || !(headshot.w > 2 * INSET + 8) || !(headshot.h > 2 * INSET + 8)) return null;
@@ -81,4 +92,4 @@ async function overlayClips(baseVideo, items, outVideo, workDir) {
   return outVideo;
 }
 
-module.exports = { requestFor, delayFor, DEFAULT_DELAY_SEC, placement, overlayClips, maskPng, INSET, FPS };
+module.exports = { requestFor, delayFor, chooseDelay, DEFAULT_DELAY_SEC, placement, overlayClips, maskPng, INSET, FPS };

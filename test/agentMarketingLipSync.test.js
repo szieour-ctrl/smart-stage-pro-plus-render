@@ -139,3 +139,14 @@ test("a clip that cannot be used leaves the normal-size still headshot", async (
   const { r } = await go("smallfallback", { open: "bad", close: "bad" });
   assert.deepStrictEqual(r.lipsync["9x16"].map((x) => x.status), ["fallback", "fallback"]);
 });
+
+test("chooseDelay: a manifest value wins; a trusted measurement is used (0 to 300 ms); otherwise the 80 ms default", () => {
+  const L = require("../src/lib/agentMarketingLipSync");
+  assert.deepStrictEqual(L.chooseDelay({ lipsync: { delay_sec: 0.2 } }, { leadSec: 0.05, corr: 0.9 }), { delaySec: 0.2, source: "manifest" });
+  assert.deepStrictEqual(L.chooseDelay({ lipsync: {} }, { leadSec: 0.12, corr: 0.7 }), { delaySec: 0.12, source: "measured" });
+  assert.deepStrictEqual(L.chooseDelay({ lipsync: {} }, { leadSec: 0.9, corr: 0.7 }), { delaySec: 0.3, source: "measured" });
+  assert.deepStrictEqual(L.chooseDelay({ lipsync: {} }, { leadSec: -0.05, corr: 0.7 }), { delaySec: 0, source: "measured" });
+  assert.deepStrictEqual(L.chooseDelay({ lipsync: {} }, { leadSec: 0.12, corr: 0.2 }), { delaySec: 0.08, source: "default" });
+  assert.deepStrictEqual(L.chooseDelay({ lipsync: { delay_sec: null } }, null), { delaySec: 0.08, source: "default" });
+  assert.deepStrictEqual(L.chooseDelay({}, null), { delaySec: 0.08, source: "default" });
+});
