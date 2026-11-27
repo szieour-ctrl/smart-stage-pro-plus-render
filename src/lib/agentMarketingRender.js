@@ -388,6 +388,8 @@ async function renderAgentMarketing(job, onStep = () => {}, deps = {}) {
       }
     }
     const keys = {}; for (const f of Object.keys(outputs)) if (outputs[f].key) keys[f] = outputs[f].key;
+    // the per-clip lip-sync numbers (delay used, measured lead) ride along in `checks`, which the job keeps, so they can be read after a render
+    if (Object.keys(lipsyncReport).length) checks.lipsync = lipsyncReport;
     return { outputs, keys, checks, warnings, durationSec: total, ...(Object.keys(lipsyncReport).length ? { lipsync: lipsyncReport } : {}) };
   } finally {
     fs.rm(workDir, { recursive: true, force: true }, () => {});
